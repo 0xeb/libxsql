@@ -33,8 +33,32 @@ target_link_libraries(xsql INTERFACE sqlite3)
 
 target_compile_features(xsql INTERFACE cxx_std_17)
 
+# ============================================================================
+# Thin Client (optional HTTP server/client)
+# ============================================================================
+
+option(XSQL_WITH_THINCLIENT "Build thin client support (HTTP server/client)" OFF)
+
+if(XSQL_WITH_THINCLIENT)
+    include(FetchContent)
+    FetchContent_Declare(
+        httplib
+        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+        GIT_TAG        v0.15.3
+    )
+    FetchContent_MakeAvailable(httplib)
+
+    target_compile_definitions(xsql INTERFACE XSQL_HAS_THINCLIENT)
+    target_link_libraries(xsql INTERFACE httplib::httplib)
+endif()
+
 # Make find_package(xsql) work from build tree
-export(TARGETS xsql sqlite3
+set(XSQL_EXPORT_TARGETS xsql sqlite3)
+if(XSQL_WITH_THINCLIENT)
+    list(APPEND XSQL_EXPORT_TARGETS httplib)
+endif()
+
+export(TARGETS ${XSQL_EXPORT_TARGETS}
     NAMESPACE xsql::
     FILE "${CMAKE_CURRENT_BINARY_DIR}/xsqlTargets.cmake"
 )

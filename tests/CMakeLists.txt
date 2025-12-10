@@ -13,11 +13,19 @@ FetchContent_MakeAvailable(googletest)
 
 enable_testing()
 
-# Test executable
-add_executable(xsql_tests
+# Test sources
+set(XSQL_TEST_SOURCES
     test_vtable.cpp
     test_database.cpp
 )
+
+# Add thinclient tests if enabled
+if(XSQL_WITH_THINCLIENT)
+    list(APPEND XSQL_TEST_SOURCES test_thinclient.cpp)
+endif()
+
+# Test executable
+add_executable(xsql_tests ${XSQL_TEST_SOURCES})
 
 target_link_libraries(xsql_tests PRIVATE
     GTest::gtest_main
