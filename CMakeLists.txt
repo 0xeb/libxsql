@@ -33,6 +33,16 @@ target_link_libraries(xsql INTERFACE sqlite3)
 
 target_compile_features(xsql INTERFACE cxx_std_17)
 
+# Make find_package(xsql) work from build tree
+export(TARGETS xsql sqlite3
+    NAMESPACE xsql::
+    FILE "${CMAKE_CURRENT_BINARY_DIR}/xsqlTargets.cmake"
+)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/xsqlConfig.cmake"
+    "include(\"\${CMAKE_CURRENT_LIST_DIR}/xsqlTargets.cmake\")\n"
+)
+set(xsql_DIR "${CMAKE_CURRENT_BINARY_DIR}" CACHE PATH "xsql config directory" FORCE)
+
 # ============================================================================
 # Tests (optional)
 # ============================================================================
