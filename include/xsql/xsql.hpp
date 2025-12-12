@@ -34,6 +34,7 @@
 
 #include "types.hpp"
 #include "vtable.hpp"
+#include "vtable_writable.hpp"
 #include "vtable_builder.hpp"
 #include "functions.hpp"
 #include "database.hpp"
