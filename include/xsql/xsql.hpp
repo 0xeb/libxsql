@@ -4,11 +4,11 @@
  * libxsql - A generic SQLite virtual table framework
  *
  * Include this single header to get all libxsql functionality:
- *   - VTableDef, VTableBuilder - Define virtual tables
+ *   - VTableDef, VTableBuilder - Define virtual tables (read-only or writable)
  *   - Database - RAII database wrapper with query helpers
  *   - SQL function registration utilities
  *
- * Example:
+ * Example (read-only):
  *
  *   #include <xsql/xsql.hpp>
  *
@@ -19,22 +19,18 @@
  *       .column_int64("value", [&](size_t i) { return data[i]; })
  *       .build();
  *
- *   xsql::Database db;
- *   db.open();
- *   db.register_table("numbers_mod", &def);
- *   db.create_table("numbers", "numbers_mod");
+ * Example (writable with hook):
  *
- *   auto result = db.query("SELECT * FROM numbers WHERE value > 15");
- *   for (const auto& row : result) {
- *       printf("%s\n", row[0].c_str());
- *   }
+ *   auto def = xsql::table("items")
+ *       .count([&]() { return items.size(); })
+ *       .on_modify([](const std::string& op) { log(op); })
+ *       .column_text_rw("name", getter, setter)
+ *       .deletable(delete_fn)
+ *       .build();
  */
 
 #pragma once
 
-#include "types.hpp"
 #include "vtable.hpp"
-#include "vtable_writable.hpp"
-#include "vtable_builder.hpp"
 #include "functions.hpp"
 #include "database.hpp"
