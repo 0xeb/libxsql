@@ -9,6 +9,7 @@
  *   - Optional UPDATE/DELETE support via column setters
  *   - before_modify hook for undo/transaction integration
  *   - Fluent builder API
+ *   - Constraint pushdown via filter_eq() for O(1) lookups
  *
  * Example (read-only table):
  *
@@ -25,6 +26,16 @@
  *       .column_text_rw("name", getter, setter)
  *       .deletable(delete_fn)
  *       .build();
+ *
+ * Example (with constraint pushdown):
+ *
+ *   auto def = xsql::table("xrefs")
+ *       .count([&]() { return count_all_xrefs(); })
+ *       .column_int64("to_ea", [&](size_t i) { return cache[i].to; })
+ *       .filter_eq("to_ea", [](int64_t target) {
+ *           return std::make_unique<XrefsToIterator>(target);
+ *       }, 10.0)  // estimated cost
+ *       .build();
  */
 
 #pragma once
@@ -35,6 +46,7 @@
 #include <functional>
 #include <sstream>
 #include <cstring>
+#include <memory>
 
 namespace xsql {
 
@@ -81,6 +93,62 @@ struct ColumnDef {
 };
 
 // ============================================================================
+// Row Iterator (for constraint pushdown)
+// ============================================================================
+
+/**
+ * Abstract iterator for filtered table access.
+ *
+ * Implement this interface to provide optimized iteration for specific
+ * constraint patterns (e.g., WHERE to_ea = X uses first_to/next_to API).
+ */
+struct RowIterator {
+    virtual ~RowIterator() = default;
+
+    // Advance to next row. Returns true if there is a row, false if exhausted.
+    // Must be called before accessing the first row.
+    virtual bool next() = 0;
+
+    // True if iterator is exhausted (no current row)
+    virtual bool eof() const = 0;
+
+    // Get column value into sqlite3_context
+    virtual void column(sqlite3_context* ctx, int col) = 0;
+
+    // Get current row's rowid
+    virtual int64_t rowid() const = 0;
+};
+
+// ============================================================================
+// Filter Definition (for constraint pushdown)
+// ============================================================================
+
+// Filter ID 0 reserved for "no filter" (full scan)
+constexpr int FILTER_NONE = 0;
+
+/**
+ * Defines a filter for a specific column constraint.
+ *
+ * When SQLite queries with WHERE column = value, xBestIndex checks if
+ * we have a filter for that column. If so, xFilter creates the specialized
+ * iterator instead of doing a full scan.
+ */
+struct FilterDef {
+    int column_index;           // Which column this filter applies to
+    int filter_id;              // Unique ID (passed in idxNum)
+    double estimated_cost;      // Cost estimate for query planner
+    double estimated_rows;      // Estimated row count
+
+    // Factory: create iterator for the given constraint value
+    std::function<std::unique_ptr<RowIterator>(sqlite3_value*)> create;
+
+    FilterDef(int col, int id, double cost, double rows,
+              std::function<std::unique_ptr<RowIterator>(sqlite3_value*)> factory)
+        : column_index(col), filter_id(id), estimated_cost(cost),
+          estimated_rows(rows), create(std::move(factory)) {}
+};
+
+// ============================================================================
 // Virtual Table Definition
 // ============================================================================
 
@@ -92,6 +160,9 @@ struct VTableDef {
 
     // Columns
     std::vector<ColumnDef> columns;
+
+    // Filters for constraint pushdown (optional)
+    std::vector<FilterDef> filters;
 
     // DELETE handler: Delete row at index, returns success
     std::function<bool(size_t)> delete_row;
@@ -110,6 +181,22 @@ struct VTableDef {
         ss << ")";
         return ss.str();
     }
+
+    // Find column index by name, -1 if not found
+    int find_column(const std::string& col_name) const {
+        for (size_t i = 0; i < columns.size(); ++i) {
+            if (columns[i].name == col_name) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    // Find filter for given column, nullptr if none
+    const FilterDef* find_filter(int col_index) const {
+        for (const auto& f : filters) {
+            if (f.column_index == col_index) return &f;
+        }
+        return nullptr;
+    }
 };
 
 // ============================================================================
@@ -123,9 +210,15 @@ struct Vtab {
 
 struct Cursor {
     sqlite3_vtab_cursor base;
-    size_t idx;
-    size_t total;
     const VTableDef* def;
+
+    // Index-based iteration (legacy, when no filter)
+    size_t idx = 0;
+    size_t total = 0;
+
+    // Iterator-based iteration (when filter applied)
+    std::unique_ptr<RowIterator> iter;
+    bool using_iterator = false;
 };
 
 // xConnect/xCreate
@@ -154,9 +247,11 @@ inline int vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCursor) {
     auto* vtab = reinterpret_cast<Vtab*>(pVtab);
     auto* cursor = new Cursor();
     memset(&cursor->base, 0, sizeof(cursor->base));
+    cursor->def = vtab->def;
     cursor->idx = 0;
     cursor->total = 0;
-    cursor->def = vtab->def;
+    cursor->iter = nullptr;
+    cursor->using_iterator = false;
     *ppCursor = &cursor->base;
     return SQLITE_OK;
 }
@@ -170,14 +265,21 @@ inline int vtab_close(sqlite3_vtab_cursor* pCursor) {
 // xNext
 inline int vtab_next(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
-    cursor->idx++;
+    if (cursor->using_iterator && cursor->iter) {
+        cursor->iter->next();  // Advance iterator
+    } else {
+        cursor->idx++;
+    }
     return SQLITE_OK;
 }
 
 // xEof
 inline int vtab_eof(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
-    return cursor->idx >= cursor->total;
+    if (cursor->using_iterator && cursor->iter) {
+        return cursor->iter->eof() ? 1 : 0;
+    }
+    return cursor->idx >= cursor->total ? 1 : 0;
 }
 
 // xColumn - fetches live data each time
@@ -187,31 +289,103 @@ inline int vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int c
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    cursor->def->columns[col].get(ctx, cursor->idx);
+    if (cursor->using_iterator && cursor->iter) {
+        cursor->iter->column(ctx, col);
+    } else {
+        cursor->def->columns[col].get(ctx, cursor->idx);
+    }
     return SQLITE_OK;
 }
 
 // xRowid
 inline int vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
-    *pRowid = static_cast<sqlite3_int64>(cursor->idx);
+    if (cursor->using_iterator && cursor->iter) {
+        *pRowid = cursor->iter->rowid();
+    } else {
+        *pRowid = static_cast<sqlite3_int64>(cursor->idx);
+    }
     return SQLITE_OK;
 }
 
-// xFilter - get fresh count for iteration
-inline int vtab_filter(sqlite3_vtab_cursor* pCursor, int, const char*, int, sqlite3_value**) {
+// xFilter - get fresh count for iteration or create filtered iterator
+inline int vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
+                       int argc, sqlite3_value** argv) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
+
+    // Reset state
+    cursor->iter = nullptr;
+    cursor->using_iterator = false;
     cursor->idx = 0;
+    cursor->total = 0;
+
+    // Check if a filter was selected by xBestIndex
+    if (idxNum != FILTER_NONE && argc > 0) {
+        // Find the filter with this ID
+        for (const auto& filter : cursor->def->filters) {
+            if (filter.filter_id == idxNum) {
+                // Create the filtered iterator
+                cursor->iter = filter.create(argv[0]);
+                cursor->using_iterator = true;
+                // Position at first row
+                if (cursor->iter) {
+                    cursor->iter->next();
+                }
+                return SQLITE_OK;
+            }
+        }
+    }
+
+    // No filter - full scan using index-based iteration
     cursor->total = cursor->def->row_count();
     return SQLITE_OK;
 }
 
-// xBestIndex
+// xBestIndex - query planner hook for constraint pushdown
 inline int vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
     auto* vtab = reinterpret_cast<Vtab*>(pVtab);
-    size_t count = vtab->def->row_count();
-    pInfo->estimatedCost = static_cast<double>(count);
-    pInfo->estimatedRows = count;
+    const VTableDef* def = vtab->def;
+
+    // Default: full scan
+    size_t full_count = def->row_count();
+    double full_cost = static_cast<double>(full_count);
+
+    // Look for constraints we can optimize
+    const FilterDef* best_filter = nullptr;
+    int best_constraint_idx = -1;
+
+    for (int i = 0; i < pInfo->nConstraint; i++) {
+        const auto& constraint = pInfo->aConstraint[i];
+
+        // Only handle usable EQ constraints for now
+        if (!constraint.usable) continue;
+        if (constraint.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+
+        // Check if we have a filter for this column
+        const FilterDef* filter = def->find_filter(constraint.iColumn);
+        if (filter) {
+            // Use the filter with lowest cost if multiple match
+            if (!best_filter || filter->estimated_cost < best_filter->estimated_cost) {
+                best_filter = filter;
+                best_constraint_idx = i;
+            }
+        }
+    }
+
+    if (best_filter && best_constraint_idx >= 0) {
+        // Tell SQLite we'll handle this constraint
+        pInfo->aConstraintUsage[best_constraint_idx].argvIndex = 1;  // First arg
+        pInfo->aConstraintUsage[best_constraint_idx].omit = 1;       // Don't recheck
+        pInfo->idxNum = best_filter->filter_id;
+        pInfo->estimatedCost = best_filter->estimated_cost;
+        pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
+    } else {
+        // No filter - full scan
+        pInfo->idxNum = FILTER_NONE;
+        pInfo->estimatedCost = full_cost;
+        pInfo->estimatedRows = full_count;
+    }
+
     return SQLITE_OK;
 }
 
@@ -429,6 +603,71 @@ public:
     VTableBuilder& deletable(std::function<bool(size_t)> delete_fn) {
         def_.supports_delete = true;
         def_.delete_row = std::move(delete_fn);
+        return *this;
+    }
+
+    // ========================================================================
+    // Constraint Pushdown Filters
+    // ========================================================================
+
+    /**
+     * Add an equality filter for int64 column.
+     *
+     * When SQLite queries with WHERE column = value, the filter's iterator
+     * factory is called instead of doing a full table scan.
+     *
+     * @param column_name Column to filter on (must exist)
+     * @param factory     Creates iterator for the given constraint value
+     * @param cost        Estimated cost (lower = preferred by query planner)
+     * @param est_rows    Estimated rows returned (default: 10)
+     *
+     * Example:
+     *   .filter_eq("to_ea", [](int64_t target) {
+     *       return std::make_unique<XrefsToIterator>(target);
+     *   }, 10.0)
+     */
+    VTableBuilder& filter_eq(const char* column_name,
+                              std::function<std::unique_ptr<RowIterator>(int64_t)> factory,
+                              double cost = 10.0,
+                              double est_rows = 10.0) {
+        int col_idx = def_.find_column(column_name);
+        if (col_idx < 0) {
+            // Column not found - programming error, but don't crash
+            return *this;
+        }
+
+        // Filter IDs start at 1 (0 = FILTER_NONE)
+        int filter_id = static_cast<int>(def_.filters.size()) + 1;
+
+        def_.filters.emplace_back(
+            col_idx, filter_id, cost, est_rows,
+            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
+                int64_t value = sqlite3_value_int64(val);
+                return factory(value);
+            }
+        );
+        return *this;
+    }
+
+    /**
+     * Add an equality filter for text column.
+     */
+    VTableBuilder& filter_eq_text(const char* column_name,
+                                   std::function<std::unique_ptr<RowIterator>(const char*)> factory,
+                                   double cost = 10.0,
+                                   double est_rows = 10.0) {
+        int col_idx = def_.find_column(column_name);
+        if (col_idx < 0) return *this;
+
+        int filter_id = static_cast<int>(def_.filters.size()) + 1;
+
+        def_.filters.emplace_back(
+            col_idx, filter_id, cost, est_rows,
+            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
+                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                return factory(text ? text : "");
+            }
+        );
         return *this;
     }
 
