@@ -6,6 +6,75 @@
 #include <xsql/xsql.hpp>
 #include <vector>
 #include <string>
+#include <atomic>
+
+namespace {
+
+class NeverEofIterator : public xsql::RowIterator {
+    int current_ = -1;
+
+public:
+    bool next() override {
+        ++current_;
+        return current_ < 2;
+    }
+
+    bool eof() const override {
+        return false;
+    }
+
+    void column(sqlite3_context* ctx, int col) override {
+        if (current_ < 0 || current_ >= 2) {
+            sqlite3_result_null(ctx);
+            return;
+        }
+
+        switch (col) {
+            case 0: sqlite3_result_int(ctx, 123); break;
+            case 1: sqlite3_result_int(ctx, current_); break;
+            default: sqlite3_result_null(ctx); break;
+        }
+    }
+
+    int64_t rowid() const override {
+        return current_;
+    }
+};
+
+struct ProgressLimiter {
+    int calls = 0;
+    int max_calls = 0;
+};
+
+int progress_handler(void* p) {
+    auto* limiter = static_cast<ProgressLimiter*>(p);
+    limiter->calls++;
+    return limiter->calls > limiter->max_calls ? 1 : 0;
+}
+
+std::vector<std::vector<std::string>> query_with_result_code(sqlite3* db, const std::string& sql, int& rc) {
+    std::vector<std::vector<std::string>> results;
+
+    sqlite3_stmt* stmt = nullptr;
+    rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return results;
+
+    int cols = sqlite3_column_count(stmt);
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        std::vector<std::string> row;
+        row.reserve(cols);
+        for (int i = 0; i < cols; ++i) {
+            const char* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, i));
+            row.push_back(text ? text : "");
+        }
+        results.push_back(std::move(row));
+    }
+
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+} // namespace
 
 class VTableTest : public ::testing::Test {
 protected:
@@ -204,4 +273,86 @@ TEST_F(VTableTest, SchemaGeneration) {
     EXPECT_TRUE(schema.find("id INTEGER") != std::string::npos);
     EXPECT_TRUE(schema.find("name TEXT") != std::string::npos);
     EXPECT_TRUE(schema.find("value REAL") != std::string::npos);
+}
+
+TEST_F(VTableTest, RowCountCalledOncePerQuery) {
+    static std::vector<int> data = {1, 2, 3};
+
+    std::atomic<int> row_count_calls = 0;
+
+    auto table = xsql::table("row_count_test")
+        .count([&]() {
+            row_count_calls++;
+            return data.size();
+        })
+        .column_int("n", [](size_t i) { return data[i]; })
+        .build();
+
+    xsql::register_vtable(db_, "row_count_module", &table);
+    xsql::create_vtable(db_, "row_count_test", "row_count_module");
+
+    auto results = query("SELECT * FROM row_count_test");
+    ASSERT_EQ(results.size(), data.size());
+    EXPECT_EQ(row_count_calls.load(), 1);
+}
+
+TEST_F(VTableTest, IteratorTerminationUsesNextReturnValue) {
+    auto table = xsql::table("iter_test")
+        .count([]() { return 0; })
+        .column_int("a", [](size_t) { return 0; })
+        .column_int("b", [](size_t) { return 0; })
+        .filter_eq("a", [](int64_t) -> std::unique_ptr<xsql::RowIterator> {
+            return std::make_unique<NeverEofIterator>();
+        })
+        .build();
+
+    xsql::register_vtable(db_, "iter_module", &table);
+    xsql::create_vtable(db_, "iter_test", "iter_module");
+
+    ProgressLimiter limiter;
+    limiter.max_calls = 10'000;
+    sqlite3_progress_handler(db_, 1'000, progress_handler, &limiter);
+
+    int rc = SQLITE_OK;
+    auto results = query_with_result_code(db_, "SELECT a, b FROM iter_test WHERE a = 123", rc);
+
+    sqlite3_progress_handler(db_, 0, nullptr, nullptr);
+
+    ASSERT_EQ(rc, SQLITE_DONE) << "SQLite did not reach EOF (rc=" << rc << ")";
+    ASSERT_EQ(results.size(), 2);
+    EXPECT_EQ(results[0][0], "123");
+    EXPECT_EQ(results[0][1], "0");
+    EXPECT_EQ(results[1][0], "123");
+    EXPECT_EQ(results[1][1], "1");
+}
+
+TEST_F(VTableTest, CachedIteratorTerminationUsesNextReturnValue) {
+    auto table = xsql::cached_table<int>("cached_iter_test")
+        .estimate_rows([]() { return 0; })
+        .cache_builder([](std::vector<int>&) {})
+        .column_int("a", [](const int&) { return 0; })
+        .column_int("b", [](const int&) { return 0; })
+        .filter_eq("a", [](int64_t) -> std::unique_ptr<xsql::RowIterator> {
+            return std::make_unique<NeverEofIterator>();
+        })
+        .build();
+
+    xsql::register_cached_vtable(db_, "cached_iter_module", &table);
+    xsql::create_vtable(db_, "cached_iter_test", "cached_iter_module");
+
+    ProgressLimiter limiter;
+    limiter.max_calls = 10'000;
+    sqlite3_progress_handler(db_, 1'000, progress_handler, &limiter);
+
+    int rc = SQLITE_OK;
+    auto results = query_with_result_code(db_, "SELECT a, b FROM cached_iter_test WHERE a = 123", rc);
+
+    sqlite3_progress_handler(db_, 0, nullptr, nullptr);
+
+    ASSERT_EQ(rc, SQLITE_DONE) << "SQLite did not reach EOF (rc=" << rc << ")";
+    ASSERT_EQ(results.size(), 2);
+    EXPECT_EQ(results[0][0], "123");
+    EXPECT_EQ(results[0][1], "0");
+    EXPECT_EQ(results[1][0], "123");
+    EXPECT_EQ(results[1][1], "1");
 }

@@ -33,4 +33,4 @@ target_link_libraries(xsql_tests PRIVATE
 )
 
 include(GoogleTest)
-gtest_discover_tests(xsql_tests)
+gtest_discover_tests(xsql_tests PROPERTIES TIMEOUT 20)

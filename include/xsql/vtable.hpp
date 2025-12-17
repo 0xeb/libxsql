@@ -158,6 +158,10 @@ struct VTableDef {
     // Row count (called fresh each time for live data)
     std::function<size_t()> row_count;
 
+    // Estimated row count for query planning (should be cheap, optional).
+    // If not set, a conservative default is used (planning avoids calling row_count()).
+    std::function<size_t()> estimate_rows;
+
     // Columns
     std::vector<ColumnDef> columns;
 
@@ -219,6 +223,7 @@ struct Cursor {
     // Iterator-based iteration (when filter applied)
     std::unique_ptr<RowIterator> iter;
     bool using_iterator = false;
+    bool iterator_eof = false;
 };
 
 // xConnect/xCreate
@@ -252,6 +257,7 @@ inline int vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCursor) {
     cursor->total = 0;
     cursor->iter = nullptr;
     cursor->using_iterator = false;
+    cursor->iterator_eof = false;
     *ppCursor = &cursor->base;
     return SQLITE_OK;
 }
@@ -266,7 +272,9 @@ inline int vtab_close(sqlite3_vtab_cursor* pCursor) {
 inline int vtab_next(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
     if (cursor->using_iterator && cursor->iter) {
-        cursor->iter->next();  // Advance iterator
+        if (!cursor->iter->next()) {
+            cursor->iterator_eof = true;
+        }
     } else {
         cursor->idx++;
     }
@@ -276,7 +284,8 @@ inline int vtab_next(sqlite3_vtab_cursor* pCursor) {
 // xEof
 inline int vtab_eof(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
-    if (cursor->using_iterator && cursor->iter) {
+    if (cursor->using_iterator) {
+        if (!cursor->iter || cursor->iterator_eof) return 1;
         return cursor->iter->eof() ? 1 : 0;
     }
     return cursor->idx >= cursor->total ? 1 : 0;
@@ -290,6 +299,10 @@ inline int vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int c
         return SQLITE_OK;
     }
     if (cursor->using_iterator && cursor->iter) {
+        if (cursor->iterator_eof) {
+            sqlite3_result_null(ctx);
+            return SQLITE_OK;
+        }
         cursor->iter->column(ctx, col);
     } else {
         cursor->def->columns[col].get(ctx, cursor->idx);
@@ -301,6 +314,10 @@ inline int vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int c
 inline int vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
     if (cursor->using_iterator && cursor->iter) {
+        if (cursor->iterator_eof) {
+            *pRowid = 0;
+            return SQLITE_OK;
+        }
         *pRowid = cursor->iter->rowid();
     } else {
         *pRowid = static_cast<sqlite3_int64>(cursor->idx);
@@ -316,6 +333,7 @@ inline int vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
     // Reset state
     cursor->iter = nullptr;
     cursor->using_iterator = false;
+    cursor->iterator_eof = false;
     cursor->idx = 0;
     cursor->total = 0;
 
@@ -327,9 +345,9 @@ inline int vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
                 // Create the filtered iterator
                 cursor->iter = filter.create(argv[0]);
                 cursor->using_iterator = true;
-                // Position at first row
+                cursor->iterator_eof = true;
                 if (cursor->iter) {
-                    cursor->iter->next();
+                    cursor->iterator_eof = !cursor->iter->next();
                 }
                 return SQLITE_OK;
             }
@@ -377,8 +395,12 @@ inline int vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
     } else {
-        // No filter - full scan. Only NOW call row_count() since we need it
-        size_t full_count = def->row_count();
+        // No filter - full scan. Prefer cheap estimate_rows() for planning.
+        // Avoid calling row_count() here since it may be expensive or have side effects.
+        size_t full_count = 100000;
+        if (def->estimate_rows) {
+            full_count = def->estimate_rows();
+        }
         pInfo->idxNum = FILTER_NONE;
         pInfo->estimatedCost = static_cast<double>(full_count);
         pInfo->estimatedRows = full_count;
@@ -492,6 +514,12 @@ public:
 
     VTableBuilder& count(std::function<size_t()> fn) {
         def_.row_count = std::move(fn);
+        return *this;
+    }
+
+    // Estimated row count for query planning (optional, should be cheap).
+    VTableBuilder& estimate_rows(std::function<size_t()> fn) {
+        def_.estimate_rows = std::move(fn);
         return *this;
     }
 
@@ -771,6 +799,7 @@ struct CachedCursor {
     size_t current_row = 0;
     std::unique_ptr<RowIterator> iterator;
     bool using_iterator = false;
+    bool iterator_eof = false;
 };
 
 template<typename RowData>
@@ -809,6 +838,7 @@ inline int cached_vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCursor)
     cursor->current_row = 0;
     cursor->iterator = nullptr;
     cursor->using_iterator = false;
+    cursor->iterator_eof = false;
     *ppCursor = &cursor->base;
     return SQLITE_OK;
 }
@@ -823,7 +853,9 @@ template<typename RowData>
 inline int cached_vtab_next(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<CachedCursor<RowData>*>(pCursor);
     if (cursor->using_iterator && cursor->iterator) {
-        cursor->iterator->next();
+        if (!cursor->iterator->next()) {
+            cursor->iterator_eof = true;
+        }
     } else {
         cursor->current_row++;
     }
@@ -833,7 +865,8 @@ inline int cached_vtab_next(sqlite3_vtab_cursor* pCursor) {
 template<typename RowData>
 inline int cached_vtab_eof(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<CachedCursor<RowData>*>(pCursor);
-    if (cursor->using_iterator && cursor->iterator) {
+    if (cursor->using_iterator) {
+        if (!cursor->iterator || cursor->iterator_eof) return 1;
         return cursor->iterator->eof() ? 1 : 0;
     }
     return cursor->current_row >= cursor->cache.size() ? 1 : 0;
@@ -847,6 +880,10 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
         return SQLITE_OK;
     }
     if (cursor->using_iterator && cursor->iterator) {
+        if (cursor->iterator_eof) {
+            sqlite3_result_null(ctx);
+            return SQLITE_OK;
+        }
         cursor->iterator->column(ctx, col);
     } else {
         if (cursor->current_row < cursor->cache.size()) {
@@ -862,6 +899,10 @@ template<typename RowData>
 inline int cached_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid) {
     auto* cursor = reinterpret_cast<CachedCursor<RowData>*>(pCursor);
     if (cursor->using_iterator && cursor->iterator) {
+        if (cursor->iterator_eof) {
+            *pRowid = 0;
+            return SQLITE_OK;
+        }
         *pRowid = cursor->iterator->rowid();
     } else {
         *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
@@ -876,6 +917,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
 
     cursor->iterator = nullptr;
     cursor->using_iterator = false;
+    cursor->iterator_eof = false;
     cursor->cache.clear();
     cursor->cache_built = false;
     cursor->current_row = 0;
@@ -885,8 +927,9 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
             if (filter.filter_id == idxNum) {
                 cursor->iterator = filter.create(argv[0]);
                 cursor->using_iterator = true;
+                cursor->iterator_eof = true;
                 if (cursor->iterator) {
-                    cursor->iterator->next();
+                    cursor->iterator_eof = !cursor->iterator->next();
                 }
                 return SQLITE_OK;
             }
