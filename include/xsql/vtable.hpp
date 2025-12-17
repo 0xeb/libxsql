@@ -346,11 +346,8 @@ inline int vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
     auto* vtab = reinterpret_cast<Vtab*>(pVtab);
     const VTableDef* def = vtab->def;
 
-    // Default: full scan
-    size_t full_count = def->row_count();
-    double full_cost = static_cast<double>(full_count);
-
-    // Look for constraints we can optimize
+    // Look for constraints we can optimize FIRST (before calling row_count)
+    // This avoids expensive cache rebuilds when a filter will be used
     const FilterDef* best_filter = nullptr;
     int best_constraint_idx = -1;
 
@@ -380,9 +377,10 @@ inline int vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
     } else {
-        // No filter - full scan
+        // No filter - full scan. Only NOW call row_count() since we need it
+        size_t full_count = def->row_count();
         pInfo->idxNum = FILTER_NONE;
-        pInfo->estimatedCost = full_cost;
+        pInfo->estimatedCost = static_cast<double>(full_count);
         pInfo->estimatedRows = full_count;
     }
 
@@ -909,12 +907,8 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
     auto* vtab = reinterpret_cast<CachedVtab<RowData>*>(pVtab);
     const auto* def = vtab->def;
 
-    size_t estimated_rows = 1000;
-    if (def->estimate_rows_fn) {
-        estimated_rows = def->estimate_rows_fn();
-    }
-    double full_cost = static_cast<double>(estimated_rows);
-
+    // Look for filters FIRST (before calling estimate_rows)
+    // This avoids expensive operations when a filter will be used
     const FilterDef* best_filter = nullptr;
     int best_constraint_idx = -1;
 
@@ -938,8 +932,13 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
     } else {
+        // No filter - full scan. Only NOW call estimate_rows since we need it
+        size_t estimated_rows = 1000;
+        if (def->estimate_rows_fn) {
+            estimated_rows = def->estimate_rows_fn();
+        }
         pInfo->idxNum = FILTER_NONE;
-        pInfo->estimatedCost = full_cost;
+        pInfo->estimatedCost = static_cast<double>(estimated_rows);
         pInfo->estimatedRows = estimated_rows;
     }
     return SQLITE_OK;
