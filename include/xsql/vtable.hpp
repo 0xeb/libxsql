@@ -1128,4 +1128,409 @@ inline CachedTableBuilder<RowData> cached_table(const char* name) {
     return CachedTableBuilder<RowData>(name);
 }
 
+// ============================================================================
+// Generator Table API (streaming, no full-cache materialization)
+// ============================================================================
+//
+// Use generator_table<T>() for expensive sources where full scans must be lazy
+// (e.g., LIMIT should stop work early).
+//
+// The generator is owned by the cursor and destroyed when the query ends.
+// SQLite will call:
+//   xFilter -> generator->next() once (position on first row)
+//   xNext   -> generator->next() for subsequent rows
+//
+// Constraints can still be pushed down using filter_eq(), which uses RowIterator.
+
+template<typename RowData>
+struct Generator {
+    virtual ~Generator() = default;
+
+    // Advance to next row. Returns true if there is a row, false if exhausted.
+    // Must be called before accessing the first row.
+    virtual bool next() = 0;
+
+    // Current row (valid only after next() returns true)
+    virtual const RowData& current() const = 0;
+
+    // Current rowid (valid only after next() returns true)
+    virtual sqlite3_int64 rowid() const = 0;
+};
+
+template<typename RowData>
+struct GeneratorTableDef {
+    std::string name;
+    std::function<size_t()> estimate_rows_fn;
+    std::function<std::unique_ptr<Generator<RowData>>()> generator_factory_fn;
+    std::vector<CachedColumnDef<RowData>> columns;
+    std::vector<FilterDef> filters;
+
+    std::string schema() const {
+        std::ostringstream ss;
+        ss << "CREATE TABLE " << name << "(";
+        for (size_t i = 0; i < columns.size(); ++i) {
+            if (i > 0) ss << ", ";
+            ss << columns[i].name << " " << column_type_sql(columns[i].type);
+        }
+        ss << ")";
+        return ss.str();
+    }
+
+    int find_column(const std::string& col_name) const {
+        for (size_t i = 0; i < columns.size(); ++i) {
+            if (columns[i].name == col_name) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    const FilterDef* find_filter(int col_index) const {
+        for (const auto& f : filters) {
+            if (f.column_index == col_index) return &f;
+        }
+        return nullptr;
+    }
+};
+
+template<typename RowData>
+struct GeneratorCursor {
+    sqlite3_vtab_cursor base;
+    const GeneratorTableDef<RowData>* def = nullptr;
+    std::unique_ptr<Generator<RowData>> generator;
+    bool generator_eof = false;
+    std::unique_ptr<RowIterator> iterator;
+    bool using_iterator = false;
+    bool iterator_eof = false;
+};
+
+template<typename RowData>
+struct GeneratorVtab {
+    sqlite3_vtab base;
+    const GeneratorTableDef<RowData>* def = nullptr;
+};
+
+// SQLite callbacks for generator tables
+template<typename RowData>
+inline int generator_vtab_connect(sqlite3* db, void* pAux, int, const char* const*,
+                                  sqlite3_vtab** ppVtab, char**) {
+    const auto* def = static_cast<const GeneratorTableDef<RowData>*>(pAux);
+    int rc = sqlite3_declare_vtab(db, def->schema().c_str());
+    if (rc != SQLITE_OK) return rc;
+    auto* vtab = new GeneratorVtab<RowData>();
+    memset(&vtab->base, 0, sizeof(vtab->base));
+    vtab->def = def;
+    *ppVtab = &vtab->base;
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_disconnect(sqlite3_vtab* pVtab) {
+    delete reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCursor) {
+    auto* vtab = reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
+    auto* cursor = new GeneratorCursor<RowData>();
+    memset(&cursor->base, 0, sizeof(cursor->base));
+    cursor->def = vtab->def;
+    cursor->generator = nullptr;
+    cursor->generator_eof = false;
+    cursor->iterator = nullptr;
+    cursor->using_iterator = false;
+    cursor->iterator_eof = false;
+    *ppCursor = &cursor->base;
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_close(sqlite3_vtab_cursor* pCursor) {
+    delete reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_next(sqlite3_vtab_cursor* pCursor) {
+    auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+    if (cursor->using_iterator && cursor->iterator) {
+        if (!cursor->iterator->next()) {
+            cursor->iterator_eof = true;
+        }
+    } else {
+        if (!cursor->generator || !cursor->generator->next()) {
+            cursor->generator_eof = true;
+        }
+    }
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_eof(sqlite3_vtab_cursor* pCursor) {
+    auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+    if (cursor->using_iterator) {
+        if (!cursor->iterator || cursor->iterator_eof) return 1;
+        return cursor->iterator->eof() ? 1 : 0;
+    }
+    return (!cursor->generator || cursor->generator_eof) ? 1 : 0;
+}
+
+template<typename RowData>
+inline int generator_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int col) {
+    auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+    if (col < 0 || static_cast<size_t>(col) >= cursor->def->columns.size()) {
+        sqlite3_result_null(ctx);
+        return SQLITE_OK;
+    }
+
+    if (cursor->using_iterator && cursor->iterator) {
+        if (cursor->iterator_eof) {
+            sqlite3_result_null(ctx);
+            return SQLITE_OK;
+        }
+        cursor->iterator->column(ctx, col);
+        return SQLITE_OK;
+    }
+
+    if (!cursor->generator || cursor->generator_eof) {
+        sqlite3_result_null(ctx);
+        return SQLITE_OK;
+    }
+
+    cursor->def->columns[col].get(ctx, cursor->generator->current());
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid) {
+    auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+    if (cursor->using_iterator && cursor->iterator) {
+        if (cursor->iterator_eof) {
+            *pRowid = 0;
+            return SQLITE_OK;
+        }
+        *pRowid = cursor->iterator->rowid();
+        return SQLITE_OK;
+    }
+
+    if (!cursor->generator || cursor->generator_eof) {
+        *pRowid = 0;
+        return SQLITE_OK;
+    }
+
+    *pRowid = cursor->generator->rowid();
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
+                                 int argc, sqlite3_value** argv) {
+    auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+
+    cursor->generator = nullptr;
+    cursor->generator_eof = false;
+    cursor->iterator = nullptr;
+    cursor->using_iterator = false;
+    cursor->iterator_eof = false;
+
+    if (idxNum != FILTER_NONE && argc > 0) {
+        for (const auto& filter : cursor->def->filters) {
+            if (filter.filter_id == idxNum) {
+                cursor->iterator = filter.create(argv[0]);
+                cursor->using_iterator = true;
+                cursor->iterator_eof = true;
+                if (cursor->iterator) {
+                    cursor->iterator_eof = !cursor->iterator->next();
+                }
+                return SQLITE_OK;
+            }
+        }
+    }
+
+    // Full scan - create generator and position to first row.
+    cursor->using_iterator = false;
+    cursor->generator_eof = true;
+    if (cursor->def->generator_factory_fn) {
+        cursor->generator = cursor->def->generator_factory_fn();
+        if (cursor->generator) {
+            cursor->generator_eof = !cursor->generator->next();
+        }
+    }
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
+    auto* vtab = reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
+    const auto* def = vtab->def;
+
+    // Prefer filters when available.
+    const FilterDef* best_filter = nullptr;
+    int best_constraint_idx = -1;
+
+    for (int i = 0; i < pInfo->nConstraint; i++) {
+        const auto& constraint = pInfo->aConstraint[i];
+        if (!constraint.usable) continue;
+        if (constraint.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+        const FilterDef* filter = def->find_filter(constraint.iColumn);
+        if (filter) {
+            if (!best_filter || filter->estimated_cost < best_filter->estimated_cost) {
+                best_filter = filter;
+                best_constraint_idx = i;
+            }
+        }
+    }
+
+    if (best_filter && best_constraint_idx >= 0) {
+        pInfo->aConstraintUsage[best_constraint_idx].argvIndex = 1;
+        pInfo->aConstraintUsage[best_constraint_idx].omit = 1;
+        pInfo->idxNum = best_filter->filter_id;
+        pInfo->estimatedCost = best_filter->estimated_cost;
+        pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
+    } else {
+        size_t estimated_rows = 1000;
+        if (def->estimate_rows_fn) {
+            estimated_rows = def->estimate_rows_fn();
+        }
+        pInfo->idxNum = FILTER_NONE;
+        pInfo->estimatedCost = static_cast<double>(estimated_rows);
+        pInfo->estimatedRows = estimated_rows;
+    }
+    return SQLITE_OK;
+}
+
+template<typename RowData>
+inline int generator_vtab_update(sqlite3_vtab*, int, sqlite3_value**, sqlite3_int64*) {
+    return SQLITE_READONLY;
+}
+
+template<typename RowData>
+inline sqlite3_module create_generator_module() {
+    sqlite3_module mod = {};
+    mod.iVersion = 0;
+    mod.xCreate = generator_vtab_connect<RowData>;
+    mod.xConnect = generator_vtab_connect<RowData>;
+    mod.xBestIndex = generator_vtab_best_index<RowData>;
+    mod.xDisconnect = generator_vtab_disconnect<RowData>;
+    mod.xDestroy = generator_vtab_disconnect<RowData>;
+    mod.xOpen = generator_vtab_open<RowData>;
+    mod.xClose = generator_vtab_close<RowData>;
+    mod.xFilter = generator_vtab_filter<RowData>;
+    mod.xNext = generator_vtab_next<RowData>;
+    mod.xEof = generator_vtab_eof<RowData>;
+    mod.xColumn = generator_vtab_column<RowData>;
+    mod.xRowid = generator_vtab_rowid<RowData>;
+    mod.xUpdate = generator_vtab_update<RowData>;
+    return mod;
+}
+
+template<typename RowData>
+inline sqlite3_module& get_generator_module() {
+    static sqlite3_module mod = create_generator_module<RowData>();
+    return mod;
+}
+
+template<typename RowData>
+inline bool register_generator_vtable(sqlite3* db, const char* module_name,
+                                      const GeneratorTableDef<RowData>* def) {
+    int rc = sqlite3_create_module_v2(db, module_name, &get_generator_module<RowData>(),
+                                       const_cast<GeneratorTableDef<RowData>*>(def), nullptr);
+    return rc == SQLITE_OK;
+}
+
+// Generator Table Builder
+template<typename RowData>
+class GeneratorTableBuilder {
+    GeneratorTableDef<RowData> def_;
+public:
+    explicit GeneratorTableBuilder(const char* name) {
+        def_.name = name;
+    }
+
+    GeneratorTableBuilder& estimate_rows(std::function<size_t()> fn) {
+        def_.estimate_rows_fn = std::move(fn);
+        return *this;
+    }
+
+    GeneratorTableBuilder& generator(std::function<std::unique_ptr<Generator<RowData>>()> fn) {
+        def_.generator_factory_fn = std::move(fn);
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_int64(const char* name, std::function<int64_t(const RowData&)> getter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, false,
+            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+                sqlite3_result_int64(ctx, getter(row));
+            }, nullptr);
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_int(const char* name, std::function<int(const RowData&)> getter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, false,
+            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+                sqlite3_result_int(ctx, getter(row));
+            }, nullptr);
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_text(const char* name, std::function<std::string(const RowData&)> getter) {
+        def_.columns.emplace_back(name, ColumnType::Text, false,
+            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+                std::string val = getter(row);
+                sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
+            }, nullptr);
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_double(const char* name, std::function<double(const RowData&)> getter) {
+        def_.columns.emplace_back(name, ColumnType::Real, false,
+            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+                sqlite3_result_double(ctx, getter(row));
+            }, nullptr);
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_blob(const char* name, std::function<std::vector<uint8_t>(const RowData&)> getter) {
+        def_.columns.emplace_back(name, ColumnType::Blob, false,
+            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+                auto val = getter(row);
+                sqlite3_result_blob(ctx, val.data(), static_cast<int>(val.size()), SQLITE_TRANSIENT);
+            }, nullptr);
+        return *this;
+    }
+
+    GeneratorTableBuilder& filter_eq(const char* column_name,
+                                     std::function<std::unique_ptr<RowIterator>(int64_t)> factory,
+                                     double cost = 10.0, double est_rows = 10.0) {
+        int col_idx = def_.find_column(column_name);
+        if (col_idx < 0) return *this;
+        int filter_id = static_cast<int>(def_.filters.size()) + 1;
+        def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
+            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
+                return factory(sqlite3_value_int64(val));
+            });
+        return *this;
+    }
+
+    GeneratorTableBuilder& filter_eq_text(const char* column_name,
+                                          std::function<std::unique_ptr<RowIterator>(const char*)> factory,
+                                          double cost = 10.0, double est_rows = 10.0) {
+        int col_idx = def_.find_column(column_name);
+        if (col_idx < 0) return *this;
+        int filter_id = static_cast<int>(def_.filters.size()) + 1;
+        def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
+            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
+                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                return factory(text ? text : "");
+            });
+        return *this;
+    }
+
+    GeneratorTableDef<RowData> build() { return std::move(def_); }
+};
+
+template<typename RowData>
+inline GeneratorTableBuilder<RowData> generator_table(const char* name) {
+    return GeneratorTableBuilder<RowData>(name);
+}
+
 } // namespace xsql

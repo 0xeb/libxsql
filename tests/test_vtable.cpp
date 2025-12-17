@@ -46,6 +46,79 @@ struct ProgressLimiter {
     int max_calls = 0;
 };
 
+struct GenRow {
+    int64_t key = 0;
+    int64_t n = 0;
+};
+
+class RangeGenerator : public xsql::Generator<GenRow> {
+    std::atomic<int>* next_calls_ = nullptr;
+    int64_t current_ = -1;
+    int64_t end_ = 0;
+    mutable GenRow row_;
+
+public:
+    RangeGenerator(std::atomic<int>* next_calls, int64_t end)
+        : next_calls_(next_calls), end_(end) {}
+
+    bool next() override {
+        next_calls_->fetch_add(1);
+        ++current_;
+        return current_ < end_;
+    }
+
+    const GenRow& current() const override {
+        row_.key = current_;
+        row_.n = current_;
+        return row_;
+    }
+
+    sqlite3_int64 rowid() const override {
+        return current_;
+    }
+};
+
+class SingleRowIterator : public xsql::RowIterator {
+    bool started_ = false;
+    bool valid_ = false;
+    int64_t key_ = 0;
+
+public:
+    explicit SingleRowIterator(int64_t key)
+        : key_(key) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            valid_ = true;
+            return true;
+        }
+        valid_ = false;
+        return false;
+    }
+
+    bool eof() const override {
+        return started_ && !valid_;
+    }
+
+    void column(sqlite3_context* ctx, int col) override {
+        if (!valid_) {
+            sqlite3_result_null(ctx);
+            return;
+        }
+
+        switch (col) {
+            case 0: sqlite3_result_int64(ctx, key_); break;
+            case 1: sqlite3_result_int64(ctx, key_); break;
+            default: sqlite3_result_null(ctx); break;
+        }
+    }
+
+    int64_t rowid() const override {
+        return key_;
+    }
+};
+
 int progress_handler(void* p) {
     auto* limiter = static_cast<ProgressLimiter*>(p);
     limiter->calls++;
@@ -355,4 +428,59 @@ TEST_F(VTableTest, CachedIteratorTerminationUsesNextReturnValue) {
     EXPECT_EQ(results[0][1], "0");
     EXPECT_EQ(results[1][0], "123");
     EXPECT_EQ(results[1][1], "1");
+}
+
+TEST_F(VTableTest, GeneratorTableLimitStopsEarly) {
+    std::atomic<int> next_calls = 0;
+    std::atomic<int> factory_calls = 0;
+
+    auto table = xsql::generator_table<GenRow>("gen_table")
+        .estimate_rows([]() { return 1000; })
+        .generator([&]() -> std::unique_ptr<xsql::Generator<GenRow>> {
+            factory_calls.fetch_add(1);
+            return std::make_unique<RangeGenerator>(&next_calls, 1000);
+        })
+        .column_int64("key", [](const GenRow& r) { return r.key; })
+        .column_int64("n", [](const GenRow& r) { return r.n; })
+        .build();
+
+    EXPECT_TRUE(xsql::register_generator_vtable(db_, "gen_module", &table));
+    EXPECT_TRUE(xsql::create_vtable(db_, "gen", "gen_module"));
+
+    auto results = query("SELECT n FROM gen LIMIT 10");
+    ASSERT_EQ(results.size(), 10);
+
+    // xFilter positions once, then xNext advances per row; allow a small buffer.
+    EXPECT_EQ(factory_calls.load(), 1);
+    EXPECT_LE(next_calls.load(), 25);
+}
+
+TEST_F(VTableTest, GeneratorTableFiltersBypassGenerator) {
+    std::atomic<int> next_calls = 0;
+    std::atomic<int> factory_calls = 0;
+
+    auto table = xsql::generator_table<GenRow>("gen_filter_table")
+        .estimate_rows([]() { return 1000; })
+        .generator([&]() -> std::unique_ptr<xsql::Generator<GenRow>> {
+            factory_calls.fetch_add(1);
+            return std::make_unique<RangeGenerator>(&next_calls, 1000);
+        })
+        .column_int64("key", [](const GenRow& r) { return r.key; })
+        .column_int64("n", [](const GenRow& r) { return r.n; })
+        .filter_eq("key", [](int64_t key) -> std::unique_ptr<xsql::RowIterator> {
+            return std::make_unique<SingleRowIterator>(key);
+        }, 1.0, 1.0)
+        .build();
+
+    EXPECT_TRUE(xsql::register_generator_vtable(db_, "gen_filter_module", &table));
+    EXPECT_TRUE(xsql::create_vtable(db_, "gen_filter", "gen_filter_module"));
+
+    auto results = query("SELECT key, n FROM gen_filter WHERE key = 42");
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_EQ(results[0][0], "42");
+    EXPECT_EQ(results[0][1], "42");
+
+    // Filter path should not even create a generator.
+    EXPECT_EQ(factory_calls.load(), 0);
+    EXPECT_EQ(next_calls.load(), 0);
 }
