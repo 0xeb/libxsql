@@ -126,7 +126,7 @@ inline int register_scalar_function(
     int flags = SQLITE_UTF8 | SQLITE_DETERMINISTIC
 ) {
     auto* wrapper = new detail::FunctionWrapper{std::move(fn)};
-    return sqlite3_create_function_v2(
+    int rc = sqlite3_create_function_v2(
         db,
         name,
         argc,
@@ -137,6 +137,10 @@ inline int register_scalar_function(
         nullptr,
         detail::destroy_wrapper
     );
+    if (rc != SQLITE_OK) {
+        delete wrapper;
+    }
+    return rc;
 }
 
 } // namespace xsql
