@@ -47,12 +47,26 @@
 #include <sstream>
 #include <cstring>
 #include <memory>
+#include <new>
 
 namespace xsql {
 
-// ============================================================================
+namespace detail {
+template <typename T>
+inline T* clone_def(const T* src) {
+    if (!src) return nullptr;
+    return new (std::nothrow) T(*src);
+}
+
+template <typename T>
+inline void destroy_def(void* p) {
+    delete static_cast<T*>(p);
+}
+} // namespace detail
+
+// ============================================================================ 
 // Column Types
-// ============================================================================
+// ============================================================================ 
 
 enum class ColumnType {
     Integer,
@@ -486,9 +500,18 @@ inline sqlite3_module& get_module() {
 // ============================================================================
 
 inline bool register_vtable(sqlite3* db, const char* module_name, const VTableDef* def) {
+    if (!db || !module_name || !def) return false;
+
+    VTableDef* owned = detail::clone_def(def);
+    if (!owned) return false;
+
     int rc = sqlite3_create_module_v2(db, module_name, &get_module(),
-                                       const_cast<VTableDef*>(def), nullptr);
-    return rc == SQLITE_OK;
+                                      owned, &detail::destroy_def<VTableDef>);
+    if (rc != SQLITE_OK) {
+        delete owned;
+        return false;
+    }
+    return true;
 }
 
 inline bool create_vtable(sqlite3* db, const char* table_name, const char* module_name) {
@@ -1021,9 +1044,24 @@ inline sqlite3_module& get_cached_module() {
 template<typename RowData>
 inline bool register_cached_vtable(sqlite3* db, const char* module_name,
                                    const CachedTableDef<RowData>* def) {
-    int rc = sqlite3_create_module_v2(db, module_name, &get_cached_module<RowData>(),
-                                       const_cast<CachedTableDef<RowData>*>(def), nullptr);
-    return rc == SQLITE_OK;
+    if (!db || !module_name || !def) return false;
+
+    auto* owned = detail::clone_def(def);
+    if (!owned) return false;
+
+    int rc = sqlite3_create_module_v2(
+        db,
+        module_name,
+        &get_cached_module<RowData>(),
+        owned,
+        &detail::destroy_def<CachedTableDef<RowData>>
+    );
+
+    if (rc != SQLITE_OK) {
+        delete owned;
+        return false;
+    }
+    return true;
 }
 
 // Cached Table Builder
@@ -1432,9 +1470,24 @@ inline sqlite3_module& get_generator_module() {
 template<typename RowData>
 inline bool register_generator_vtable(sqlite3* db, const char* module_name,
                                       const GeneratorTableDef<RowData>* def) {
-    int rc = sqlite3_create_module_v2(db, module_name, &get_generator_module<RowData>(),
-                                       const_cast<GeneratorTableDef<RowData>*>(def), nullptr);
-    return rc == SQLITE_OK;
+    if (!db || !module_name || !def) return false;
+
+    auto* owned = detail::clone_def(def);
+    if (!owned) return false;
+
+    int rc = sqlite3_create_module_v2(
+        db,
+        module_name,
+        &get_generator_module<RowData>(),
+        owned,
+        &detail::destroy_def<GeneratorTableDef<RowData>>
+    );
+
+    if (rc != SQLITE_OK) {
+        delete owned;
+        return false;
+    }
+    return true;
 }
 
 // Generator Table Builder
