@@ -40,6 +40,7 @@ using status_handler_t = std::function<std::string()>;
 struct server_config {
     int port = 5555;
     std::string bind_address = "127.0.0.1";
+    std::string auth_token;
 
     // Required: handles SQL queries
     query_handler_t on_query;
@@ -132,10 +133,32 @@ private:
         });
     }
 
-    void handle_query(const httplib::Request& req, httplib::Response& res) {
+    bool authorize(const httplib::Request& req, httplib::Response& res) const {
+        if (config_.auth_token.empty()) return true;
+
+        std::string token;
+        if (req.has_header("X-XSQL-Token")) {
+            token = req.get_header_value("X-XSQL-Token");
+        } else if (req.has_header("Authorization")) {
+            const std::string auth = req.get_header_value("Authorization");
+            const std::string prefix = "Bearer ";
+            if (auth.rfind(prefix, 0) == 0) {
+                token = auth.substr(prefix.size());
+            }
+        }
+
+        if (token == config_.auth_token) return true;
+
+        res.status = 401;
+        res.set_content("Unauthorized", "text/plain");
+        return false;
+    }
+
+    void handle_query(const httplib::Request& req, httplib::Response& res) {    
+        if (!authorize(req, res)) return;
         if (!config_.on_query) {
             res.status = 500;
-            res.set_content("No query handler configured", "text/plain");
+            res.set_content("No query handler configured", "text/plain");       
             return;
         }
 
@@ -157,7 +180,8 @@ private:
         }
     }
 
-    void handle_status(const httplib::Request&, httplib::Response& res) {
+    void handle_status(const httplib::Request& req, httplib::Response& res) {
+        if (!authorize(req, res)) return;
         if (config_.on_status) {
             try {
                 std::string status = config_.on_status();
@@ -171,7 +195,8 @@ private:
         }
     }
 
-    void handle_shutdown(const httplib::Request&, httplib::Response& res) {
+    void handle_shutdown(const httplib::Request& req, httplib::Response& res) {
+        if (!authorize(req, res)) return;
         res.set_content("Shutting down\n", "text/plain");
         if (config_.on_shutdown) {
             config_.on_shutdown();

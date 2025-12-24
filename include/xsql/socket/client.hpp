@@ -49,6 +49,7 @@ class Client {
     std::string error_;
     bool wsa_init_ = false;
     size_t max_message_bytes_ = 10 * 1024 * 1024;
+    std::string auth_token_;
 
 public:
     Client() {
@@ -123,6 +124,9 @@ public:
     void set_max_message_bytes(size_t bytes) { max_message_bytes_ = bytes; }
     size_t max_message_bytes() const { return max_message_bytes_; }
 
+    void set_auth_token(std::string token) { auth_token_ = std::move(token); }
+    const std::string& auth_token() const { return auth_token_; }
+
     /**
      * Execute SQL query.
      * @param sql SQL query string
@@ -139,7 +143,13 @@ public:
         // Build JSON request
         std::string request = "{\"sql\":\"";
         request += json_escape(sql);
-        request += "\"}";
+        request += "\"";
+        if (!auth_token_.empty()) {
+            request += ",\"token\":\"";
+            request += json_escape(auth_token_);
+            request += "\"";
+        }
+        request += "}";
 
         if (!send_message(request)) {
             result.error = "send failed";

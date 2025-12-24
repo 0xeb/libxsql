@@ -140,15 +140,32 @@ inline std::string result_to_json(const QueryResult& result) {
     return json.str();
 }
 
-inline std::string extract_sql_from_request(const std::string& json) {
-    auto pos = json.find("\"sql\"");
-    if (pos == std::string::npos) return "";
+inline std::string extract_string_field(const std::string& json, const char* field) {
+    if (!field || !*field) return "";
 
-    pos = json.find("\"", pos + 5);
-    if (pos == std::string::npos) return "";
-    pos++;
+    std::string key = "\"";
+    key += field;
+    key += "\"";
 
+    auto key_pos = json.find(key);
+    if (key_pos == std::string::npos) return "";
+
+    auto colon_pos = json.find(':', key_pos + key.size());
+    if (colon_pos == std::string::npos) return "";
+
+    auto quote_pos = json.find('\"', colon_pos + 1);
+    if (quote_pos == std::string::npos) return "";
+
+    size_t pos = quote_pos + 1;
     return json_unescape(json, pos);
+}
+
+inline std::string extract_sql_from_request(const std::string& json) {
+    return extract_string_field(json, "sql");
+}
+
+inline std::string extract_token_from_request(const std::string& json) {
+    return extract_string_field(json, "token");
 }
 
 //=============================================================================

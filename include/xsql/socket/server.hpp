@@ -57,6 +57,7 @@ struct ServerConfig {
     std::string bind_address = "127.0.0.1";
     bool verbose = true;
     size_t max_message_bytes = 10 * 1024 * 1024;
+    std::string auth_token;
 };
 
 //=============================================================================
@@ -218,6 +219,14 @@ private:
             if (sql.empty()) {
                 send_message(client, "{\"success\":false,\"error\":\"Invalid request: missing sql field\"}");
                 continue;
+            }
+
+            if (!config_.auth_token.empty()) {
+                std::string token = extract_token_from_request(request);
+                if (token != config_.auth_token) {
+                    send_message(client, "{\"success\":false,\"error\":\"Unauthorized\"}");
+                    continue;
+                }
             }
 
             QueryResult result;
