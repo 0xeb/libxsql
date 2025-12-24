@@ -201,7 +201,12 @@ Serve tables over TCP with length-prefixed JSON protocol.
 #include <xsql/socket/socket.hpp>
 
 xsql::socket::Server server;
-server.start(12345, [&](const std::string& sql) {
+// Optional: require an auth token from clients
+// xsql::socket::ServerConfig cfg;
+// cfg.auth_token = "secret";
+// server.set_config(cfg);
+
+server.set_query_handler([&](const std::string& sql) {
     auto result = db.query(sql);
     xsql::socket::QueryResult qr;
     qr.success = result.ok();
@@ -212,7 +217,7 @@ server.start(12345, [&](const std::string& sql) {
     }
     return qr;
 });
-server.run();  // Blocking
+server.run(12345);  // Blocking
 ```
 
 ### Client
@@ -221,6 +226,8 @@ server.run();  // Blocking
 #include <xsql/socket/socket.hpp>
 
 xsql::socket::Client client;
+// Optional: if server requires a token
+// client.set_auth_token("secret");
 if (client.connect("localhost", 12345)) {
     auto result = client.query("SELECT * FROM items LIMIT 10");
     if (result.success) {
