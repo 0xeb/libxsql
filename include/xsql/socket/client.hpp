@@ -18,6 +18,8 @@
 
 #include <string>
 #include <cstdint>
+#include <cstddef>
+#include <limits>
 
 // Platform-specific socket includes
 #ifdef _WIN32
@@ -46,6 +48,7 @@ class Client {
     socket_t sock_ = SOCKET_INVALID;
     std::string error_;
     bool wsa_init_ = false;
+    size_t max_message_bytes_ = 10 * 1024 * 1024;
 
 public:
     Client() {
@@ -117,6 +120,9 @@ public:
     bool is_connected() const { return sock_ != SOCKET_INVALID; }
     const std::string& error() const { return error_; }
 
+    void set_max_message_bytes(size_t bytes) { max_message_bytes_ = bytes; }
+    size_t max_message_bytes() const { return max_message_bytes_; }
+
     /**
      * Execute SQL query.
      * @param sql SQL query string
@@ -151,26 +157,45 @@ public:
 
 private:
     bool send_message(const std::string& payload) {
+        if (payload.size() > max_message_bytes_) return false;
+        if (payload.size() > static_cast<size_t>((std::numeric_limits<uint32_t>::max)())) return false;
+
+        auto send_all = [&](const char* data, size_t len) -> bool {
+            size_t total = 0;
+            while (total < len) {
+                int n = send(sock_, data + total, static_cast<int>(len - total), 0);
+                if (n <= 0) return false;
+                total += static_cast<size_t>(n);
+            }
+            return true;
+        };
+
         uint32_t len = static_cast<uint32_t>(payload.size());
-        if (send(sock_, reinterpret_cast<char*>(&len), 4, 0) != 4) return false;
-        if (send(sock_, payload.c_str(), static_cast<int>(len), 0) != static_cast<int>(len)) return false;
-        return true;
+        uint32_t len_net = htonl(len);
+
+        if (!send_all(reinterpret_cast<const char*>(&len_net), sizeof(len_net))) return false;
+        return send_all(payload.data(), payload.size());
     }
 
     bool recv_message(std::string& payload) {
-        uint32_t len = 0;
-        int received = recv(sock_, reinterpret_cast<char*>(&len), 4, 0);
-        if (received != 4) return false;
-        if (len > 100 * 1024 * 1024) return false;  // 100MB limit
+        auto recv_all = [&](char* data, size_t len) -> bool {
+            size_t total = 0;
+            while (total < len) {
+                int n = recv(sock_, data + total, static_cast<int>(len - total), 0);
+                if (n <= 0) return false;
+                total += static_cast<size_t>(n);
+            }
+            return true;
+        };
+
+        uint32_t len_net = 0;
+        if (!recv_all(reinterpret_cast<char*>(&len_net), sizeof(len_net))) return false;
+
+        uint32_t len = ntohl(len_net);
+        if (static_cast<size_t>(len) > max_message_bytes_) return false;
 
         payload.resize(len);
-        size_t total = 0;
-        while (total < len) {
-            int n = recv(sock_, payload.data() + total, static_cast<int>(len - total), 0);
-            if (n <= 0) return false;
-            total += n;
-        }
-        return true;
+        return recv_all(payload.data(), payload.size());
     }
 };
 
