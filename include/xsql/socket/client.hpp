@@ -32,6 +32,7 @@
     #include <sys/socket.h>
     #include <netinet/in.h>
     #include <arpa/inet.h>
+    #include <netdb.h>
     #include <unistd.h>
     typedef int socket_t;
     #define SOCKET_INVALID -1
