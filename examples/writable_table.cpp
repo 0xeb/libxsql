@@ -51,7 +51,6 @@ int main() {
 
     // Open database and register table
     xsql::Database db;
-    db.open(":memory:");
     db.register_and_create_table(def);
 
     // Show initial state

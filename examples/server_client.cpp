@@ -44,7 +44,6 @@ void setup_database() {
         .column_int("quantity", [](size_t i) { return g_items[i].quantity; })
         .build();
 
-    g_db.open(":memory:");
     g_db.register_and_create_table(g_def);
 }
 
