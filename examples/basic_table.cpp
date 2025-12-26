@@ -35,10 +35,6 @@ int main() {
 
     // Open database and register table
     xsql::Database db;
-    if (!db.open(":memory:")) {
-        fprintf(stderr, "Failed to open database: %s\n", db.last_error().c_str());
-        return 1;
-    }
 
     db.register_and_create_table(def);
 
