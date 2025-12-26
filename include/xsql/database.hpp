@@ -189,6 +189,15 @@ public:
     }
 
     template<typename RowData>
+    bool register_cached_table(const char* module_name, const CachedTableDef<RowData>* def) {
+        if (!db_) {
+            last_error_ = "Database not open";
+            return false;
+        }
+        return register_cached_vtable(db_, module_name, def);
+    }
+
+    template<typename RowData>
     bool register_and_create_cached_table(const CachedTableDef<RowData>& def) {
         return register_cached_table(def) &&
                create_table(def.name.c_str(), def.name.c_str());
@@ -211,6 +220,15 @@ public:
             return false;
         }
         return register_generator_vtable(db_, def.name.c_str(), &def);
+    }
+
+    template<typename RowData>
+    bool register_generator_table(const char* module_name, const GeneratorTableDef<RowData>* def) {
+        if (!db_) {
+            last_error_ = "Database not open";
+            return false;
+        }
+        return register_generator_vtable(db_, module_name, def);
     }
 
     template<typename RowData>
