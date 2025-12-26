@@ -50,7 +50,7 @@ auto def = xsql::table("items")
 xsql::Database db;
 db.open(":memory:");
 db.register_table(def.name.c_str(), &def);
-db.create_table("items", def.name.c_str());
+db.create_table(def.name.c_str(), def.name.c_str());
 
 auto result = db.query("SELECT * FROM items WHERE id > 1");
 for (const auto& row : result) {
@@ -269,7 +269,7 @@ if (client.connect("localhost", 12345)) {
 xsql::Database db;
 db.open(":memory:");                        // Open database
 db.register_table(def.name.c_str(), &def);  // Register module
-db.create_table("tbl", def.name.c_str());   // Create virtual table
+db.create_table(def.name.c_str(), def.name.c_str());   // Create virtual table
 auto result = db.query("SELECT ...");       // Execute query
 db.exec("UPDATE ...");                      // Execute statement
 db.close();                                 // Close (automatic in destructor)

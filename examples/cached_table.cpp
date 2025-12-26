@@ -105,7 +105,7 @@ int main() {
     xsql::Database db;
     db.open(":memory:");
     xsql::register_cached_vtable(db.handle(), def.name.c_str(), &def);
-    db.create_table("xrefs", def.name.c_str());
+    db.create_table(def.name.c_str(), def.name.c_str());
 
     // Full scan query (builds cache)
     printf("Query 1: Full scan\n");

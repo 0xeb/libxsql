@@ -53,7 +53,7 @@ int main() {
     xsql::Database db;
     db.open(":memory:");
     db.register_table(def.name.c_str(), &def);
-    db.create_table("tasks", def.name.c_str());
+    db.create_table(def.name.c_str(), def.name.c_str());
 
     // Show initial state
     auto print_tasks = [&]() {

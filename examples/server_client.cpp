@@ -46,7 +46,7 @@ void setup_database() {
 
     g_db.open(":memory:");
     g_db.register_table(g_def.name.c_str(), &g_def);
-    g_db.create_table("items", g_def.name.c_str());
+    g_db.create_table(g_def.name.c_str(), g_def.name.c_str());
 }
 
 xsql::socket::QueryResult execute_query(const std::string& sql) {
