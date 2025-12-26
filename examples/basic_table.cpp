@@ -40,8 +40,7 @@ int main() {
         return 1;
     }
 
-    db.register_table(def.name.c_str(), &def);
-    db.create_table(def.name.c_str(), def.name.c_str());
+    db.register_and_create_table(def);
 
     // Query: All products
     printf("All products:\n");

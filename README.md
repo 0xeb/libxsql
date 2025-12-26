@@ -49,8 +49,7 @@ auto def = xsql::table("items")
 // Use it
 xsql::Database db;
 db.open(":memory:");
-db.register_table(def.name.c_str(), &def);
-db.create_table(def.name.c_str(), def.name.c_str());
+db.register_and_create_table(def);
 
 auto result = db.query("SELECT * FROM items WHERE id > 1");
 for (const auto& row : result) {
@@ -268,8 +267,7 @@ if (client.connect("localhost", 12345)) {
 ```cpp
 xsql::Database db;
 db.open(":memory:");                        // Open database
-db.register_table(def.name.c_str(), &def);  // Register module
-db.create_table(def.name.c_str(), def.name.c_str());   // Create virtual table
+db.register_and_create_table(def);         // Register and create table
 auto result = db.query("SELECT ...");       // Execute query
 db.exec("UPDATE ...");                      // Execute statement
 db.close();                                 // Close (automatic in destructor)

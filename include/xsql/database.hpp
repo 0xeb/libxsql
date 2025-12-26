@@ -149,6 +149,11 @@ public:
         return xsql::create_vtable(db_, table_name, module_name);
     }
 
+    bool register_and_create_table(const VTableDef& def) {
+        return register_table(def) &&
+               create_table(def.name.c_str(), def.name.c_str());
+    }
+
     // ========================================================================
     // Function Registration
     // ========================================================================
