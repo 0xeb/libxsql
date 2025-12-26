@@ -76,6 +76,7 @@ private:
     log_func_t log_func_;
     std::atomic<bool> running_{false};
     socket_t listen_sock_ = SOCKET_INVALID;
+    std::atomic<socket_t> active_client_{SOCKET_INVALID};
     std::thread server_thread_;
     bool wsa_init_ = false;
 
@@ -132,6 +133,15 @@ public:
         if (listen_sock_ != SOCKET_INVALID) {
             CLOSE_SOCKET(listen_sock_);
             listen_sock_ = SOCKET_INVALID;
+        }
+
+        socket_t client = active_client_.exchange(SOCKET_INVALID);
+        if (client != SOCKET_INVALID) {
+#ifdef _WIN32
+            ::shutdown(client, SD_BOTH);
+#else
+            ::shutdown(client, SHUT_RDWR);
+#endif
         }
 
         if (server_thread_.joinable()) {
@@ -214,6 +224,7 @@ private:
     }
 
     void handle_client(socket_t client) {
+        active_client_.store(client);
         std::string request;
         while (running_ && recv_message(client, request)) {
             std::string sql = extract_sql_from_request(request);
@@ -243,6 +254,7 @@ private:
 
             if (!send_message(client, result_to_json(result))) break;
         }
+        active_client_.compare_exchange_strong(client, SOCKET_INVALID);
         CLOSE_SOCKET(client);
     }
 
