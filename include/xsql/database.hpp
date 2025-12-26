@@ -344,6 +344,28 @@ public:
         return exec(sql.c_str());
     }
 
+    /**
+     * Execute SQL with callback (for custom result handling)
+     */
+    int exec(const char* sql, int (*callback)(void*, int, char**, char**), void* data) {
+        if (!db_) {
+            last_error_ = "Database not open";
+            return SQLITE_ERROR;
+        }
+
+        char* err = nullptr;
+        int rc = sqlite3_exec(db_, sql, callback, data, &err);
+        if (err) {
+            last_error_ = err;
+            sqlite3_free(err);
+        } else if (rc != SQLITE_OK) {
+            last_error_ = sqlite3_errmsg(db_);
+        } else {
+            last_error_.clear();
+        }
+        return rc;
+    }
+
     // ========================================================================
     // Direct Access
     // ========================================================================
