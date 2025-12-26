@@ -274,8 +274,14 @@ private:
         // Bind
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = inet_addr(config_.bind_address.c_str());
-        addr.sin_port = htons(static_cast<uint16_t>(config_.port));
+        if (inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) != 1) {
+            log("Invalid bind_address: " + config_.bind_address);
+            CLOSE_SOCKET(listen_sock_);
+            listen_sock_ = SOCKET_INVALID;
+            cleanup_winsock();
+            return false;
+        }
+        addr.sin_port = htons(static_cast<uint16_t>(config_.port));       
 
         if (bind(listen_sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
             log("bind() failed: " + std::to_string(SOCKET_ERROR_CODE));
