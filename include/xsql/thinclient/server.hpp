@@ -41,6 +41,7 @@ struct server_config {
     int port = 5555;
     std::string bind_address = "127.0.0.1";
     std::string auth_token;
+    bool allow_insecure_no_auth = false;
 
     // Required: handles SQL queries
     query_handler_t on_query;
@@ -71,6 +72,17 @@ public:
      */
     void run() {
         setup_routes();
+
+        auto is_loopback_bind_address = [](const std::string& addr) -> bool {
+            return addr == "localhost" || addr == "127.0.0.1" || addr == "::1" || addr.rfind("127.", 0) == 0;
+        };
+
+        if (!config_.allow_insecure_no_auth && config_.auth_token.empty() && !is_loopback_bind_address(config_.bind_address)) {
+            std::cerr << "Refusing to bind to " << config_.bind_address
+                      << " without auth token. Set server_config::auth_token or allow_insecure_no_auth=true.\n";
+            return;
+        }
+
         running_ = true;
         std::cout << "Listening on " << config_.bind_address << ":" << config_.port << "\n";
         svr_.listen(config_.bind_address.c_str(), config_.port);

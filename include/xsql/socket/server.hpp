@@ -58,6 +58,7 @@ struct ServerConfig {
     bool verbose = true;
     size_t max_message_bytes = 10 * 1024 * 1024;
     std::string auth_token;
+    bool allow_insecure_no_auth = false;
 };
 
 //=============================================================================
@@ -247,6 +248,16 @@ private:
 
     bool run_server() {
         if (!init_winsock()) return false;
+
+        auto is_loopback_bind_address = [](const std::string& addr) -> bool {
+            return addr == "127.0.0.1" || addr.rfind("127.", 0) == 0;
+        };
+
+        if (!config_.allow_insecure_no_auth && config_.auth_token.empty() && !is_loopback_bind_address(config_.bind_address)) {
+            log("Refusing to bind to " + config_.bind_address + " without auth token. Set ServerConfig::auth_token or allow_insecure_no_auth=true.");
+            cleanup_winsock();
+            return false;
+        }
 
         listen_sock_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_sock_ == SOCKET_INVALID) {
