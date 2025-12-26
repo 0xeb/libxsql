@@ -17,6 +17,7 @@ enable_testing()
 set(XSQL_TEST_SOURCES
     test_vtable.cpp
     test_database.cpp
+    test_protocol.cpp
 )
 
 # Add thinclient tests if enabled
