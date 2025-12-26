@@ -70,7 +70,12 @@ struct Result {
 
 class Database {
 public:
-    Database() = default;
+    Database() { open(":memory:"); }
+
+    /**
+     * Constructor with explicit path
+     */
+    explicit Database(const char* path) { open(path); }
     ~Database() { close(); }
 
     // Non-copyable
@@ -154,6 +159,72 @@ public:
                create_table(def.name.c_str(), def.name.c_str());
     }
 
+    /**
+     * Register and create a virtual table with different table name
+     */
+    bool register_and_create_table(const VTableDef& def, const char* table_name) {
+        return register_table(def) &&
+               create_table(table_name, def.name.c_str());
+    }
+
+    /**
+     * Register and create multiple virtual tables at once
+     */
+    template<typename... Defs>
+    bool register_and_create_tables(Defs&... defs) {
+        return (register_and_create_table(defs) && ...);
+    }
+
+    // ========================================================================
+    // Table Registration - Cached Virtual Tables
+    // ========================================================================
+
+    template<typename RowData>
+    bool register_cached_table(const CachedTableDef<RowData>& def) {
+        if (!db_) {
+            last_error_ = "Database not open";
+            return false;
+        }
+        return register_cached_vtable(db_, def.name.c_str(), &def);
+    }
+
+    template<typename RowData>
+    bool register_and_create_cached_table(const CachedTableDef<RowData>& def) {
+        return register_cached_table(def) &&
+               create_table(def.name.c_str(), def.name.c_str());
+    }
+
+    template<typename RowData>
+    bool register_and_create_cached_table(const CachedTableDef<RowData>& def, const char* table_name) {
+        return register_cached_table(def) &&
+               create_table(table_name, def.name.c_str());
+    }
+
+    // ========================================================================
+    // Table Registration - Generator Virtual Tables
+    // ========================================================================
+
+    template<typename RowData>
+    bool register_generator_table(const GeneratorTableDef<RowData>& def) {
+        if (!db_) {
+            last_error_ = "Database not open";
+            return false;
+        }
+        return register_generator_vtable(db_, def.name.c_str(), &def);
+    }
+
+    template<typename RowData>
+    bool register_and_create_generator_table(const GeneratorTableDef<RowData>& def) {
+        return register_generator_table(def) &&
+               create_table(def.name.c_str(), def.name.c_str());
+    }
+
+    template<typename RowData>
+    bool register_and_create_generator_table(const GeneratorTableDef<RowData>& def, const char* table_name) {
+        return register_generator_table(def) &&
+               create_table(table_name, def.name.c_str());
+    }
+
     // ========================================================================
     // Function Registration
     // ========================================================================
@@ -215,6 +286,21 @@ public:
 
     Result query(const std::string& sql) {
         return query(sql.c_str());
+    }
+
+    /**
+     * Get single value (first column of first row)
+     */
+    std::string scalar(const char* sql) {
+        auto result = query(sql);
+        if (result.ok() && !result.empty()) {
+            return result[0][0];
+        }
+        return "";
+    }
+
+    std::string scalar(const std::string& sql) {
+        return scalar(sql.c_str());
     }
 
     int exec(const char* sql) {
