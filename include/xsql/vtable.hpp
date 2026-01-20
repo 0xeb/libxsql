@@ -46,6 +46,7 @@
 #include <functional>
 #include <sstream>
 #include <cstring>
+#include <cctype>
 #include <memory>
 #include <new>
 
@@ -514,7 +515,20 @@ inline bool register_vtable(sqlite3* db, const char* module_name, const VTableDe
     return true;
 }
 
+/// Validate that a name contains only alphanumeric chars and underscores
+inline bool is_valid_sql_identifier(const char* name) {
+    if (!name || !*name) return false;
+    for (const char* p = name; *p; ++p) {
+        if (!std::isalnum(static_cast<unsigned char>(*p)) && *p != '_') return false;
+    }
+    return true;
+}
+
 inline bool create_vtable(sqlite3* db, const char* table_name, const char* module_name) {
+    // Validate identifiers to prevent SQL injection
+    if (!is_valid_sql_identifier(table_name) || !is_valid_sql_identifier(module_name)) {
+        return false;
+    }
     std::string sql = "CREATE VIRTUAL TABLE " + std::string(table_name) +
                       " USING " + std::string(module_name) + ";";
     char* err = nullptr;
