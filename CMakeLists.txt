@@ -18,6 +18,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_subdirectory(external/sqlite)
 
 # ============================================================================
+# nlohmann/json (shared dependency for all xsql projects)
+# ============================================================================
+
+include(FetchContent)
+find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG v3.11.3
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+    message(STATUS "libxsql: Fetched nlohmann/json via FetchContent")
+else()
+    message(STATUS "libxsql: Using nlohmann/json via find_package")
+endif()
+
+# ============================================================================
 # libxsql - Header-only library with SQLite dependency
 # ============================================================================
 
@@ -29,7 +48,7 @@ target_include_directories(xsql INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(xsql INTERFACE sqlite3)
+target_link_libraries(xsql INTERFACE sqlite3 nlohmann_json::nlohmann_json)
 
 target_compile_features(xsql INTERFACE cxx_std_17)
 
