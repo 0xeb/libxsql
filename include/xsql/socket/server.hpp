@@ -31,6 +31,7 @@
     #include <winsock2.h>
     #include <ws2tcpip.h>
     typedef SOCKET socket_t;
+    typedef int socklen_t;
     #define SOCKET_INVALID INVALID_SOCKET
     #define SOCKET_ERROR_CODE WSAGetLastError()
     #define CLOSE_SOCKET closesocket
@@ -301,6 +302,15 @@ private:
             listen_sock_ = SOCKET_INVALID;
             cleanup_winsock();
             return false;
+        }
+
+        // If port was 0, get the actual assigned port
+        if (config_.port == 0) {
+            sockaddr_in bound_addr{};
+            socklen_t addr_len = sizeof(bound_addr);
+            if (getsockname(listen_sock_, reinterpret_cast<sockaddr*>(&bound_addr), &addr_len) == 0) {
+                config_.port = ntohs(bound_addr.sin_port);
+            }
         }
 
         if (listen(listen_sock_, 1) < 0) {

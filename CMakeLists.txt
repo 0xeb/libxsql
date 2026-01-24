@@ -77,6 +77,11 @@ if(XSQL_WITH_THINCLIENT)
     list(APPEND XSQL_EXPORT_TARGETS httplib)
 endif()
 
+# Include nlohmann_json in export if it was fetched (not system-installed)
+if(TARGET nlohmann_json AND NOT nlohmann_json_FOUND)
+    list(APPEND XSQL_EXPORT_TARGETS nlohmann_json)
+endif()
+
 export(TARGETS ${XSQL_EXPORT_TARGETS}
     NAMESPACE xsql::
     FILE "${CMAKE_CURRENT_BINARY_DIR}/xsqlTargets.cmake"
