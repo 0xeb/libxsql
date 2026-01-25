@@ -1,6 +1,10 @@
 # libxsql
 
-C++17 header-only library for SQLite virtual tables.
+**libxsql** is a modern C++17 header-only library that exposes C++ data structures as SQLite virtual tables.
+
+SQL is the universal query language. By exposing your application's data as SQL tables, you make it instantly accessible to scripts, CLI pipelines, and AI coding agents. No proprietary API to learn. No SDK to integrate. Just SQL.
+
+Build a CLI tool with libxsql, and any agent (Claude Code, Codex, Copilot) can query your application's internals with zero additional work.
 
 ## Features
 
@@ -16,7 +20,7 @@ C++17 header-only library for SQLite virtual tables.
 ### As Git Submodule
 
 ```bash
-git submodule add https://github.com/user/libxsql external/libxsql
+git submodule add https://github.com/0xeb/libxsql external/libxsql
 ```
 
 ```cmake
@@ -273,11 +277,75 @@ db.exec("UPDATE ...");                      // Execute statement
 db.close();                                 // Close (automatic in destructor)
 ```
 
+## CLI Tools and AI Agents
+
+libxsql is designed for building CLI tools that AI coding agents can query directly.
+
+### The Pattern
+
+1. Your application exposes data as virtual tables
+2. A thin CLI client connects via socket and runs SQL
+3. Agents invoke the CLI and parse results
+
+```
+┌─────────────────┐     SQL over TCP     ┌─────────────┐
+│  Your App       │◄────────────────────►│  CLI Client │
+│  (libxsql)      │                      │  (thin)     │
+│                 │                      └──────┬──────┘
+│  - funcs table  │                             │
+│  - strings table│                             ▼
+│  - xrefs table  │                      ┌─────────────┐
+└─────────────────┘                      │  AI Agent   │
+                                         │  (invokes   │
+                                         │   CLI)      │
+                                         └─────────────┘
+```
+
+### Why This Works
+
+- **SQL is universal** - Every agent understands SQL. No tool definitions needed.
+- **Self-describing** - `SELECT * FROM sqlite_master` lists available tables.
+- **Composable** - Agents can JOIN, filter, aggregate without learning your API.
+- **Portable** - Same queries work in scripts, notebooks, CI pipelines.
+
+### Example: Reverse Engineering Tool
+
+```cpp
+// Expose IDA-like data structures
+auto funcs = xsql::table("funcs")
+    .count([&]() { return functions.size(); })
+    .column_text("name", [&](size_t i) { return functions[i].name; })
+    .column_int64("address", [&](size_t i) { return functions[i].addr; })
+    .column_int("size", [&](size_t i) { return functions[i].size; })
+    .build();
+
+// Start server
+xsql::socket::Server server;
+server.set_query_handler([&](const std::string& sql) { /* ... */ });
+server.run(13337);
+```
+
+Now an agent can:
+
+```bash
+# Find largest functions
+mytool --remote localhost:13337 -q "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
+
+# Search for patterns
+mytool --remote localhost:13337 -q "SELECT * FROM strings WHERE content LIKE '%password%'"
+```
+
+The agent writes SQL. Your tool executes it. No glue code required.
+
 ## Requirements
 
 - C++17 or later
 - SQLite 3.x (vendored in `external/sqlite/`)
 
+## Author
+
+**Elias Bachaalany** ([@0xeb](https://github.com/0xeb))
+
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) for details.
