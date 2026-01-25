@@ -1,6 +1,13 @@
+
 # libxsql
 
-C++17 header-only library for SQLite virtual tables.
+**libxsql** is a modern C++17 header-only library that lets you expose your C++ data structures as high-performance SQLite virtual tables with minimal boilerplate.
+
+- Effortlessly map C++ containers to SQL tables
+- Build custom, writable, and streaming tables in just a few lines
+- Ideal for CLI tools, scripting, and rapid data exploration
+
+Turn your in-memory data into a full-featured SQL database—no dependencies, no hassle.
 
 ## Features
 
@@ -16,7 +23,7 @@ C++17 header-only library for SQLite virtual tables.
 ### As Git Submodule
 
 ```bash
-git submodule add https://github.com/user/libxsql external/libxsql
+git submodule add https://github.com/0xeb/libxsql external/libxsql
 ```
 
 ```cmake
@@ -278,6 +285,10 @@ db.close();                                 // Close (automatic in destructor)
 - C++17 or later
 - SQLite 3.x (vendored in `external/sqlite/`)
 
+## Author
+
+**Elias Bachaalany** ([@0xeb](https://github.com/0xeb))
+
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) for details.

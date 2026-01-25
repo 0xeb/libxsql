@@ -3,7 +3,7 @@
  * @brief Generic TCP socket server for xsql tools
  *
  * Provides a simple single-threaded server that accepts JSON queries
- * and returns JSON responses. Used by pdbsql and idasql.
+ * and returns JSON responses.
  *
  * Usage:
  *   xsql::socket::Server server;
