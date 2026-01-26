@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Enable CMAKE_MSVC_RUNTIME_LIBRARY support (required for IDA SDK compatibility)
+cmake_policy(SET CMP0091 NEW)
+
 project(libxsql VERSION 1.0.0 LANGUAGES C CXX)
 
 # Detect if we're being built standalone or as part of a larger project

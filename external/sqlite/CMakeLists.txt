@@ -5,6 +5,12 @@ add_library(sqlite3 STATIC
 # Enable position-independent code for linking into shared libraries
 set_property(TARGET sqlite3 PROPERTY POSITION_INDEPENDENT_CODE ON)
 
+# Respect MSVC runtime library setting from parent project (e.g., IDA SDK uses /MT)
+# CMake 3.15+ with policy CMP0091 NEW respects CMAKE_MSVC_RUNTIME_LIBRARY
+if(MSVC AND CMAKE_MSVC_RUNTIME_LIBRARY)
+    set_property(TARGET sqlite3 PROPERTY MSVC_RUNTIME_LIBRARY ${CMAKE_MSVC_RUNTIME_LIBRARY})
+endif()
+
 target_include_directories(sqlite3 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>
