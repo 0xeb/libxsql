@@ -10,6 +10,16 @@
 
 #ifdef XSQL_HAS_THINCLIENT
 
+// Windows SDK compatibility for cpp-httplib
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include <httplib.h>
 #include <string>
 #include <functional>
@@ -25,17 +35,11 @@ namespace xsql::thinclient {
 // ============================================================================
 
 /**
- * Query handler callback.
- * Takes SQL string, returns result string (CSV/JSON).
- * Throw exception on error.
+ * Route setup callback.
+ * Called with the httplib::Server& so you can register your own routes.
+ * This gives full control over endpoints to the application.
  */
-using query_handler_t = std::function<std::string(const std::string& sql)>;
-
-/**
- * Status handler callback (optional).
- * Returns JSON status string.
- */
-using status_handler_t = std::function<std::string()>;
+using route_setup_t = std::function<void(httplib::Server& svr)>;
 
 struct server_config {
     int port = 5555;
@@ -43,14 +47,8 @@ struct server_config {
     std::string auth_token;
     bool allow_insecure_no_auth = false;
 
-    // Required: handles SQL queries
-    query_handler_t on_query;
-
-    // Optional: returns status JSON
-    status_handler_t on_status;
-
-    // Optional: called on shutdown request
-    std::function<void()> on_shutdown;
+    // Required: callback to set up your routes on the httplib::Server
+    route_setup_t setup_routes;
 };
 
 // ============================================================================
@@ -71,7 +69,10 @@ public:
      * Returns when server is stopped.
      */
     void run() {
-        setup_routes();
+        // Let the application set up its routes
+        if (config_.setup_routes) {
+            config_.setup_routes(svr_);
+        }
 
         auto is_loopback_bind_address = [](const std::string& addr) -> bool {
             return addr == "localhost" || addr == "127.0.0.1" || addr == "::1" || addr.rfind("127.", 0) == 0;
@@ -84,7 +85,6 @@ public:
         }
 
         running_ = true;
-        std::cout << "Listening on " << config_.bind_address << ":" << config_.port << "\n";
         svr_.listen(config_.bind_address.c_str(), config_.port);
         running_ = false;
     }
@@ -116,35 +116,17 @@ public:
     bool is_running() const { return running_; }
     int port() const { return config_.port; }
 
-private:
-    server_config config_;
-    httplib::Server svr_;
-    std::thread server_thread_;
-    std::atomic<bool> running_;
-    std::mutex query_mutex_;  // Serialize queries (IDA is single-threaded)
+    /**
+     * Get a reference to the underlying httplib::Server.
+     * Useful for advanced configuration.
+     */
+    httplib::Server& http_server() { return svr_; }
 
-    void setup_routes() {
-        // POST /query - Execute SQL
-        svr_.Post("/query", [this](const httplib::Request& req, httplib::Response& res) {
-            handle_query(req, res);
-        });
-
-        // GET /status - Health check
-        svr_.Get("/status", [this](const httplib::Request& req, httplib::Response& res) {
-            handle_status(req, res);
-        });
-
-        // POST /shutdown - Graceful shutdown
-        svr_.Post("/shutdown", [this](const httplib::Request& req, httplib::Response& res) {
-            handle_shutdown(req, res);
-        });
-
-        // GET / - Simple welcome
-        svr_.Get("/", [this](const httplib::Request&, httplib::Response& res) {
-            res.set_content("xsql server running. POST /query with SQL.\n", "text/plain");
-        });
-    }
-
+    /**
+     * Check authorization from request.
+     * Returns true if authorized, false if not (and sets 401 response).
+     * Applications can use this helper in their route handlers.
+     */
     bool authorize(const httplib::Request& req, httplib::Response& res) const {
         if (config_.auth_token.empty()) return true;
 
@@ -166,59 +148,22 @@ private:
         return false;
     }
 
-    void handle_query(const httplib::Request& req, httplib::Response& res) {    
-        if (!authorize(req, res)) return;
-        if (!config_.on_query) {
-            res.status = 500;
-            res.set_content("No query handler configured", "text/plain");       
-            return;
-        }
-
-        std::string sql = req.body;
-        if (sql.empty()) {
-            res.status = 400;
-            res.set_content("Empty query", "text/plain");
-            return;
-        }
-
-        try {
-            // Serialize queries
-            std::lock_guard<std::mutex> lock(query_mutex_);
-            std::string result = config_.on_query(sql);
-            res.set_content(result, "text/csv");
-        } catch (const std::exception& e) {
-            res.status = 400;
-            res.set_content(std::string("Error: ") + e.what(), "text/plain");
-        }
-    }
-
-    void handle_status(const httplib::Request& req, httplib::Response& res) {
-        if (!authorize(req, res)) return;
-        if (config_.on_status) {
-            try {
-                std::string status = config_.on_status();
-                res.set_content(status, "application/json");
-            } catch (const std::exception& e) {
-                res.status = 500;
-                res.set_content(std::string("{\"error\": \"") + e.what() + "\"}", "application/json");
-            }
-        } else {
-            res.set_content("{\"status\": \"ok\"}", "application/json");
-        }
-    }
-
-    void handle_shutdown(const httplib::Request& req, httplib::Response& res) {
-        if (!authorize(req, res)) return;
-        res.set_content("Shutting down\n", "text/plain");
-        if (config_.on_shutdown) {
-            config_.on_shutdown();
-        }
-        // Schedule stop after response is sent
+    /**
+     * Schedule a graceful shutdown after the current response.
+     * Applications can call this from their shutdown endpoint.
+     */
+    void schedule_shutdown() {
         std::thread([this] {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             svr_.stop();
         }).detach();
     }
+
+private:
+    server_config config_;
+    httplib::Server svr_;
+    std::thread server_thread_;
+    std::atomic<bool> running_;
 };
 
 }  // namespace xsql::thinclient
