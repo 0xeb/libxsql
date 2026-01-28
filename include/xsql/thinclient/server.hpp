@@ -42,7 +42,7 @@ namespace xsql::thinclient {
 using route_setup_t = std::function<void(httplib::Server& svr)>;
 
 struct server_config {
-    int port = 5555;
+    int port = 8081;
     std::string bind_address = "127.0.0.1";
     std::string auth_token;
     bool allow_insecure_no_auth = false;
@@ -144,7 +144,7 @@ public:
         if (token == config_.auth_token) return true;
 
         res.status = 401;
-        res.set_content("Unauthorized", "text/plain");
+        res.set_content(R"({"success":false,"error":"Unauthorized"})", "application/json");
         return false;
     }
 
@@ -169,6 +169,8 @@ private:
 }  // namespace xsql::thinclient
 
 #else  // !XSQL_HAS_THINCLIENT
+
+#include <stdexcept>
 
 // Stub when thinclient not enabled
 namespace xsql::thinclient {
