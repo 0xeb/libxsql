@@ -187,7 +187,12 @@ struct VTableDef {
     std::function<bool(size_t)> delete_row;
     bool supports_delete = false;
 
-    // Hook called before any modification (UPDATE/DELETE)
+    // INSERT handler: Insert row with column values, returns success
+    // Values are passed as vector of sqlite3_value* (one per column)
+    std::function<bool(int argc, sqlite3_value** argv)> insert_row;
+    bool supports_insert = false;
+
+    // Hook called before any modification (INSERT/UPDATE/DELETE)
     std::function<void(const std::string&)> before_modify;
 
     std::string schema() const {
@@ -467,7 +472,23 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         return SQLITE_OK;
     }
 
-    // argc > 1, argv[0] == NULL: INSERT (not supported by default)
+    // argc > 1, argv[0] == NULL: INSERT
+    if (argc > 1 && sqlite3_value_type(argv[0]) == SQLITE_NULL) {
+        if (!def->supports_insert || !def->insert_row) {
+            return SQLITE_READONLY;
+        }
+
+        if (def->before_modify) {
+            def->before_modify("INSERT INTO " + def->name);
+        }
+
+        // Pass column values starting at argv[2] (argv[0]=NULL, argv[1]=rowid)
+        if (!def->insert_row(argc - 2, &argv[2])) {
+            return SQLITE_ERROR;
+        }
+        return SQLITE_OK;
+    }
+
     return SQLITE_READONLY;
 }
 
@@ -666,6 +687,15 @@ public:
     VTableBuilder& deletable(std::function<bool(size_t)> delete_fn) {
         def_.supports_delete = true;
         def_.delete_row = std::move(delete_fn);
+        return *this;
+    }
+
+    // Enable INSERT support
+    // The callback receives (argc, argv) where argv contains column values
+    // Column order matches the schema definition
+    VTableBuilder& insertable(std::function<bool(int argc, sqlite3_value** argv)> insert_fn) {
+        def_.supports_insert = true;
+        def_.insert_row = std::move(insert_fn);
         return *this;
     }
 
