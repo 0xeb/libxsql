@@ -1380,7 +1380,11 @@ public:
         return *this;
     }
 
-    CachedTableDef<RowData> build() { return std::move(def_); }
+    CachedTableDef<RowData> build() {
+        // Pre-create the shared cache so all copies share the same instance
+        def_.shared_cache = std::make_shared<SharedCache<RowData>>();
+        return std::move(def_);
+    }
 };
 
 template<typename RowData>
