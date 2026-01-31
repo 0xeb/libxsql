@@ -49,6 +49,8 @@
 #include <cctype>
 #include <memory>
 #include <new>
+#include <unordered_map>
+#include <mutex>
 
 namespace xsql {
 
@@ -140,6 +142,9 @@ struct RowIterator {
 
 // Filter ID 0 reserved for "no filter" (full scan)
 constexpr int FILTER_NONE = 0;
+
+// Index IDs start at INDEX_BASE (indexes are auto-generated filters)
+constexpr int INDEX_BASE = 1000;
 
 /**
  * Defines a filter for a specific column constraint.
@@ -820,6 +825,22 @@ struct CachedColumnDef {
         : name(n), type(t), writable(w), get(std::move(getter)), set(std::move(setter)) {}
 };
 
+// Index definition for cached tables
+struct CachedIndexDef {
+    int column_index;                                        // Which column is indexed
+    std::function<int64_t(const void*)> key_extractor;       // Extract key from row (type-erased)
+};
+
+// Shared cache with indexes - lazily built, shared across all cursors
+template<typename RowData>
+struct SharedCache {
+    std::vector<RowData> data;
+    // Map from column value -> list of row indices in data
+    std::vector<std::unordered_map<int64_t, std::vector<size_t>>> indexes;
+    bool built = false;
+    mutable std::mutex mutex;
+};
+
 template<typename RowData>
 struct CachedTableDef {
     std::string name;
@@ -830,6 +851,12 @@ struct CachedTableDef {
     std::function<bool(RowData&)> delete_row;
     bool supports_delete = false;
     std::function<void(const std::string&)> before_modify;
+
+    // Index definitions: column index -> key extractor
+    std::vector<std::pair<int, std::function<int64_t(const RowData&)>>> index_defs;
+
+    // Shared cache - lazily built on first query, shared across all cursors
+    mutable std::shared_ptr<SharedCache<RowData>> shared_cache;
 
     std::string schema() const {
         std::ostringstream ss;
@@ -855,18 +882,68 @@ struct CachedTableDef {
         }
         return nullptr;
     }
+
+    // Find index position for a column (-1 if not indexed)
+    int find_index(int col_index) const {
+        for (size_t i = 0; i < index_defs.size(); ++i) {
+            if (index_defs[i].first == col_index) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    // Ensure shared cache is built (thread-safe, lazy initialization)
+    void ensure_cache_built() const {
+        if (!shared_cache) {
+            shared_cache = std::make_shared<SharedCache<RowData>>();
+        }
+        std::lock_guard<std::mutex> lock(shared_cache->mutex);
+        if (shared_cache->built) return;
+
+        // Build the cache
+        if (cache_builder_fn) {
+            cache_builder_fn(shared_cache->data);
+        }
+
+        // Build indexes
+        shared_cache->indexes.resize(index_defs.size());
+        for (size_t idx = 0; idx < index_defs.size(); ++idx) {
+            auto& index_map = shared_cache->indexes[idx];
+            const auto& key_fn = index_defs[idx].second;
+            for (size_t row = 0; row < shared_cache->data.size(); ++row) {
+                int64_t key = key_fn(shared_cache->data[row]);
+                index_map[key].push_back(row);
+            }
+        }
+
+        shared_cache->built = true;
+    }
+
+    // Invalidate cache (call when underlying data changes)
+    void invalidate_cache() const {
+        if (shared_cache) {
+            std::lock_guard<std::mutex> lock(shared_cache->mutex);
+            shared_cache->data.clear();
+            shared_cache->indexes.clear();
+            shared_cache->built = false;
+        }
+    }
 };
 
 template<typename RowData>
 struct CachedCursor {
     sqlite3_vtab_cursor base;
     const CachedTableDef<RowData>* def;
-    std::vector<RowData> cache;
+    std::vector<RowData> cache;           // Used only for non-shared fallback
     bool cache_built = false;
     size_t current_row = 0;
     std::unique_ptr<RowIterator> iterator;
     bool using_iterator = false;
     bool iterator_eof = false;
+
+    // Index-based iteration
+    bool using_index = false;
+    const std::vector<size_t>* index_matches = nullptr;  // Points into shared_cache->indexes
+    size_t index_pos = 0;
 };
 
 template<typename RowData>
@@ -923,6 +1000,8 @@ inline int cached_vtab_next(sqlite3_vtab_cursor* pCursor) {
         if (!cursor->iterator->next()) {
             cursor->iterator_eof = true;
         }
+    } else if (cursor->using_index) {
+        cursor->index_pos++;
     } else {
         cursor->current_row++;
     }
@@ -935,6 +1014,14 @@ inline int cached_vtab_eof(sqlite3_vtab_cursor* pCursor) {
     if (cursor->using_iterator) {
         if (!cursor->iterator || cursor->iterator_eof) return 1;
         return cursor->iterator->eof() ? 1 : 0;
+    }
+    if (cursor->using_index) {
+        if (!cursor->index_matches) return 1;
+        return cursor->index_pos >= cursor->index_matches->size() ? 1 : 0;
+    }
+    // Full scan using shared cache
+    if (cursor->def->shared_cache && cursor->def->shared_cache->built) {
+        return cursor->current_row >= cursor->def->shared_cache->data.size() ? 1 : 0;
     }
     return cursor->current_row >= cursor->cache.size() ? 1 : 0;
 }
@@ -952,8 +1039,25 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
             return SQLITE_OK;
         }
         cursor->iterator->column(ctx, col);
+    } else if (cursor->using_index) {
+        // Index-based access: get row from shared cache via index
+        if (cursor->index_matches && cursor->index_pos < cursor->index_matches->size()) {
+            size_t row_idx = (*cursor->index_matches)[cursor->index_pos];
+            const auto& shared = cursor->def->shared_cache;
+            if (shared && row_idx < shared->data.size()) {
+                cursor->def->columns[col].get(ctx, shared->data[row_idx]);
+            } else {
+                sqlite3_result_null(ctx);
+            }
+        } else {
+            sqlite3_result_null(ctx);
+        }
     } else {
-        if (cursor->current_row < cursor->cache.size()) {
+        // Full scan: use shared cache if available, else local cache
+        const auto& shared = cursor->def->shared_cache;
+        if (shared && shared->built && cursor->current_row < shared->data.size()) {
+            cursor->def->columns[col].get(ctx, shared->data[cursor->current_row]);
+        } else if (cursor->current_row < cursor->cache.size()) {
             cursor->def->columns[col].get(ctx, cursor->cache[cursor->current_row]);
         } else {
             sqlite3_result_null(ctx);
@@ -982,14 +1086,44 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                               int argc, sqlite3_value** argv) {
     auto* cursor = reinterpret_cast<CachedCursor<RowData>*>(pCursor);
 
+    // Reset cursor state
     cursor->iterator = nullptr;
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
+    cursor->using_index = false;
+    cursor->index_matches = nullptr;
+    cursor->index_pos = 0;
     cursor->cache.clear();
     cursor->cache_built = false;
     cursor->current_row = 0;
 
     if (idxNum != FILTER_NONE && argc > 0) {
+        // Check for index-based lookup (idxNum >= INDEX_BASE)
+        if (idxNum >= INDEX_BASE) {
+            int index_pos = idxNum - INDEX_BASE;
+            const auto& index_defs = cursor->def->index_defs;
+            if (index_pos >= 0 && static_cast<size_t>(index_pos) < index_defs.size()) {
+                // Ensure cache and indexes are built
+                cursor->def->ensure_cache_built();
+                const auto& shared = cursor->def->shared_cache;
+                if (shared && shared->built && static_cast<size_t>(index_pos) < shared->indexes.size()) {
+                    int64_t key = sqlite3_value_int64(argv[0]);
+                    auto it = shared->indexes[index_pos].find(key);
+                    if (it != shared->indexes[index_pos].end()) {
+                        cursor->using_index = true;
+                        cursor->index_matches = &it->second;
+                        cursor->index_pos = 0;
+                    } else {
+                        // No matches - return empty result
+                        cursor->using_index = true;
+                        cursor->index_matches = nullptr;
+                    }
+                    return SQLITE_OK;
+                }
+            }
+        }
+
+        // Check for filter-based lookup
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
                 cursor->iterator = filter.create(argv[0]);
@@ -1003,12 +1137,11 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
         }
     }
 
-    // Full scan - build cache now
+    // Full scan - use shared cache if available
+    cursor->def->ensure_cache_built();
     cursor->using_iterator = false;
-    if (cursor->def->cache_builder_fn) {
-        cursor->def->cache_builder_fn(cursor->cache);
-    }
-    cursor->cache_built = true;
+    cursor->using_index = false;
+    cursor->current_row = 0;
     return SQLITE_OK;
 }
 
@@ -1017,32 +1150,55 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
     auto* vtab = reinterpret_cast<CachedVtab<RowData>*>(pVtab);
     const auto* def = vtab->def;
 
-    // Look for filters FIRST (before calling estimate_rows)
-    // This avoids expensive operations when a filter will be used
+    // Track best option: filter, index, or full scan
     const FilterDef* best_filter = nullptr;
-    int best_constraint_idx = -1;
+    int best_filter_constraint_idx = -1;
+    int best_index_pos = -1;
+    int best_index_constraint_idx = -1;
+    double best_cost = 1e9;
 
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
         if (!constraint.usable) continue;
         if (constraint.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+
+        // Check for explicit filter
         const FilterDef* filter = def->find_filter(constraint.iColumn);
-        if (filter) {
-            if (!best_filter || filter->estimated_cost < best_filter->estimated_cost) {
-                best_filter = filter;
-                best_constraint_idx = i;
+        if (filter && filter->estimated_cost < best_cost) {
+            best_filter = filter;
+            best_filter_constraint_idx = i;
+            best_cost = filter->estimated_cost;
+        }
+
+        // Check for indexed column
+        int idx_pos = def->find_index(constraint.iColumn);
+        if (idx_pos >= 0) {
+            // Index lookups are very cheap (hash lookup)
+            double index_cost = 1.0;
+            if (index_cost < best_cost) {
+                best_index_pos = idx_pos;
+                best_index_constraint_idx = i;
+                best_cost = index_cost;
+                best_filter = nullptr;  // Index beats filter
             }
         }
     }
 
-    if (best_filter && best_constraint_idx >= 0) {
-        pInfo->aConstraintUsage[best_constraint_idx].argvIndex = 1;
-        pInfo->aConstraintUsage[best_constraint_idx].omit = 1;
+    // Prefer index over filter if both matched
+    if (best_index_pos >= 0 && best_index_constraint_idx >= 0) {
+        pInfo->aConstraintUsage[best_index_constraint_idx].argvIndex = 1;
+        pInfo->aConstraintUsage[best_index_constraint_idx].omit = 1;
+        pInfo->idxNum = INDEX_BASE + best_index_pos;
+        pInfo->estimatedCost = 1.0;
+        pInfo->estimatedRows = 5;  // Assume small result set
+    } else if (best_filter && best_filter_constraint_idx >= 0) {
+        pInfo->aConstraintUsage[best_filter_constraint_idx].argvIndex = 1;
+        pInfo->aConstraintUsage[best_filter_constraint_idx].omit = 1;
         pInfo->idxNum = best_filter->filter_id;
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
     } else {
-        // No filter - full scan. Only NOW call estimate_rows since we need it
+        // No filter or index - full scan
         size_t estimated_rows = 1000;
         if (def->estimate_rows_fn) {
             estimated_rows = def->estimate_rows_fn();
@@ -1199,6 +1355,28 @@ public:
                 const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
                 return factory(text ? text : "");
             });
+        return *this;
+    }
+
+    /**
+     * Add an index on an integer column for O(1) lookups.
+     *
+     * The index is built lazily when the table is first queried.
+     * When SQLite uses WHERE column = value, the index provides
+     * direct access to matching rows without scanning.
+     *
+     * @param column_name Name of the column to index (must be int64)
+     * @param key_extractor Function to extract the key from a row
+     * @return Reference to builder for chaining
+     *
+     * Example:
+     *   .index_on("to_ea", [](const XrefInfo& r) { return r.to_ea; })
+     */
+    CachedTableBuilder& index_on(const char* column_name,
+                                  std::function<int64_t(const RowData&)> key_extractor) {
+        int col_idx = def_.find_column(column_name);
+        if (col_idx < 0) return *this;
+        def_.index_defs.emplace_back(col_idx, std::move(key_extractor));
         return *this;
     }
 
