@@ -69,7 +69,7 @@ inline std::string make_success_json(const std::string& message = "") {
 }
 
 /**
- * Create a JSON status/health response.
+ * Create a JSON status response.
  * @param tool Tool name (e.g., "bnsql", "idasql")
  * @param extra_json Additional JSON fields without enclosing braces (e.g., "\"functions\":42")
  * @return JSON string: {"success":true,"status":"ok","tool":"toolname",...}
