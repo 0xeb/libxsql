@@ -40,9 +40,8 @@
 
 #pragma once
 
+#include "database.hpp"
 #include <sqlite3.h>
-#include "functions.hpp"
-#include "status.hpp"
 #include <string>
 #include <vector>
 #include <functional>
@@ -66,6 +65,45 @@ inline T* clone_def(const T* src) {
 template <typename T>
 inline void destroy_def(void* p) {
     delete static_cast<T*>(p);
+}
+
+inline sqlite3* sqlite_db(void* db_handle) {
+    return reinterpret_cast<sqlite3*>(db_handle);
+}
+
+inline bool register_vtable_sqlite(sqlite3* db, const char* module_name, const VTableDef* def);
+inline bool create_vtable_sqlite(sqlite3* db, const char* table_name, const char* module_name);
+
+template<typename RowData>
+inline bool register_cached_vtable_sqlite(sqlite3* db,
+                                          const char* module_name,
+                                          const CachedTableDef<RowData>* def);
+
+template<typename RowData>
+inline bool register_generator_vtable_sqlite(sqlite3* db,
+                                             const char* module_name,
+                                             const GeneratorTableDef<RowData>* def);
+
+inline bool register_vtable_opaque(void* db_handle, const char* module_name, const VTableDef* def) {
+    return register_vtable_sqlite(sqlite_db(db_handle), module_name, def);
+}
+
+inline bool create_vtable_opaque(void* db_handle, const char* table_name, const char* module_name) {
+    return create_vtable_sqlite(sqlite_db(db_handle), table_name, module_name);
+}
+
+template<typename RowData>
+inline bool register_cached_vtable_opaque(void* db_handle,
+                                          const char* module_name,
+                                          const CachedTableDef<RowData>* def) {
+    return register_cached_vtable_sqlite(sqlite_db(db_handle), module_name, def);
+}
+
+template<typename RowData>
+inline bool register_generator_vtable_opaque(void* db_handle,
+                                             const char* module_name,
+                                             const GeneratorTableDef<RowData>* def) {
+    return register_generator_vtable_sqlite(sqlite_db(db_handle), module_name, def);
 }
 } // namespace detail
 
@@ -560,7 +598,9 @@ inline sqlite3_module& get_module() {
 // Registration
 // ============================================================================
 
-inline bool register_vtable(sqlite3* db, const char* module_name, const VTableDef* def) {
+namespace detail {
+
+inline bool register_vtable_sqlite(sqlite3* db, const char* module_name, const VTableDef* def) {
     if (!db || !module_name || !def) return false;
 
     VTableDef* owned = detail::clone_def(def);
@@ -584,7 +624,7 @@ inline bool is_valid_sql_identifier(const char* name) {
     return true;
 }
 
-inline bool create_vtable(sqlite3* db, const char* table_name, const char* module_name) {
+inline bool create_vtable_sqlite(sqlite3* db, const char* table_name, const char* module_name) {
     // Validate identifiers to prevent SQL injection
     if (!is_valid_sql_identifier(table_name) || !is_valid_sql_identifier(module_name)) {
         return false;
@@ -595,6 +635,16 @@ inline bool create_vtable(sqlite3* db, const char* table_name, const char* modul
     int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err);
     if (err) sqlite3_free(err);
     return xsql::is_ok(rc);
+}
+
+} // namespace detail
+
+inline bool register_vtable(Database& db, const char* module_name, const VTableDef* def) {
+    return detail::register_vtable_opaque(db.native_handle_unsafe(), module_name, def);
+}
+
+inline bool create_vtable(Database& db, const char* table_name, const char* module_name) {
+    return detail::create_vtable_opaque(db.native_handle_unsafe(), table_name, module_name);
 }
 
 // ============================================================================
@@ -731,15 +781,6 @@ public:
     VTableBuilder& insertable(std::function<bool(int argc, FunctionArg* argv)> insert_fn) {
         def_.supports_insert = true;
         def_.insert_row = std::move(insert_fn);
-        return *this;
-    }
-
-    // Legacy INSERT overload (raw sqlite3 values).
-    VTableBuilder& insertable(std::function<bool(int argc, sqlite3_value** argv)> insert_fn) {
-        def_.supports_insert = true;
-        def_.insert_row = [insert_fn = std::move(insert_fn)](int argc, FunctionArg* argv) -> bool {
-            return insert_fn(argc, reinterpret_cast<sqlite3_value**>(argv));
-        };
         return *this;
     }
 
@@ -1444,8 +1485,9 @@ inline sqlite3_module& get_cached_module() {
 }
 
 template<typename RowData>
-inline bool register_cached_vtable(sqlite3* db, const char* module_name,
-                                   const CachedTableDef<RowData>* def) {
+inline bool detail::register_cached_vtable_sqlite(sqlite3* db,
+                                                  const char* module_name,
+                                                  const CachedTableDef<RowData>* def) {
     if (!db || !module_name || !def) return false;
 
     auto* owned = detail::clone_def(def);
@@ -1464,6 +1506,13 @@ inline bool register_cached_vtable(sqlite3* db, const char* module_name,
         return false;
     }
     return true;
+}
+
+template<typename RowData>
+inline bool register_cached_vtable(Database& db,
+                                   const char* module_name,
+                                   const CachedTableDef<RowData>* def) {
+    return detail::register_cached_vtable_opaque<RowData>(db.native_handle_unsafe(), module_name, def);
 }
 
 // Cached Table Builder
@@ -1652,13 +1701,6 @@ public:
         return *this;
     }
 
-    CachedTableBuilder& row_populator(std::function<void(RowData&, int argc, sqlite3_value** argv)> fn) {
-        def_.row_from_argv = [fn = std::move(fn)](RowData& row, int argc, FunctionArg* argv) {
-            fn(row, argc, reinterpret_cast<sqlite3_value**>(argv));
-        };
-        return *this;
-    }
-
     CachedTableBuilder& row_populator(std::function<void(RowData&, int argc, FunctionArg* argv)> fn) {
         def_.row_from_argv = std::move(fn);
         return *this;
@@ -1678,14 +1720,6 @@ public:
     CachedTableBuilder& insertable(std::function<bool(int argc, FunctionArg* argv)> insert_fn) {
         def_.supports_insert = true;
         def_.insert_row = std::move(insert_fn);
-        return *this;
-    }
-
-    CachedTableBuilder& insertable(std::function<bool(int argc, sqlite3_value** argv)> insert_fn) {
-        def_.supports_insert = true;
-        def_.insert_row = [insert_fn = std::move(insert_fn)](int argc, FunctionArg* argv) -> bool {
-            return insert_fn(argc, reinterpret_cast<sqlite3_value**>(argv));
-        };
         return *this;
     }
 
@@ -2030,8 +2064,9 @@ inline sqlite3_module& get_generator_module() {
 }
 
 template<typename RowData>
-inline bool register_generator_vtable(sqlite3* db, const char* module_name,
-                                      const GeneratorTableDef<RowData>* def) {
+inline bool detail::register_generator_vtable_sqlite(sqlite3* db,
+                                                     const char* module_name,
+                                                     const GeneratorTableDef<RowData>* def) {
     if (!db || !module_name || !def) return false;
 
     auto* owned = detail::clone_def(def);
@@ -2050,6 +2085,13 @@ inline bool register_generator_vtable(sqlite3* db, const char* module_name,
         return false;
     }
     return true;
+}
+
+template<typename RowData>
+inline bool register_generator_vtable(Database& db,
+                                      const char* module_name,
+                                      const GeneratorTableDef<RowData>* def) {
+    return detail::register_generator_vtable_opaque<RowData>(db.native_handle_unsafe(), module_name, def);
 }
 
 // Generator Table Builder

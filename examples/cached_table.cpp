@@ -62,16 +62,16 @@ public:
 
     bool eof() const override { return !valid_; }
 
-    void column(sqlite3_context* ctx, int col) override {
+    void column(xsql::FunctionContext& ctx, int col) override {
         if (it_ == end_) {
-            sqlite3_result_null(ctx);
+            ctx.result_null();
             return;
         }
         const auto& xref = g_xrefs[it_->second];
         switch (col) {
-            case 0: sqlite3_result_int64(ctx, xref.from); break;
-            case 1: sqlite3_result_int64(ctx, xref.to); break;
-            case 2: sqlite3_result_int(ctx, xref.type); break;
+            case 0: ctx.result_int64(xref.from); break;
+            case 1: ctx.result_int64(xref.to); break;
+            case 2: ctx.result_int(xref.type); break;
         }
     }
 
@@ -104,7 +104,7 @@ int main() {
     // Open database
     xsql::Database db;
     db.open(":memory:");
-    xsql::register_cached_vtable(db.handle(), def.name.c_str(), &def);
+    xsql::register_cached_vtable(db, def.name.c_str(), &def);
     db.create_table(def.name.c_str(), def.name.c_str());
 
     // Full scan query (builds cache)

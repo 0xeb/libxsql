@@ -33,4 +33,5 @@
 
 #include "vtable.hpp"
 #include "functions.hpp"
+#include "statement.hpp"
 #include "database.hpp"

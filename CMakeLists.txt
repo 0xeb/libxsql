@@ -41,20 +41,25 @@ else()
 endif()
 
 # ============================================================================
-# libxsql - Header-only library with SQLite dependency
+# libxsql
 # ============================================================================
 
-add_library(xsql INTERFACE)
+add_library(xsql STATIC
+    src/database.cpp
+    src/functions.cpp
+    src/script.cpp
+    src/statement.cpp
+)
 add_library(xsql::xsql ALIAS xsql)
 
-target_include_directories(xsql INTERFACE
+target_include_directories(xsql PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(xsql INTERFACE sqlite3 nlohmann_json::nlohmann_json)
+target_link_libraries(xsql PUBLIC sqlite3 nlohmann_json::nlohmann_json)
 
-target_compile_features(xsql INTERFACE cxx_std_17)
+target_compile_features(xsql PUBLIC cxx_std_17)
 
 # ============================================================================
 # Thin Client (optional HTTP server/client)
@@ -71,8 +76,8 @@ if(XSQL_WITH_THINCLIENT)
     )
     FetchContent_MakeAvailable(httplib)
 
-    target_compile_definitions(xsql INTERFACE XSQL_HAS_THINCLIENT)
-    target_link_libraries(xsql INTERFACE httplib::httplib)
+    target_compile_definitions(xsql PUBLIC XSQL_HAS_THINCLIENT)
+    target_link_libraries(xsql PUBLIC httplib::httplib)
 endif()
 
 # Make find_package(xsql) work from build tree

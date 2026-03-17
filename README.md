@@ -113,7 +113,7 @@ public:
         return true;
     }
     const DecompRow& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return idx_ - 1; }
+    int64_t rowid() const override { return idx_ - 1; }
 };
 
 auto def = xsql::generator_table<DecompRow>("decompiled")
@@ -175,9 +175,9 @@ public:
         return had;
     }
     bool eof() const override { return !valid_; }
-    void column(sqlite3_context* ctx, int col) override {
-        if (col == 0) sqlite3_result_int64(ctx, xref_.from);
-        else sqlite3_result_int64(ctx, target_);
+    void column(xsql::FunctionContext& ctx, int col) override {
+        if (col == 0) ctx.result_int64(xref_.from);
+        else ctx.result_int64(target_);
     }
     int64_t rowid() const override { return xref_.from; }
 };
