@@ -51,6 +51,7 @@
 #include <memory>
 #include <new>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 
 namespace xsql {
@@ -1790,6 +1791,22 @@ struct Generator {
     virtual int64_t rowid() const = 0;
 };
 
+// Parametric filter: requires ALL specified columns to be EQ-constrained.
+// Used for table-valued functions with hidden input parameters.
+// Filter IDs start at PARAMETRIC_FILTER_BASE to avoid collision with single-column filters.
+constexpr int PARAMETRIC_FILTER_BASE = 500;
+
+template<typename RowData>
+struct ParametricFilterDef {
+    std::vector<int> column_indices;     // Columns that must ALL be EQ-constrained
+    int filter_id;                       // Unique ID (PARAMETRIC_FILTER_BASE + N)
+    double estimated_cost;
+    double estimated_rows;
+    // Factory receives constraint values in column_indices order
+    std::function<std::unique_ptr<Generator<RowData>>(
+        const std::vector<FunctionArg>&)> create;
+};
+
 template<typename RowData>
 struct GeneratorTableDef {
     std::string name;
@@ -1797,6 +1814,8 @@ struct GeneratorTableDef {
     std::function<std::unique_ptr<Generator<RowData>>()> generator_factory_fn;
     std::vector<CachedColumnDef<RowData>> columns;
     std::vector<FilterDef> filters;
+    std::vector<ParametricFilterDef<RowData>> parametric_filters;
+    std::unordered_set<int> hidden_columns;  // Column indices marked HIDDEN
 
     std::string schema() const {
         std::ostringstream ss;
@@ -1804,6 +1823,7 @@ struct GeneratorTableDef {
         for (size_t i = 0; i < columns.size(); ++i) {
             if (i > 0) ss << ", ";
             ss << "\"" << columns[i].name << "\" " << column_type_sql(columns[i].type);
+            if (hidden_columns.count(static_cast<int>(i))) ss << " HIDDEN";
         }
         ss << ")";
         return ss.str();
@@ -1967,6 +1987,27 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
     cursor->iterator_eof = false;
 
     if (idxNum != FILTER_NONE && argc > 0) {
+        // Check parametric filters first (multi-column, creates a Generator)
+        if (idxNum >= PARAMETRIC_FILTER_BASE) {
+            for (const auto& pf : cursor->def->parametric_filters) {
+                if (pf.filter_id == idxNum) {
+                    std::vector<FunctionArg> args;
+                    args.reserve(argc);
+                    for (int i = 0; i < argc; i++) {
+                        args.emplace_back(argv[i]);
+                    }
+                    cursor->generator = pf.create(args);
+                    cursor->using_iterator = false;
+                    cursor->generator_eof = true;
+                    if (cursor->generator) {
+                        cursor->generator_eof = !cursor->generator->next();
+                    }
+                    return to_sqlite_status(Status::ok);
+                }
+            }
+        }
+
+        // Single-column filters (creates a RowIterator)
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
                 cursor->iterator = filter.create(FunctionArg(argv[0]));
@@ -1997,7 +2038,43 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
     auto* vtab = reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
     const auto* def = vtab->def;
 
-    // Prefer filters when available.
+    // First, check parametric filters (multi-column, e.g. hidden params for table-valued functions).
+    // A parametric filter matches when ALL its required columns are EQ-constrained.
+    for (const auto& pf : def->parametric_filters) {
+        // Map each required column to its constraint index
+        std::vector<int> matched_constraints(pf.column_indices.size(), -1);
+        bool all_matched = true;
+
+        for (size_t p = 0; p < pf.column_indices.size(); ++p) {
+            int required_col = pf.column_indices[p];
+            bool found = false;
+            for (int i = 0; i < pInfo->nConstraint; i++) {
+                const auto& c = pInfo->aConstraint[i];
+                if (!c.usable) continue;
+                if (c.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+                if (c.iColumn == required_col) {
+                    matched_constraints[p] = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) { all_matched = false; break; }
+        }
+
+        if (all_matched) {
+            // Assign sequential argvIndex values (1-based)
+            for (size_t p = 0; p < matched_constraints.size(); ++p) {
+                pInfo->aConstraintUsage[matched_constraints[p]].argvIndex = static_cast<int>(p + 1);
+                pInfo->aConstraintUsage[matched_constraints[p]].omit = 1;
+            }
+            pInfo->idxNum = pf.filter_id;
+            pInfo->estimatedCost = pf.estimated_cost;
+            pInfo->estimatedRows = static_cast<sqlite3_int64>(pf.estimated_rows);
+            return to_sqlite_status(Status::ok);
+        }
+    }
+
+    // Next, check single-column filters.
     const FilterDef* best_filter = nullptr;
     int best_constraint_idx = -1;
 
@@ -2178,6 +2255,57 @@ public:
                 const char* text = val.as_c_str();
                 return factory(text ? text : "");
             });
+        return *this;
+    }
+
+    // Hidden columns: input parameters not part of output, constrained via WHERE clause.
+    // These appear as HIDDEN in the schema and are typically used with parametric_filter().
+    GeneratorTableBuilder& hidden_column_int64(const char* name) {
+        int idx = static_cast<int>(def_.columns.size());
+        // Hidden columns use a no-op getter (value comes from WHERE, not from RowData)
+        def_.columns.emplace_back(name, ColumnType::Integer, false,
+            [](FunctionContext& ctx, const RowData&) { ctx.result_null(); }, nullptr);
+        def_.hidden_columns.insert(idx);
+        return *this;
+    }
+
+    GeneratorTableBuilder& hidden_column_text(const char* name) {
+        int idx = static_cast<int>(def_.columns.size());
+        def_.columns.emplace_back(name, ColumnType::Text, false,
+            [](FunctionContext& ctx, const RowData&) { ctx.result_null(); }, nullptr);
+        def_.hidden_columns.insert(idx);
+        return *this;
+    }
+
+    GeneratorTableBuilder& hidden_column_int(const char* name) {
+        int idx = static_cast<int>(def_.columns.size());
+        def_.columns.emplace_back(name, ColumnType::Integer, false,
+            [](FunctionContext& ctx, const RowData&) { ctx.result_null(); }, nullptr);
+        def_.hidden_columns.insert(idx);
+        return *this;
+    }
+
+    /**
+     * Parametric filter: requires ALL named columns to be EQ-constrained.
+     * The factory receives constraint values in the order of param_columns.
+     * Returns a Generator (not a RowIterator) since the result set is computed fresh.
+     */
+    GeneratorTableBuilder& parametric_filter(
+            std::initializer_list<const char*> param_columns,
+            std::function<std::unique_ptr<Generator<RowData>>(
+                const std::vector<FunctionArg>&)> factory,
+            double cost = 1.0, double est_rows = 100.0) {
+        ParametricFilterDef<RowData> pf;
+        for (const char* col_name : param_columns) {
+            int idx = def_.find_column(col_name);
+            if (idx < 0) return *this;  // Column not found
+            pf.column_indices.push_back(idx);
+        }
+        pf.filter_id = PARAMETRIC_FILTER_BASE + static_cast<int>(def_.parametric_filters.size());
+        pf.estimated_cost = cost;
+        pf.estimated_rows = est_rows;
+        pf.create = std::move(factory);
+        def_.parametric_filters.push_back(std::move(pf));
         return *this;
     }
 
