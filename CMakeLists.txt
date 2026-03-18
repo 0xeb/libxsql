@@ -61,6 +61,9 @@ target_link_libraries(xsql PUBLIC sqlite3 nlohmann_json::nlohmann_json)
 
 target_compile_features(xsql PUBLIC cxx_std_17)
 
+# Enable PIC so the static library can be linked into shared objects (e.g. IDA plugins)
+set_target_properties(xsql PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # ============================================================================
 # Thin Client (optional HTTP server/client)
 # ============================================================================
