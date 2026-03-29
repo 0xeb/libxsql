@@ -22,23 +22,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_subdirectory(external/sqlite)
 
 # ============================================================================
-# nlohmann/json (shared dependency for all xsql projects)
+# nlohmann/json (vendored single-include, v3.11.3)
 # ============================================================================
 
-include(FetchContent)
-find_package(nlohmann_json QUIET)
-if(NOT nlohmann_json_FOUND)
-    FetchContent_Declare(
-        nlohmann_json
-        GIT_REPOSITORY https://github.com/nlohmann/json.git
-        GIT_TAG v3.11.3
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_MakeAvailable(nlohmann_json)
-    message(STATUS "libxsql: Fetched nlohmann/json via FetchContent")
-else()
-    message(STATUS "libxsql: Using nlohmann/json via find_package")
-endif()
+add_subdirectory(external/nlohmann)
 
 # ============================================================================
 # libxsql
@@ -71,27 +58,15 @@ set_target_properties(xsql PROPERTIES POSITION_INDEPENDENT_CODE ON)
 option(XSQL_WITH_THINCLIENT "Build thin client support (HTTP server/client)" OFF)
 
 if(XSQL_WITH_THINCLIENT)
-    include(FetchContent)
-    FetchContent_Declare(
-        httplib
-        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-        GIT_TAG        v0.15.3
-    )
-    FetchContent_MakeAvailable(httplib)
-
+    add_subdirectory(external/httplib)
     target_compile_definitions(xsql PUBLIC XSQL_HAS_THINCLIENT)
     target_link_libraries(xsql PUBLIC httplib::httplib)
 endif()
 
 # Make find_package(xsql) work from build tree
-set(XSQL_EXPORT_TARGETS xsql sqlite3)
+set(XSQL_EXPORT_TARGETS xsql sqlite3 nlohmann_json)
 if(XSQL_WITH_THINCLIENT)
     list(APPEND XSQL_EXPORT_TARGETS httplib)
-endif()
-
-# Include nlohmann_json in export if it was fetched (not system-installed)
-if(TARGET nlohmann_json AND NOT nlohmann_json_FOUND)
-    list(APPEND XSQL_EXPORT_TARGETS nlohmann_json)
 endif()
 
 export(TARGETS ${XSQL_EXPORT_TARGETS}
@@ -119,10 +94,7 @@ endif()
 if(XSQL_STANDALONE)
     include(GNUInstallDirs)
 
-    set(XSQL_INSTALL_TARGETS xsql sqlite3)
-    if(TARGET nlohmann_json AND NOT nlohmann_json_FOUND)
-        list(APPEND XSQL_INSTALL_TARGETS nlohmann_json)
-    endif()
+    set(XSQL_INSTALL_TARGETS xsql sqlite3 nlohmann_json)
 
     install(TARGETS ${XSQL_INSTALL_TARGETS}
         EXPORT xsqlTargets
