@@ -129,6 +129,15 @@ inline const std::string& get_vtab_error() {
     return g_vtab_error_message;
 }
 
+inline int return_vtab_error(sqlite3_vtab* pVtab) {
+    const std::string& err = get_vtab_error();
+    if (!err.empty() && pVtab) {
+        pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+    }
+    clear_vtab_error();
+    return to_sqlite_status(Status::error);
+}
+
 // ============================================================================ 
 // Column Types
 // ============================================================================ 
@@ -1003,6 +1012,12 @@ struct CachedTableDef {
         // Build the cache
         if (cache_builder_fn) {
             cache_builder_fn(shared_cache->data);
+            if (!get_vtab_error().empty()) {
+                shared_cache->data.clear();
+                shared_cache->indexes.clear();
+                shared_cache->built = false;
+                return;
+            }
         }
 
         // Build indexes
@@ -1217,7 +1232,11 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
             const auto& index_defs = cursor->def->index_defs;
             if (index_pos >= 0 && static_cast<size_t>(index_pos) < index_defs.size()) {
                 // Ensure cache and indexes are built
+                clear_vtab_error();
                 cursor->def->ensure_cache_built();
+                if (!get_vtab_error().empty()) {
+                    return return_vtab_error(pCursor->pVtab);
+                }
                 const auto& shared = cursor->def->shared_cache;
                 if (shared && shared->built && static_cast<size_t>(index_pos) < shared->indexes.size()) {
                     int64_t key = FunctionArg(argv[0]).as_int64();
@@ -1239,11 +1258,15 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
         // Check for filter-based lookup
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
+                clear_vtab_error();
                 cursor->iterator = filter.create(FunctionArg(argv[0]));
                 cursor->using_iterator = true;
                 cursor->iterator_eof = true;
                 if (cursor->iterator) {
                     cursor->iterator_eof = !cursor->iterator->next();
+                }
+                if (!get_vtab_error().empty()) {
+                    return return_vtab_error(pCursor->pVtab);
                 }
                 return to_sqlite_status(Status::ok);
             }
@@ -1252,10 +1275,19 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
 
     // Full scan - use shared cache or query-local cache depending on table policy.
     if (cursor->def->use_shared_cache) {
+        clear_vtab_error();
         cursor->def->ensure_cache_built();
+        if (!get_vtab_error().empty()) {
+            return return_vtab_error(pCursor->pVtab);
+        }
     } else if (cursor->def->cache_builder_fn) {
         cursor->cache.clear();
+        clear_vtab_error();
         cursor->def->cache_builder_fn(cursor->cache);
+        if (!get_vtab_error().empty()) {
+            cursor->cache.clear();
+            return return_vtab_error(pCursor->pVtab);
+        }
         cursor->cache_built = true;
     }
     cursor->using_iterator = false;
