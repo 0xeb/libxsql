@@ -178,7 +178,7 @@ public:
 
         // Handle --version
         if (args.version) {
-            std::cout << program_name_ << " version 1.0.0\n";
+            std::cout << program_name_ << " version 1.0.1\n";
             return std::nullopt;
         }
 

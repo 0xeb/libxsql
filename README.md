@@ -84,6 +84,7 @@ struct XrefInfo { uint64_t from; uint64_t to; };
 
 auto def = xsql::cached_table<XrefInfo>("xrefs")
     .estimate_rows([]() { return 10000; })
+    .count([]() { return exact_xref_count(); })  // Optional: optimizes COUNT(*)
     .cache_builder([](std::vector<XrefInfo>& cache) {
         // Enumerate and populate cache
         for (auto& xref : all_xrefs())
@@ -245,7 +246,7 @@ printf("%s\n", result.c_str());
 
 | Method | Description |
 |--------|-------------|
-| `count(fn)` | Row count function (required for index-based) |
+| `count(fn)` | Row count function (required for index-based, optional exact `COUNT(*)` fast path for cached tables) |
 | `estimate_rows(fn)` | Cheap row estimate for query planner |
 | `cache_builder(fn)` | Populate cache (cached_table only) |
 | `generator(fn)` | Generator factory (generator_table only) |

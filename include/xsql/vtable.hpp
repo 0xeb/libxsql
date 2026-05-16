@@ -55,8 +55,10 @@
 #include <sstream>
 #include <cstring>
 #include <cctype>
+#include <cstdlib>
 #include <memory>
 #include <new>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
@@ -213,6 +215,15 @@ struct RowIterator {
 
 // Filter ID 0 reserved for "no filter" (full scan)
 constexpr int FILTER_NONE = 0;
+
+// Internal filter for rowid equality constraints.
+constexpr int ROWID_FILTER = -1;
+
+// Internal scan mode for exact no-column full scans such as COUNT(*).
+constexpr int COUNT_ONLY_SCAN = -2;
+
+// Internal generator mode for required constraints that are missing.
+constexpr int MISSING_REQUIRED_CONSTRAINT = -3;
 
 // Index IDs start at INDEX_BASE (indexes are auto-generated filters)
 constexpr int INDEX_BASE = 1000;
@@ -934,6 +945,8 @@ struct SharedCache {
     // Map from column value -> list of row indices in data
     std::vector<std::unordered_map<int64_t, std::vector<size_t>>> indexes;
     bool built = false;
+    // Preserves row data while SQLite applies a scan-driven UPDATE/DELETE.
+    bool mutation_snapshot = false;
     mutable std::mutex mutex;
 };
 
@@ -941,6 +954,7 @@ template<typename RowData>
 struct CachedTableDef {
     std::string name;
     std::function<size_t()> estimate_rows_fn;
+    std::function<size_t()> row_count_fn;
     std::function<void(std::vector<RowData>&)> cache_builder_fn;
     std::vector<CachedColumnDef<RowData>> columns;
     std::vector<FilterDef> filters;
@@ -1009,6 +1023,10 @@ struct CachedTableDef {
         std::lock_guard<std::mutex> lock(shared_cache->mutex);
         if (shared_cache->built) return;
 
+        shared_cache->data.clear();
+        shared_cache->indexes.clear();
+        shared_cache->mutation_snapshot = false;
+
         // Build the cache
         if (cache_builder_fn) {
             cache_builder_fn(shared_cache->data);
@@ -1016,6 +1034,7 @@ struct CachedTableDef {
                 shared_cache->data.clear();
                 shared_cache->indexes.clear();
                 shared_cache->built = false;
+                shared_cache->mutation_snapshot = false;
                 return;
             }
         }
@@ -1041,9 +1060,36 @@ struct CachedTableDef {
             shared_cache->data.clear();
             shared_cache->indexes.clear();
             shared_cache->built = false;
+            shared_cache->mutation_snapshot = false;
         }
     }
 };
+
+namespace detail {
+template<typename RowData>
+inline bool cached_table_has_scan_driven_mutation(const CachedTableDef<RowData>* def) {
+    if (!def) return false;
+    if (def->supports_delete) return true;
+    for (const auto& col : def->columns) {
+        if (col.writable && col.set) return true;
+    }
+    return false;
+}
+
+template<typename RowData>
+inline bool cached_table_supports_count_only_scan(const CachedTableDef<RowData>* def) {
+    return def && def->row_count_fn && !cached_table_has_scan_driven_mutation(def);
+}
+
+template<typename RowData>
+inline void cached_table_invalidate_after_mutation(const CachedTableDef<RowData>* def) {
+    if (!def || !def->shared_cache) return;
+    std::lock_guard<std::mutex> lock(def->shared_cache->mutex);
+    def->shared_cache->indexes.clear();
+    def->shared_cache->built = false;
+    def->shared_cache->mutation_snapshot = !def->shared_cache->data.empty();
+}
+} // namespace detail
 
 template<typename RowData>
 struct CachedCursor {
@@ -1056,10 +1102,20 @@ struct CachedCursor {
     bool using_iterator = false;
     bool iterator_eof = false;
 
+    // Rowid equality lookup
+    bool using_rowid_lookup = false;
+    bool rowid_lookup_eof = false;
+    RowData rowid_lookup_row{};
+    int64_t rowid_lookup_id = 0;
+
     // Index-based iteration
     bool using_index = false;
     const std::vector<size_t>* index_matches = nullptr;  // Points into shared_cache->indexes
     size_t index_pos = 0;
+
+    // Exact count-only/no-column full scan
+    bool using_count_only = false;
+    size_t count_only_total = 0;
 };
 
 template<typename RowData>
@@ -1099,6 +1155,11 @@ inline int cached_vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCursor)
     cursor->iterator = nullptr;
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
+    cursor->using_rowid_lookup = false;
+    cursor->rowid_lookup_eof = false;
+    cursor->rowid_lookup_id = 0;
+    cursor->using_count_only = false;
+    cursor->count_only_total = 0;
     *ppCursor = &cursor->base;
     return to_sqlite_status(Status::ok);
 }
@@ -1116,8 +1177,12 @@ inline int cached_vtab_next(sqlite3_vtab_cursor* pCursor) {
         if (!cursor->iterator->next()) {
             cursor->iterator_eof = true;
         }
+    } else if (cursor->using_rowid_lookup) {
+        cursor->rowid_lookup_eof = true;
     } else if (cursor->using_index) {
         cursor->index_pos++;
+    } else if (cursor->using_count_only) {
+        cursor->current_row++;
     } else {
         cursor->current_row++;
     }
@@ -1131,12 +1196,19 @@ inline int cached_vtab_eof(sqlite3_vtab_cursor* pCursor) {
         if (!cursor->iterator || cursor->iterator_eof) return 1;
         return cursor->iterator->eof() ? 1 : 0;
     }
+    if (cursor->using_rowid_lookup) {
+        return cursor->rowid_lookup_eof ? 1 : 0;
+    }
     if (cursor->using_index) {
         if (!cursor->index_matches) return 1;
         return cursor->index_pos >= cursor->index_matches->size() ? 1 : 0;
     }
+    if (cursor->using_count_only) {
+        return cursor->current_row >= cursor->count_only_total ? 1 : 0;
+    }
     // Full scan using shared cache
-    if (cursor->def->use_shared_cache && cursor->def->shared_cache && cursor->def->shared_cache->built) {
+    if (cursor->def->use_shared_cache && cursor->def->shared_cache &&
+        (cursor->def->shared_cache->built || cursor->def->shared_cache->mutation_snapshot)) {
         return cursor->current_row >= cursor->def->shared_cache->data.size() ? 1 : 0;
     }
     return cursor->current_row >= cursor->cache.size() ? 1 : 0;
@@ -1160,6 +1232,10 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
         sqlite3_result_null(ctx);
         return to_sqlite_status(Status::ok);
     }
+    if (cursor->using_count_only) {
+        sqlite3_result_null(ctx);
+        return to_sqlite_status(Status::ok);
+    }
     FunctionContext fctx(ctx);
     if (cursor->using_iterator && cursor->iterator) {
         if (cursor->iterator_eof) {
@@ -1167,6 +1243,12 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
             return to_sqlite_status(Status::ok);
         }
         cursor->iterator->column(fctx, col);
+    } else if (cursor->using_rowid_lookup) {
+        if (cursor->rowid_lookup_eof) {
+            sqlite3_result_null(ctx);
+            return to_sqlite_status(Status::ok);
+        }
+        cursor->def->columns[col].get(fctx, cursor->rowid_lookup_row);
     } else if (cursor->using_index) {
         // Index-based access: get row from shared cache via index
         if (cursor->index_matches && cursor->index_pos < cursor->index_matches->size()) {
@@ -1183,7 +1265,9 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
     } else {
         // Full scan: use shared cache if available, else local cache
         const auto& shared = cursor->def->shared_cache;
-        if (cursor->def->use_shared_cache && shared && shared->built && cursor->current_row < shared->data.size()) {
+        if (cursor->def->use_shared_cache && shared &&
+            (shared->built || shared->mutation_snapshot) &&
+            cursor->current_row < shared->data.size()) {
             cursor->def->columns[col].get(fctx, shared->data[cursor->current_row]);
         } else if (cursor->current_row < cursor->cache.size()) {
             cursor->def->columns[col].get(fctx, cursor->cache[cursor->current_row]);
@@ -1203,6 +1287,10 @@ inline int cached_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid
             return to_sqlite_status(Status::ok);
         }
         *pRowid = cursor->iterator->rowid();
+    } else if (cursor->using_rowid_lookup) {
+        *pRowid = cursor->rowid_lookup_eof ? 0 : cursor->rowid_lookup_id;
+    } else if (cursor->using_count_only) {
+        *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
     } else {
         *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
     }
@@ -1218,14 +1306,83 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
     cursor->iterator = nullptr;
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
+    cursor->using_rowid_lookup = false;
+    cursor->rowid_lookup_eof = false;
+    cursor->rowid_lookup_id = 0;
     cursor->using_index = false;
     cursor->index_matches = nullptr;
     cursor->index_pos = 0;
+    cursor->using_count_only = false;
+    cursor->count_only_total = 0;
     cursor->cache.clear();
     cursor->cache_built = false;
     cursor->current_row = 0;
 
+    if (idxNum == COUNT_ONLY_SCAN && argc == 0 &&
+        detail::cached_table_supports_count_only_scan(cursor->def)) {
+        clear_vtab_error();
+        cursor->using_count_only = true;
+        cursor->count_only_total = cursor->def->row_count_fn();
+        if (!get_vtab_error().empty()) {
+            return return_vtab_error(pCursor->pVtab);
+        }
+        return to_sqlite_status(Status::ok);
+    }
+
     if (idxNum != FILTER_NONE && argc > 0) {
+        if (idxNum == ROWID_FILTER) {
+            if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
+                cursor->using_rowid_lookup = true;
+                cursor->rowid_lookup_id = 0;
+                cursor->rowid_lookup_eof = true;
+                return to_sqlite_status(Status::ok);
+            }
+
+            const int64_t raw_rowid = FunctionArg(argv[0]).as_int64();
+            cursor->using_rowid_lookup = true;
+            cursor->rowid_lookup_id = raw_rowid;
+            cursor->rowid_lookup_eof = true;
+
+            if (raw_rowid >= 0) {
+                clear_vtab_error();
+                bool row_found = false;
+                if (cursor->def->row_lookup) {
+                    row_found = cursor->def->row_lookup(cursor->rowid_lookup_row, raw_rowid);
+                    cursor->rowid_lookup_eof = !row_found;
+                }
+
+                if (!row_found) {
+                    if (cursor->def->use_shared_cache) {
+                        cursor->def->ensure_cache_built();
+                        if (!get_vtab_error().empty()) {
+                            return return_vtab_error(pCursor->pVtab);
+                        }
+                        const auto& shared = cursor->def->shared_cache;
+                        const size_t rowid = static_cast<size_t>(raw_rowid);
+                        if (shared && shared->built && rowid < shared->data.size()) {
+                            cursor->rowid_lookup_row = shared->data[rowid];
+                            cursor->rowid_lookup_eof = false;
+                        }
+                    } else if (!cursor->def->row_lookup && cursor->def->cache_builder_fn) {
+                        std::vector<RowData> rows;
+                        cursor->def->cache_builder_fn(rows);
+                        if (!get_vtab_error().empty()) {
+                            return return_vtab_error(pCursor->pVtab);
+                        }
+                        const size_t rowid = static_cast<size_t>(raw_rowid);
+                        if (rowid < rows.size()) {
+                            cursor->rowid_lookup_row = std::move(rows[rowid]);
+                            cursor->rowid_lookup_eof = false;
+                        }
+                    }
+                }
+                if (!get_vtab_error().empty()) {
+                    return return_vtab_error(pCursor->pVtab);
+                }
+            }
+            return to_sqlite_status(Status::ok);
+        }
+
         // Check for index-based lookup (idxNum >= INDEX_BASE)
         if (cursor->def->use_shared_cache && idxNum >= INDEX_BASE) {
             int index_pos = idxNum - INDEX_BASE;
@@ -1306,12 +1463,26 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
     int best_filter_constraint_idx = -1;
     int best_index_pos = -1;
     int best_index_constraint_idx = -1;
+    int best_rowid_constraint_idx = -1;
     double best_cost = 1e9;
+
+    auto estimate_full_scan_rows = [&]() -> size_t {
+        size_t estimated_rows = 1000;
+        if (def->estimate_rows_fn) {
+            estimated_rows = def->estimate_rows_fn();
+        }
+        return estimated_rows;
+    };
 
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
         if (!constraint.usable) continue;
         if (constraint.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+
+        if (constraint.iColumn < 0) {
+            best_rowid_constraint_idx = i;
+            continue;
+        }
 
         // Check for explicit filter
         const FilterDef* filter = def->find_filter(constraint.iColumn);
@@ -1336,7 +1507,19 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
     }
 
     // Prefer index over filter if both matched
-    if (best_index_pos >= 0 && best_index_constraint_idx >= 0) {
+    if (pInfo->nConstraint == 0 && pInfo->colUsed == 0 &&
+        detail::cached_table_supports_count_only_scan(def)) {
+        const size_t estimated_rows = estimate_full_scan_rows();
+        pInfo->idxNum = COUNT_ONLY_SCAN;
+        pInfo->estimatedCost = static_cast<double>(estimated_rows);
+        pInfo->estimatedRows = estimated_rows;
+    } else if (best_rowid_constraint_idx >= 0) {
+        pInfo->aConstraintUsage[best_rowid_constraint_idx].argvIndex = 1;
+        pInfo->aConstraintUsage[best_rowid_constraint_idx].omit = 1;
+        pInfo->idxNum = ROWID_FILTER;
+        pInfo->estimatedCost = 1.0;
+        pInfo->estimatedRows = 1;
+    } else if (best_index_pos >= 0 && best_index_constraint_idx >= 0) {
         pInfo->aConstraintUsage[best_index_constraint_idx].argvIndex = 1;
         pInfo->aConstraintUsage[best_index_constraint_idx].omit = 1;
         pInfo->idxNum = INDEX_BASE + best_index_pos;
@@ -1350,10 +1533,7 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
     } else {
         // No filter or index - full scan
-        size_t estimated_rows = 1000;
-        if (def->estimate_rows_fn) {
-            estimated_rows = def->estimate_rows_fn();
-        }
+        size_t estimated_rows = estimate_full_scan_rows();
         pInfo->idxNum = FILTER_NONE;
         pInfo->estimatedCost = static_cast<double>(estimated_rows);
         pInfo->estimatedRows = estimated_rows;
@@ -1381,6 +1561,9 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
 
         if (shared && shared->built && raw_rowid >= 0 && rowid < shared->data.size()) {
             row_ptr = &shared->data[rowid];
+        } else if (shared && shared->mutation_snapshot && !def->row_lookup &&
+                   raw_rowid >= 0 && rowid < shared->data.size()) {
+            row_ptr = &shared->data[rowid];
         } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
             row_ptr = &temp_row;
         } else if (!def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
@@ -1403,7 +1586,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         if (!def->delete_row(*row_ptr)) {
             return to_sqlite_status(Status::error);
         }
-        def->invalidate_cache();
+        detail::cached_table_invalidate_after_mutation(def);
         if (def->after_modify) def->after_modify("DELETE FROM " + def->name);
         return to_sqlite_status(Status::ok);
     }
@@ -1431,6 +1614,9 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         RowData temp_row{};
 
         if (shared && shared->built && raw_rowid >= 0 && old_rowid < shared->data.size()) {
+            row_ptr = &shared->data[old_rowid];
+        } else if (shared && shared->mutation_snapshot && !def->row_lookup &&
+                   raw_rowid >= 0 && old_rowid < shared->data.size()) {
             row_ptr = &shared->data[old_rowid];
         } else if (def->row_from_argv) {
             // Build temp row from argv column values.
@@ -1468,7 +1654,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
                 }
             }
         }
-        def->invalidate_cache();
+        detail::cached_table_invalidate_after_mutation(def);
         if (def->after_modify) def->after_modify("UPDATE " + def->name);
         return to_sqlite_status(Status::ok);
     }
@@ -1568,6 +1754,11 @@ public:
 
     CachedTableBuilder& estimate_rows(std::function<size_t()> fn) {
         def_.estimate_rows_fn = std::move(fn);
+        return *this;
+    }
+
+    CachedTableBuilder& count(std::function<size_t()> fn) {
+        def_.row_count_fn = std::move(fn);
         return *this;
     }
 
@@ -1834,6 +2025,71 @@ struct Generator {
 // Used for table-valued functions with hidden input parameters.
 // Filter IDs start at PARAMETRIC_FILTER_BASE to avoid collision with single-column filters.
 constexpr int PARAMETRIC_FILTER_BASE = 500;
+constexpr int CONSTRAINT_FILTER_BASE = 2000;
+
+enum class ConstraintOp {
+    Eq,
+    Gt,
+    Le,
+    Lt,
+    Ge
+};
+
+inline int sqlite_constraint_op(ConstraintOp op) {
+    switch (op) {
+        case ConstraintOp::Eq: return SQLITE_INDEX_CONSTRAINT_EQ;
+        case ConstraintOp::Gt: return SQLITE_INDEX_CONSTRAINT_GT;
+        case ConstraintOp::Le: return SQLITE_INDEX_CONSTRAINT_LE;
+        case ConstraintOp::Lt: return SQLITE_INDEX_CONSTRAINT_LT;
+        case ConstraintOp::Ge: return SQLITE_INDEX_CONSTRAINT_GE;
+    }
+    return SQLITE_INDEX_CONSTRAINT_EQ;
+}
+
+struct ConstraintRequest {
+    std::string column_name;
+    ConstraintOp op = ConstraintOp::Eq;
+    bool required = false;
+    std::string missing_error;
+};
+
+inline ConstraintRequest required_eq(const char* column_name, const char* missing_error) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Eq, true,
+                             missing_error ? missing_error : ""};
+}
+
+inline ConstraintRequest optional_eq(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Eq, false, ""};
+}
+
+inline ConstraintRequest optional_gt(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Gt, false, ""};
+}
+
+inline ConstraintRequest optional_ge(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Ge, false, ""};
+}
+
+inline ConstraintRequest optional_lt(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Lt, false, ""};
+}
+
+inline ConstraintRequest optional_le(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Le, false, ""};
+}
+
+struct GeneratorConstraintSpec {
+    int column_index = -1;
+    ConstraintOp op = ConstraintOp::Eq;
+    bool required = false;
+    std::string missing_error;
+};
+
+struct GeneratorConstraintArg {
+    int column_index = -1;
+    ConstraintOp op = ConstraintOp::Eq;
+    FunctionArg value;
+};
 
 template<typename RowData>
 struct ParametricFilterDef {
@@ -1847,6 +2103,18 @@ struct ParametricFilterDef {
 };
 
 template<typename RowData>
+struct ConstraintFilterDef {
+    std::vector<GeneratorConstraintSpec> specs;
+    int filter_id;
+    double estimated_cost;
+    double estimated_rows;
+    int ordered_column = -1;
+    bool ordered_desc = false;
+    std::function<std::unique_ptr<Generator<RowData>>(
+        const std::vector<GeneratorConstraintArg>&)> create;
+};
+
+template<typename RowData>
 struct GeneratorTableDef {
     std::string name;
     std::function<size_t()> estimate_rows_fn;
@@ -1854,7 +2122,12 @@ struct GeneratorTableDef {
     std::vector<CachedColumnDef<RowData>> columns;
     std::vector<FilterDef> filters;
     std::vector<ParametricFilterDef<RowData>> parametric_filters;
+    std::vector<ConstraintFilterDef<RowData>> constraint_filters;
     std::unordered_set<int> hidden_columns;  // Column indices marked HIDDEN
+    std::string full_scan_error;
+    std::function<bool(RowData&, int64_t)> row_lookup;
+    std::function<void(const std::string&)> before_modify;
+    std::function<void(const std::string&)> after_modify;
 
     std::string schema() const {
         std::ostringstream ss;
@@ -1882,6 +2155,20 @@ struct GeneratorTableDef {
         return nullptr;
     }
 };
+
+inline std::vector<int> parse_constraint_index_list(const char* idx_str) {
+    std::vector<int> result;
+    if (!idx_str || !*idx_str) return result;
+
+    std::stringstream ss(idx_str);
+    std::string part;
+    while (std::getline(ss, part, ',')) {
+        if (!part.empty()) {
+            result.push_back(std::atoi(part.c_str()));
+        }
+    }
+    return result;
+}
 
 template<typename RowData>
 struct GeneratorCursor {
@@ -1969,6 +2256,10 @@ inline int generator_vtab_eof(sqlite3_vtab_cursor* pCursor) {
 template<typename RowData>
 inline int generator_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int col) {
     auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+    if (sqlite3_vtab_nochange(ctx)) {
+        return to_sqlite_status(Status::ok);
+    }
+
     if (col < 0 || static_cast<size_t>(col) >= cursor->def->columns.size()) {
         sqlite3_result_null(ctx);
         return to_sqlite_status(Status::ok);
@@ -2015,7 +2306,7 @@ inline int generator_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRo
 }
 
 template<typename RowData>
-inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
+inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxStr,
                                  int argc, sqlite3_value** argv) {
     auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
 
@@ -2025,8 +2316,43 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
 
+    if (idxNum == MISSING_REQUIRED_CONSTRAINT) {
+        set_vtab_error(idxStr && idxStr[0] ? idxStr : "required constraint missing");
+        return return_vtab_error(pCursor->pVtab);
+    }
+
     if (idxNum != FILTER_NONE && argc > 0) {
-        // Check parametric filters first (multi-column, creates a Generator)
+        // Check constraint filters first (multi-column, multi-operator).
+        if (idxNum >= CONSTRAINT_FILTER_BASE) {
+            for (const auto& cf : cursor->def->constraint_filters) {
+                if (cf.filter_id == idxNum) {
+                    std::vector<int> spec_indices = parse_constraint_index_list(idxStr);
+                    std::vector<GeneratorConstraintArg> args;
+                    args.reserve(static_cast<size_t>(argc));
+                    for (int i = 0; i < argc && i < static_cast<int>(spec_indices.size()); i++) {
+                        int spec_idx = spec_indices[static_cast<size_t>(i)];
+                        if (spec_idx < 0 || static_cast<size_t>(spec_idx) >= cf.specs.size()) {
+                            continue;
+                        }
+                        const auto& spec = cf.specs[static_cast<size_t>(spec_idx)];
+                        args.push_back(GeneratorConstraintArg{
+                            spec.column_index,
+                            spec.op,
+                            FunctionArg(argv[i])
+                        });
+                    }
+                    cursor->generator = cf.create(args);
+                    cursor->using_iterator = false;
+                    cursor->generator_eof = true;
+                    if (cursor->generator) {
+                        cursor->generator_eof = !cursor->generator->next();
+                    }
+                    return to_sqlite_status(Status::ok);
+                }
+            }
+        }
+
+        // Check parametric filters (multi-column, creates a Generator)
         if (idxNum >= PARAMETRIC_FILTER_BASE) {
             for (const auto& pf : cursor->def->parametric_filters) {
                 if (pf.filter_id == idxNum) {
@@ -2060,6 +2386,11 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
         }
     }
 
+    if (!cursor->def->full_scan_error.empty()) {
+        set_vtab_error(cursor->def->full_scan_error);
+        return return_vtab_error(pCursor->pVtab);
+    }
+
     // Full scan - create generator and position to first row.
     cursor->using_iterator = false;
     cursor->generator_eof = true;
@@ -2077,7 +2408,94 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
     auto* vtab = reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
     const auto* def = vtab->def;
 
-    // First, check parametric filters (multi-column, e.g. hidden params for table-valued functions).
+    // First, check constraint filters (multi-column, multi-operator).
+    const ConstraintFilterDef<RowData>* best_cf = nullptr;
+    std::vector<int> best_matched_constraints;
+    bool best_consumes_order = false;
+    int best_matched_count = -1;
+    std::string missing_required_error;
+
+    for (const auto& cf : def->constraint_filters) {
+        std::vector<int> matched_constraints(cf.specs.size(), -1);
+        bool all_required_matched = true;
+        int matched_count = 0;
+
+        for (size_t s = 0; s < cf.specs.size(); ++s) {
+            const auto& spec = cf.specs[s];
+            bool found = false;
+            const int sqlite_op = sqlite_constraint_op(spec.op);
+            for (int i = 0; i < pInfo->nConstraint; i++) {
+                const auto& c = pInfo->aConstraint[i];
+                if (!c.usable) continue;
+                if (c.op != sqlite_op) continue;
+                if (c.iColumn == spec.column_index) {
+                    matched_constraints[s] = i;
+                    found = true;
+                    matched_count++;
+                    break;
+                }
+            }
+            if (spec.required && !found) {
+                all_required_matched = false;
+                if (missing_required_error.empty() && !spec.missing_error.empty()) {
+                    missing_required_error = spec.missing_error;
+                }
+                break;
+            }
+        }
+
+        if (all_required_matched && matched_count > 0) {
+            bool consumes_order = false;
+            if (cf.ordered_column >= 0 && pInfo->nOrderBy == 1) {
+                const auto& order = pInfo->aOrderBy[0];
+                if (order.iColumn == cf.ordered_column &&
+                    ((order.desc != 0) == cf.ordered_desc)) {
+                    consumes_order = true;
+                }
+            }
+
+            if (!best_cf ||
+                cf.estimated_cost < best_cf->estimated_cost ||
+                (cf.estimated_cost == best_cf->estimated_cost &&
+                 consumes_order && !best_consumes_order) ||
+                (cf.estimated_cost == best_cf->estimated_cost &&
+                 consumes_order == best_consumes_order &&
+                 matched_count > best_matched_count)) {
+                best_cf = &cf;
+                best_matched_constraints = std::move(matched_constraints);
+                best_consumes_order = consumes_order;
+                best_matched_count = matched_count;
+            }
+        }
+    }
+
+    if (best_cf) {
+        std::ostringstream idx_str;
+        int argv_index = 1;
+        bool first = true;
+        for (size_t s = 0; s < best_matched_constraints.size(); ++s) {
+            int constraint_idx = best_matched_constraints[s];
+            if (constraint_idx < 0) continue;
+            pInfo->aConstraintUsage[constraint_idx].argvIndex = argv_index++;
+            pInfo->aConstraintUsage[constraint_idx].omit = 1;
+            if (!first) idx_str << ",";
+            idx_str << s;
+            first = false;
+        }
+
+        if (best_consumes_order) {
+            pInfo->orderByConsumed = 1;
+        }
+
+        pInfo->idxNum = best_cf->filter_id;
+        pInfo->idxStr = sqlite3_mprintf("%s", idx_str.str().c_str());
+        pInfo->needToFreeIdxStr = 1;
+        pInfo->estimatedCost = best_cf->estimated_cost;
+        pInfo->estimatedRows = static_cast<sqlite3_int64>(best_cf->estimated_rows);
+        return to_sqlite_status(Status::ok);
+    }
+
+    // Next, check parametric filters (multi-column, e.g. hidden params for table-valued functions).
     // A parametric filter matches when ALL its required columns are EQ-constrained.
     for (const auto& pf : def->parametric_filters) {
         // Map each required column to its constraint index
@@ -2136,6 +2554,12 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         pInfo->idxNum = best_filter->filter_id;
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
+    } else if (!missing_required_error.empty()) {
+        pInfo->idxNum = MISSING_REQUIRED_CONSTRAINT;
+        pInfo->idxStr = sqlite3_mprintf("%s", missing_required_error.c_str());
+        pInfo->needToFreeIdxStr = 1;
+        pInfo->estimatedCost = 1.0;
+        pInfo->estimatedRows = 0;
     } else {
         size_t estimated_rows = 1000;
         if (def->estimate_rows_fn) {
@@ -2149,7 +2573,62 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
 }
 
 template<typename RowData>
-inline int generator_vtab_update(sqlite3_vtab*, int, sqlite3_value**, sqlite3_int64*) {
+inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqlite3_int64*) {
+    auto* vtab = reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
+    const auto* def = vtab->def;
+
+    if (argc > 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
+        bool has_writable = false;
+        for (const auto& col : def->columns) {
+            if (col.writable && col.set) {
+                has_writable = true;
+                break;
+            }
+        }
+        if (!has_writable || !def->row_lookup) {
+            return to_sqlite_status(Status::read_only);
+        }
+
+        RowData row{};
+        const int64_t raw_rowid = sqlite3_value_int64(argv[0]);
+        clear_vtab_error();
+        if (!def->row_lookup(row, raw_rowid)) {
+            const std::string& err = get_vtab_error();
+            if (!err.empty()) {
+                pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+            }
+            clear_vtab_error();
+            return to_sqlite_status(Status::error);
+        }
+
+        if (def->before_modify) {
+            def->before_modify("UPDATE " + def->name);
+        }
+
+        for (size_t i = 2; i < static_cast<size_t>(argc) && (i - 2) < def->columns.size(); ++i) {
+            if (sqlite3_value_nochange(argv[i])) continue;
+            const auto& col = def->columns[i - 2];
+            if (col.writable && col.set) {
+                clear_vtab_error();
+                if (!col.set(row, FunctionArg(argv[i]))) {
+                    const std::string& err = get_vtab_error();
+                    if (!err.empty()) {
+                        pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                    }
+                    clear_vtab_error();
+                    return to_sqlite_status(Status::error);
+                }
+            }
+        }
+
+        if (def->after_modify) def->after_modify("UPDATE " + def->name);
+        return to_sqlite_status(Status::ok);
+    }
+
+    return to_sqlite_status(Status::read_only);
+}
+
+inline int generator_vtab_read_only_update(sqlite3_vtab*, int, sqlite3_value**, sqlite3_int64*) {
     return to_sqlite_status(Status::read_only);
 }
 
@@ -2169,7 +2648,11 @@ inline sqlite3_module create_generator_module() {
     mod.xEof = generator_vtab_eof<RowData>;
     mod.xColumn = generator_vtab_column<RowData>;
     mod.xRowid = generator_vtab_rowid<RowData>;
-    mod.xUpdate = generator_vtab_update<RowData>;
+    if constexpr (std::is_default_constructible_v<RowData>) {
+        mod.xUpdate = generator_vtab_update<RowData>;
+    } else {
+        mod.xUpdate = generator_vtab_read_only_update;
+    }
     return mod;
 }
 
@@ -2229,6 +2712,28 @@ public:
         return *this;
     }
 
+    GeneratorTableBuilder& full_scan_error(std::string message) {
+        def_.full_scan_error = std::move(message);
+        return *this;
+    }
+
+    GeneratorTableBuilder& on_modify(std::function<void(const std::string&)> fn) {
+        def_.before_modify = std::move(fn);
+        return *this;
+    }
+
+    GeneratorTableBuilder& after_modify(std::function<void(const std::string&)> fn) {
+        def_.after_modify = std::move(fn);
+        return *this;
+    }
+
+    GeneratorTableBuilder& column(const char* name,
+                                  ColumnType type,
+                                  std::function<void(FunctionContext&, const RowData&)> getter) {
+        def_.columns.emplace_back(name, type, false, std::move(getter), nullptr);
+        return *this;
+    }
+
     GeneratorTableBuilder& column_int64(const char* name, std::function<int64_t(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
             [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
@@ -2237,11 +2742,59 @@ public:
         return *this;
     }
 
+    GeneratorTableBuilder& column_int64_rw(const char* name,
+                                           std::function<int64_t(const RowData&)> getter,
+                                           std::function<bool(RowData&, FunctionArg)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int64(getter(row));
+            },
+            std::move(setter));
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_int64_rw(const char* name,
+                                           std::function<int64_t(const RowData&)> getter,
+                                           std::function<bool(RowData&, int64_t)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int64(getter(row));
+            },
+            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+                return setter(row, val.as_int64());
+            });
+        return *this;
+    }
+
     GeneratorTableBuilder& column_int(const char* name, std::function<int(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
             [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
                 ctx.result_int(getter(row));
             }, nullptr);
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_int_rw(const char* name,
+                                         std::function<int(const RowData&)> getter,
+                                         std::function<bool(RowData&, FunctionArg)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int(getter(row));
+            },
+            std::move(setter));
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_int_rw(const char* name,
+                                         std::function<int(const RowData&)> getter,
+                                         std::function<bool(RowData&, int)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int(getter(row));
+            },
+            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+                return setter(row, val.as_int());
+            });
         return *this;
     }
 
@@ -2345,6 +2898,45 @@ public:
         pf.estimated_rows = est_rows;
         pf.create = std::move(factory);
         def_.parametric_filters.push_back(std::move(pf));
+        return *this;
+    }
+
+    GeneratorTableBuilder& constraint_filter(
+            std::initializer_list<ConstraintRequest> constraints,
+            std::function<std::unique_ptr<Generator<RowData>>(
+                const std::vector<GeneratorConstraintArg>&)> factory,
+            double cost = 1.0, double est_rows = 100.0) {
+        ConstraintFilterDef<RowData> cf;
+        for (const auto& req : constraints) {
+            int idx = def_.find_column(req.column_name);
+            if (idx < 0) return *this;
+            cf.specs.push_back(GeneratorConstraintSpec{
+                idx,
+                req.op,
+                req.required,
+                req.missing_error
+            });
+        }
+        cf.filter_id = CONSTRAINT_FILTER_BASE + static_cast<int>(def_.constraint_filters.size());
+        cf.estimated_cost = cost;
+        cf.estimated_rows = est_rows;
+        cf.create = std::move(factory);
+        def_.constraint_filters.push_back(std::move(cf));
+        return *this;
+    }
+
+    GeneratorTableBuilder& order_by_consumed(const char* column_name, bool desc = false) {
+        if (def_.constraint_filters.empty()) return *this;
+        int idx = def_.find_column(column_name ? column_name : "");
+        if (idx < 0) return *this;
+        auto& cf = def_.constraint_filters.back();
+        cf.ordered_column = idx;
+        cf.ordered_desc = desc;
+        return *this;
+    }
+
+    GeneratorTableBuilder& row_lookup(std::function<bool(RowData&, int64_t)> fn) {
+        def_.row_lookup = std::move(fn);
         return *this;
     }
 
