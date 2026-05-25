@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # Enable CMAKE_MSVC_RUNTIME_LIBRARY support (required for IDA SDK compatibility)
 cmake_policy(SET CMP0091 NEW)
 
-project(libxsql VERSION 1.0.1 LANGUAGES C CXX)
+project(libxsql VERSION 1.0.2 LANGUAGES C CXX)
 
 # Detect if we're being built standalone or as part of a larger project
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -65,20 +65,29 @@ if(XSQL_WITH_THINCLIENT)
     target_link_libraries(xsql PUBLIC httplib::httplib)
 endif()
 
-# Make find_package(xsql) work from build tree
-set(XSQL_EXPORT_TARGETS xsql sqlite3 nlohmann_json)
-if(XSQL_WITH_THINCLIENT)
-    list(APPEND XSQL_EXPORT_TARGETS httplib)
-endif()
+# Make find_package(xsql) work from build tree.
+#
+# Only generate the build-tree export when libxsql owns all of xsql's PUBLIC
+# link dependencies. When an outer project (e.g. bnsql's fastmcpp
+# FetchContent) already provided nlohmann_json, that target lives in a
+# different export set and CMake refuses to export xsql against it. In that
+# case the outer project consumes xsql::xsql directly as an in-tree target
+# and the build-tree export is unnecessary anyway.
+if(XSQL_OWNS_NLOHMANN_JSON)
+    set(XSQL_EXPORT_TARGETS xsql sqlite3 nlohmann_json)
+    if(XSQL_WITH_THINCLIENT)
+        list(APPEND XSQL_EXPORT_TARGETS httplib)
+    endif()
 
-export(TARGETS ${XSQL_EXPORT_TARGETS}
-    NAMESPACE xsql::
-    FILE "${CMAKE_CURRENT_BINARY_DIR}/xsqlTargets.cmake"
-)
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/xsqlConfig.cmake"
-    "include(\"\${CMAKE_CURRENT_LIST_DIR}/xsqlTargets.cmake\")\n"
-)
-set(xsql_DIR "${CMAKE_CURRENT_BINARY_DIR}" CACHE PATH "xsql config directory" FORCE)
+    export(TARGETS ${XSQL_EXPORT_TARGETS}
+        NAMESPACE xsql::
+        FILE "${CMAKE_CURRENT_BINARY_DIR}/xsqlTargets.cmake"
+    )
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/xsqlConfig.cmake"
+        "include(\"\${CMAKE_CURRENT_LIST_DIR}/xsqlTargets.cmake\")\n"
+    )
+    set(xsql_DIR "${CMAKE_CURRENT_BINARY_DIR}" CACHE PATH "xsql config directory" FORCE)
+endif()
 
 # ============================================================================
 # Examples (optional)
@@ -96,7 +105,10 @@ endif()
 if(XSQL_STANDALONE)
     include(GNUInstallDirs)
 
-    set(XSQL_INSTALL_TARGETS xsql sqlite3 nlohmann_json)
+    set(XSQL_INSTALL_TARGETS xsql sqlite3)
+    if(XSQL_OWNS_NLOHMANN_JSON)
+        list(APPEND XSQL_INSTALL_TARGETS nlohmann_json)
+    endif()
 
     install(TARGETS ${XSQL_INSTALL_TARGETS}
         EXPORT xsqlTargets
