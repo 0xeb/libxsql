@@ -2126,6 +2126,10 @@ struct GeneratorTableDef {
     std::unordered_set<int> hidden_columns;  // Column indices marked HIDDEN
     std::string full_scan_error;
     std::function<bool(RowData&, int64_t)> row_lookup;
+    std::function<bool(RowData&)> delete_row;
+    bool supports_delete = false;
+    std::function<bool(int argc, FunctionArg* argv)> insert_row;
+    bool supports_insert = false;
     std::function<void(const std::string&)> before_modify;
     std::function<void(const std::string&)> after_modify;
 
@@ -2341,7 +2345,15 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
                             FunctionArg(argv[i])
                         });
                     }
+                    clear_vtab_error();
                     cursor->generator = cf.create(args);
+                    const std::string& err = get_vtab_error();
+                    if (!err.empty()) {
+                        pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                        clear_vtab_error();
+                        return to_sqlite_status(Status::error);
+                    }
+                    clear_vtab_error();
                     cursor->using_iterator = false;
                     cursor->generator_eof = true;
                     if (cursor->generator) {
@@ -2361,7 +2373,15 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
                     for (int i = 0; i < argc; i++) {
                         args.emplace_back(argv[i]);
                     }
+                    clear_vtab_error();
                     cursor->generator = pf.create(args);
+                    const std::string& err = get_vtab_error();
+                    if (!err.empty()) {
+                        pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                        clear_vtab_error();
+                        return to_sqlite_status(Status::error);
+                    }
+                    clear_vtab_error();
                     cursor->using_iterator = false;
                     cursor->generator_eof = true;
                     if (cursor->generator) {
@@ -2375,7 +2395,15 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
         // Single-column filters (creates a RowIterator)
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
+                clear_vtab_error();
                 cursor->iterator = filter.create(FunctionArg(argv[0]));
+                const std::string& err = get_vtab_error();
+                if (!err.empty()) {
+                    pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                    clear_vtab_error();
+                    return to_sqlite_status(Status::error);
+                }
+                clear_vtab_error();
                 cursor->using_iterator = true;
                 cursor->iterator_eof = true;
                 if (cursor->iterator) {
@@ -2577,6 +2605,42 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
     auto* vtab = reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
     const auto* def = vtab->def;
 
+    // argc == 1: DELETE
+    if (argc == 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
+        if (!def->supports_delete || !def->delete_row || !def->row_lookup) {
+            return to_sqlite_status(Status::read_only);
+        }
+
+        RowData row{};
+        const int64_t raw_rowid = sqlite3_value_int64(argv[0]);
+        clear_vtab_error();
+        if (!def->row_lookup(row, raw_rowid)) {
+            const std::string& err = get_vtab_error();
+            if (!err.empty()) {
+                pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+            }
+            clear_vtab_error();
+            return to_sqlite_status(Status::error);
+        }
+
+        if (def->before_modify) {
+            def->before_modify("DELETE FROM " + def->name);
+        }
+
+        clear_vtab_error();
+        if (!def->delete_row(row)) {
+            const std::string& err = get_vtab_error();
+            if (!err.empty()) {
+                pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+            }
+            clear_vtab_error();
+            return to_sqlite_status(Status::error);
+        }
+
+        if (def->after_modify) def->after_modify("DELETE FROM " + def->name);
+        return to_sqlite_status(Status::ok);
+    }
+
     if (argc > 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
         bool has_writable = false;
         for (const auto& col : def->columns) {
@@ -2622,6 +2686,35 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
         }
 
         if (def->after_modify) def->after_modify("UPDATE " + def->name);
+        return to_sqlite_status(Status::ok);
+    }
+
+    // argc > 1, argv[0] == NULL: INSERT
+    if (argc > 1 && sqlite3_value_type(argv[0]) == SQLITE_NULL) {
+        if (!def->supports_insert || !def->insert_row) {
+            return to_sqlite_status(Status::read_only);
+        }
+
+        if (def->before_modify) {
+            def->before_modify("INSERT INTO " + def->name);
+        }
+
+        bool ok = false;
+        clear_vtab_error();
+        detail::with_args(argc - 2, &argv[2], [&](FunctionArg* args) {
+            ok = def->insert_row(argc - 2, args);
+        });
+        if (!ok) {
+            const std::string& err = get_vtab_error();
+            if (!err.empty()) {
+                pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+            }
+            clear_vtab_error();
+            return to_sqlite_status(Status::error);
+        }
+        clear_vtab_error();
+
+        if (def->after_modify) def->after_modify("INSERT INTO " + def->name);
         return to_sqlite_status(Status::ok);
     }
 
@@ -2734,6 +2827,14 @@ public:
         return *this;
     }
 
+    GeneratorTableBuilder& column_rw(const char* name,
+                                     ColumnType type,
+                                     std::function<void(FunctionContext&, const RowData&)> getter,
+                                     std::function<bool(RowData&, FunctionArg)> setter) {
+        def_.columns.emplace_back(name, type, true, std::move(getter), std::move(setter));
+        return *this;
+    }
+
     GeneratorTableBuilder& column_int64(const char* name, std::function<int64_t(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
             [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
@@ -2803,6 +2904,31 @@ public:
             [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
                 ctx.result_text(getter(row));
             }, nullptr);
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_text_rw(const char* name,
+                                          std::function<std::string(const RowData&)> getter,
+                                          std::function<bool(RowData&, FunctionArg)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Text, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_text(getter(row));
+            },
+            std::move(setter));
+        return *this;
+    }
+
+    GeneratorTableBuilder& column_text_rw(const char* name,
+                                          std::function<std::string(const RowData&)> getter,
+                                          std::function<bool(RowData&, const char*)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Text, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_text(getter(row));
+            },
+            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+                const char* text = val.as_c_str();
+                return setter(row, text ? text : "");
+            });
         return *this;
     }
 
@@ -2937,6 +3063,20 @@ public:
 
     GeneratorTableBuilder& row_lookup(std::function<bool(RowData&, int64_t)> fn) {
         def_.row_lookup = std::move(fn);
+        return *this;
+    }
+
+    // DELETE handler. The row is resolved via row_lookup() from the rowid, then
+    // passed to delete_fn. Requires row_lookup() to be set.
+    GeneratorTableBuilder& deletable(std::function<bool(RowData&)> delete_fn) {
+        def_.supports_delete = true;
+        def_.delete_row = std::move(delete_fn);
+        return *this;
+    }
+
+    GeneratorTableBuilder& insertable(std::function<bool(int argc, FunctionArg* argv)> insert_fn) {
+        def_.supports_insert = true;
+        def_.insert_row = std::move(insert_fn);
         return *this;
     }
 

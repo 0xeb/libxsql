@@ -125,6 +125,10 @@ auto def = xsql::generator_table<DecompRow>("decompiled")
     .build();
 ```
 
+Generator tables also support UPDATE (via `*_rw` column setters) and DELETE (via
+`deletable()`); both resolve the target row through `row_lookup()`, so set a
+`row_lookup()` when enabling either.
+
 ## Writable Tables
 
 Support UPDATE and DELETE with column setters and `deletable()`.
