@@ -58,6 +58,7 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
+#include <optional>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -140,9 +141,9 @@ inline int return_vtab_error(sqlite3_vtab* pVtab) {
     return to_sqlite_status(Status::error);
 }
 
-// ============================================================================ 
+// ============================================================================
 // Column Types
-// ============================================================================ 
+// ============================================================================
 
 enum class ColumnType {
     Integer,
@@ -774,6 +775,23 @@ public:
                 const char* text = val.as_c_str();
                 return setter(idx, text ? text : "");
             });
+        return *this;
+    }
+
+    VTableBuilder& column_text_nullable_rw(
+                                   const char* name,
+                                   std::function<std::optional<std::string>(size_t)> getter,
+                                   std::function<bool(size_t, FunctionArg)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Text, true,
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
+                auto value = getter(idx);
+                if (value.has_value()) {
+                    ctx.result_text(*value);
+                } else {
+                    ctx.result_null();
+                }
+            },
+            std::move(setter));
         return *this;
     }
 
@@ -1874,6 +1892,23 @@ public:
         return *this;
     }
 
+    CachedTableBuilder& column_text_nullable_rw(
+                                        const char* name,
+                                        std::function<std::optional<std::string>(const RowData&)> getter,
+                                        std::function<bool(RowData&, FunctionArg)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Text, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                auto value = getter(row);
+                if (value.has_value()) {
+                    ctx.result_text(*value);
+                } else {
+                    ctx.result_null();
+                }
+            },
+            std::move(setter));
+        return *this;
+    }
+
     CachedTableBuilder& column_text_rw(const char* name,
                                         std::function<std::string(const RowData&)> getter,
                                         std::function<bool(RowData&, const char*)> setter) {
@@ -2032,7 +2067,8 @@ enum class ConstraintOp {
     Gt,
     Le,
     Lt,
-    Ge
+    Ge,
+    Like
 };
 
 inline int sqlite_constraint_op(ConstraintOp op) {
@@ -2042,6 +2078,7 @@ inline int sqlite_constraint_op(ConstraintOp op) {
         case ConstraintOp::Le: return SQLITE_INDEX_CONSTRAINT_LE;
         case ConstraintOp::Lt: return SQLITE_INDEX_CONSTRAINT_LT;
         case ConstraintOp::Ge: return SQLITE_INDEX_CONSTRAINT_GE;
+        case ConstraintOp::Like: return SQLITE_INDEX_CONSTRAINT_LIKE;
     }
     return SQLITE_INDEX_CONSTRAINT_EQ;
 }
@@ -2058,8 +2095,17 @@ inline ConstraintRequest required_eq(const char* column_name, const char* missin
                              missing_error ? missing_error : ""};
 }
 
+inline ConstraintRequest required_like(const char* column_name, const char* missing_error) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Like, true,
+                             missing_error ? missing_error : ""};
+}
+
 inline ConstraintRequest optional_eq(const char* column_name) {
     return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Eq, false, ""};
+}
+
+inline ConstraintRequest optional_like(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Like, false, ""};
 }
 
 inline ConstraintRequest optional_gt(const char* column_name) {

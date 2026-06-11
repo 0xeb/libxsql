@@ -42,3 +42,4 @@
 #include "functions.hpp"
 #include "statement.hpp"
 #include "database.hpp"
+#include "aggregates.hpp"

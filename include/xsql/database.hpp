@@ -151,6 +151,12 @@ public:
 
     Status register_function(const char* name, int argc, ScalarFn fn);
 
+    // Register a custom aggregate function. step() is invoked once per input
+    // row; final() is invoked once per aggregation to produce the result.
+    // For per-aggregation state, use AggregateContext::state_ptr().
+    Status register_aggregate(const char* name, int argc,
+                              AggregateStepFn step, AggregateFinalFn final);
+
     Statement prepare_statement(const char* sql);
     Statement prepare_statement(const std::string& sql);
     bool is_readonly_statement(const char* sql);

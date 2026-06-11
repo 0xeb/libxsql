@@ -85,6 +85,33 @@ private:
 
 using ScalarFn = std::function<void(FunctionContext& ctx, int argc, FunctionArg* argv)>;
 
+// Per-aggregation context for custom aggregate functions. Each query that
+// invokes the aggregate gets its own state pointer (via state_ptr()), zero
+// initialized by SQLite on first access and stable across step() calls
+// for the same aggregation. Allocate the actual state on the heap on first
+// access; release it in the final() callback.
+class AggregateContext {
+public:
+    explicit AggregateContext(void* ctx = nullptr) : ctx_(ctx) {}
+
+    // Returns a pointer to one pointer-sized slot owned by SQLite. The slot is
+    // zero-initialized on first access and stable for the duration of the
+    // aggregation. Typical usage: store a heap pointer to your state object
+    // here, allocate on first step, free in final.
+    void** state_ptr();
+
+    void result_blob(const void* data, size_t len);
+    void result_null();
+    void result_error(const std::string& msg);
+    void result_error(const char* msg);
+
+private:
+    void* ctx_ = nullptr;
+};
+
+using AggregateStepFn = std::function<void(AggregateContext& ctx, int argc, FunctionArg* argv)>;
+using AggregateFinalFn = std::function<void(AggregateContext& ctx)>;
+
 namespace detail {
 
 template<typename ArgPtr, typename Fn>

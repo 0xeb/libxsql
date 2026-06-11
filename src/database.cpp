@@ -5,6 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#include <xsql/aggregates.hpp>
 #include <xsql/database.hpp>
 #include <xsql/vtable.hpp>
 
@@ -47,7 +48,67 @@ void destroy_scalar_fn_wrapper(void* ptr) {
     delete static_cast<ScalarFnWrapper*>(ptr);
 }
 
+struct AggregateFnWrapper {
+    AggregateStepFn step;
+    AggregateFinalFn final;
+};
+
+void aggregate_step_callback(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+    auto* wrapper = static_cast<AggregateFnWrapper*>(sqlite3_user_data(ctx));
+    if (!wrapper || !wrapper->step) {
+        return;
+    }
+
+    AggregateContext actx(ctx);
+    detail::with_args(argc, reinterpret_cast<void* const*>(argv),
+        [&](int count, FunctionArg* args) {
+            wrapper->step(actx, count, args);
+        });
+}
+
+void aggregate_final_callback(sqlite3_context* ctx) {
+    auto* wrapper = static_cast<AggregateFnWrapper*>(sqlite3_user_data(ctx));
+    if (!wrapper || !wrapper->final) {
+        return;
+    }
+
+    AggregateContext actx(ctx);
+    wrapper->final(actx);
+}
+
+void destroy_aggregate_fn_wrapper(void* ptr) {
+    delete static_cast<AggregateFnWrapper*>(ptr);
+}
+
 } // namespace
+
+void** AggregateContext::state_ptr() {
+    if (!ctx_) return nullptr;
+    return static_cast<void**>(sqlite3_aggregate_context(
+        static_cast<sqlite3_context*>(ctx_), sizeof(void*)));
+}
+
+void AggregateContext::result_blob(const void* data, size_t len) {
+    if (!ctx_) return;
+    sqlite3_result_blob(static_cast<sqlite3_context*>(ctx_), data,
+                        static_cast<int>(len), SQLITE_TRANSIENT);
+}
+
+void AggregateContext::result_null() {
+    if (!ctx_) return;
+    sqlite3_result_null(static_cast<sqlite3_context*>(ctx_));
+}
+
+void AggregateContext::result_error(const std::string& msg) {
+    if (!ctx_) return;
+    sqlite3_result_error(static_cast<sqlite3_context*>(ctx_), msg.c_str(),
+                         static_cast<int>(msg.size()));
+}
+
+void AggregateContext::result_error(const char* msg) {
+    if (!ctx_) return;
+    sqlite3_result_error(static_cast<sqlite3_context*>(ctx_), msg ? msg : "", -1);
+}
 
 Database::Database()
     : impl_(std::make_unique<Impl>()) {
@@ -78,6 +139,7 @@ bool Database::open(const char* path) {
         return false;
     }
     impl_->last_error.clear();
+    register_builtin_aggregates(*this);
     return true;
 }
 
@@ -142,7 +204,42 @@ Status Database::register_function(const char* name, int argc, ScalarFn fn) {
         nullptr,
         destroy_scalar_fn_wrapper);
     if (!is_ok(rc)) {
-        delete wrapper;
+        // Do NOT delete `wrapper` here: sqlite3_create_function_v2 invokes the
+        // xDestroy callback (destroy_scalar_fn_wrapper) even when registration
+        // fails, which already deletes the wrapper. A manual delete would be a
+        // double-free. (See SQLite docs: the destructor "is also invoked if the
+        // call to sqlite3_create_function_v2() fails".)
+        impl_->last_error = sqlite3_errmsg(impl_->db);
+    } else {
+        impl_->last_error.clear();
+    }
+    return to_status(rc);
+}
+
+Status Database::register_aggregate(const char* name, int argc,
+                                    AggregateStepFn step, AggregateFinalFn final) {
+    if (!is_open()) {
+        impl_->last_error = "Database not open";
+        return Status::error;
+    }
+
+    auto* wrapper = new AggregateFnWrapper{std::move(step), std::move(final)};
+    int rc = sqlite3_create_function_v2(
+        impl_->db,
+        name,
+        argc,
+        SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+        wrapper,
+        nullptr,
+        aggregate_step_callback,
+        aggregate_final_callback,
+        destroy_aggregate_fn_wrapper);
+    if (!is_ok(rc)) {
+        // Do NOT delete `wrapper` here: sqlite3_create_function_v2 invokes the
+        // xDestroy callback (destroy_aggregate_fn_wrapper) even when registration
+        // fails, which already deletes the wrapper. A manual delete would be a
+        // double-free. (See SQLite docs: the destructor "is also invoked if the
+        // call to sqlite3_create_function_v2() fails".)
         impl_->last_error = sqlite3_errmsg(impl_->db);
     } else {
         impl_->last_error.clear();
