@@ -308,11 +308,28 @@ Result Database::query(const char* sql, const QueryOptions& options) {
 
     TimeoutState timeout_state;
     const bool timeout_enabled = options.timeout_ms > 0;
+
+    // RAII guard for the thread-local cooperative-cancellation checker. The
+    // progress handler only fires between VDBE opcodes, so it cannot interrupt a
+    // long C++ virtual-table cache-build; the checker lets such loops poll the
+    // same deadline via xsql::vtab_interrupted() and bail out cleanly.
+    struct InterruptCheckerGuard {
+        bool active = false;
+        ~InterruptCheckerGuard() { if (active) clear_interrupt_checker(); }
+    } interrupt_guard;
+
     if (timeout_enabled) {
         timeout_state.started_at = std::chrono::steady_clock::now();
         timeout_state.timeout_ms = options.timeout_ms;
         const int progress_steps = options.progress_steps > 0 ? options.progress_steps : 1000;
         sqlite3_progress_handler(impl_->db, progress_steps, &ProgressHandler::callback, &timeout_state);
+
+        const auto deadline =
+            timeout_state.started_at + std::chrono::milliseconds(options.timeout_ms);
+        set_interrupt_checker([deadline]() {
+            return std::chrono::steady_clock::now() >= deadline;
+        });
+        interrupt_guard.active = true;
     }
 
     const auto query_started_at = std::chrono::steady_clock::now();
@@ -354,6 +371,28 @@ Result Database::query(const char* sql, const QueryOptions& options) {
         }
 
         if (step == StepResult::done) {
+            break;
+        }
+
+        // A cooperative-cancellation bail-out (a vtable builder/iterator that
+        // polled vtab_interrupted() and stopped) surfaces as a statement error,
+        // not via the progress handler. If the deadline has passed, classify it
+        // as a timeout so callers treat it consistently. The connection remains
+        // reusable either way.
+        if (timeout_enabled &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - timeout_state.started_at).count()
+                >= timeout_state.timeout_ms) {
+            result.timed_out = true;
+            // Mirror the progress-handler timeout path above: a result-bearing
+            // statement (col_count > 0) keeps the rows gathered so far and flags
+            // them partial; a non-result statement reports a hard timeout error.
+            if (col_count > 0) {
+                result.partial = true;
+                result.warnings.push_back("query timed out; returning partial rows");
+            } else {
+                result.error = "Query timed out";
+            }
             break;
         }
 

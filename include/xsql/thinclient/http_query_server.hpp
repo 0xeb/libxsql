@@ -174,8 +174,17 @@ public:
         }
 
         if (!svr_->is_running()) {
-            server_thread_.detach();
+            // Bind failed (listen() already returned). Tear down cleanly: stop()
+            // unblocks listen() if it is somehow still mid-flight, then JOIN the
+            // thread (never detach -- a detached thread racing svr_.reset() is a
+            // use-after-free) and clear the stale endpoint so status/port() do
+            // not report a port we never bound.
+            svr_->stop();
+            if (server_thread_.joinable()) {
+                server_thread_.join();
+            }
             svr_.reset();
+            port_ = 0;
             return -1;
         }
 
@@ -219,6 +228,7 @@ public:
             server_thread_.join();
         }
         svr_.reset();
+        port_ = 0;  // no stale endpoint after stop; next start() assigns a fresh one
     }
 
     bool is_running() const { return running_.load(); }

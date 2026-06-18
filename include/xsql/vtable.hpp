@@ -142,6 +142,33 @@ inline int return_vtab_error(sqlite3_vtab* pVtab) {
 }
 
 // ============================================================================
+// Cooperative cancellation
+// ============================================================================
+//
+// SQLite's progress handler / sqlite3_interrupt only takes effect between VDBE
+// opcodes. A virtual-table cache-builder or iterator that loops for seconds in
+// C++ never yields to the VDBE, so the query timeout cannot reach it. To make
+// such loops cancellable, Database::query installs a thread-local interrupt
+// checker (bound to the same timeout deadline); long materialization loops poll
+// vtab_interrupted() and bail out via set_vtab_error() when it returns true.
+inline thread_local std::function<bool()> g_vtab_interrupt_check;
+
+inline void set_interrupt_checker(std::function<bool()> fn) {
+    g_vtab_interrupt_check = std::move(fn);
+}
+
+inline void clear_interrupt_checker() {
+    g_vtab_interrupt_check = nullptr;
+}
+
+// Returns true if the current query has exceeded its deadline. Cheap (a single
+// steady_clock compare behind a null check) -- safe to poll inside hot loops,
+// though callers typically poll every ~1024-4096 iterations to keep overhead nil.
+inline bool vtab_interrupted() {
+    return g_vtab_interrupt_check && g_vtab_interrupt_check();
+}
+
+// ============================================================================
 // Column Types
 // ============================================================================
 
@@ -242,13 +269,20 @@ struct FilterDef {
     double estimated_cost;      // Cost estimate for query planner
     double estimated_rows;      // Estimated row count
 
+    // Which SQLite constraint operator this filter matches. EQ filters are
+    // applied with omit=1 (SQLite trusts the iterator). LIKE/GLOB filters are a
+    // best-effort superset optimization applied with omit=0, so SQLite still
+    // re-applies the real pattern test for correctness.
+    int op = SQLITE_INDEX_CONSTRAINT_EQ;
+
     // Factory: create iterator for the given constraint value
     std::function<std::unique_ptr<RowIterator>(FunctionArg)> create;
 
     FilterDef(int col, int id, double cost, double rows,
-              std::function<std::unique_ptr<RowIterator>(FunctionArg)> factory)
+              std::function<std::unique_ptr<RowIterator>(FunctionArg)> factory,
+              int constraint_op = SQLITE_INDEX_CONSTRAINT_EQ)
         : column_index(col), filter_id(id), estimated_cost(cost),
-          estimated_rows(rows), create(std::move(factory)) {}
+          estimated_rows(rows), op(constraint_op), create(std::move(factory)) {}
 };
 
 // ============================================================================
@@ -586,12 +620,14 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
 
         // Pass column values starting at argv[2] (argv[0]=NULL, argv[1]=rowid)
         bool ok = false;
+        clear_vtab_error();
         detail::with_args(argc - 2, &argv[2], [&](FunctionArg* args) {
             ok = def->insert_row(argc - 2, args);
         });
         if (!ok) {
-            return to_sqlite_status(Status::error);
+            return return_vtab_error(pVtab);
         }
+        clear_vtab_error();
         return to_sqlite_status(Status::ok);
     }
 
@@ -601,7 +637,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
 // Create module with xUpdate support
 inline sqlite3_module create_module() {
     sqlite3_module mod = {};
-    mod.iVersion = 1;
+    mod.iVersion = 3;
     mod.xCreate = vtab_connect;
     mod.xConnect = vtab_connect;
     mod.xBestIndex = vtab_best_index;
@@ -974,6 +1010,16 @@ struct CachedTableDef {
     std::function<size_t()> estimate_rows_fn;
     std::function<size_t()> row_count_fn;
     std::function<void(std::vector<RowData>&)> cache_builder_fn;
+
+    // Optional projection-aware variant for query-scoped (no_shared_cache)
+    // tables. Receives SQLite's colUsed bitmask (bit i => column i is read by
+    // the query; bit 63 => "column >= 63 or unknown, assume all"). The builder
+    // may skip materializing expensive columns the query doesn't select (e.g.
+    // a large text blob for a COUNT/aggregate). When set, it is used INSTEAD of
+    // cache_builder_fn for the non-shared full-scan build. It is NOT used for
+    // shared caches (a cross-query cache can't depend on one query's colUsed),
+    // preserving correctness and the query-scoped-only cache model.
+    std::function<void(std::vector<RowData>&, uint64_t)> projection_cache_builder_fn;
     std::vector<CachedColumnDef<RowData>> columns;
     std::vector<FilterDef> filters;
     std::function<bool(RowData&)> delete_row;
@@ -991,6 +1037,28 @@ struct CachedTableDef {
     // Optional row lookup by rowid for UPDATE/DELETE fallback.
     // Useful for filter iterators whose rowid is not a positional index.
     std::function<bool(RowData&, int64_t)> row_lookup;
+
+    // Optional stable rowid for a row. When set, the full-scan and index cursors
+    // report rowid_fn(row) instead of the cache position, so the rowid is
+    // consistent with what filter iterators return (e.g. an ordinal/ea key). This
+    // is required for tables whose filter iterators key by a stable id AND whose
+    // UPDATE/DELETE reconstruct via row_lookup(that id): without it a full-scan
+    // rowid (cache position) and an iterator rowid (the key) would disagree.
+    std::function<int64_t(const RowData&)> rowid_fn;
+
+    // Opt-OUT of rowid-based UPDATE reconstruction + the SQLITE_NOCHANGE
+    // optimization. Set this when the table's rowid is NOT a reliable lookup key
+    // for UPDATE -- i.e. row_lookup() cannot resolve every rowid the scans
+    // produce to the exact row (full-scan position vs key mismatch, or a filter
+    // iterator whose rowid is func-local while row_lookup() expects a global
+    // index). For such tables the framework must reconstruct from the REAL
+    // column values in argv (row_from_argv) and therefore must NOT report
+    // unchanged columns as NOCHANGE (which would feed row_from_argv 0/NULL for
+    // unchanged identity fields like ea or func_addr). Default OFF: the post-
+    // 1ceb960 behavior (NOCHANGE on, row_lookup-first) used by tables whose
+    // filter iterators round-trip through row_lookup() (e.g. types_members) and
+    // by tables with many/paired writable columns that must skip unchanged ones.
+    bool update_from_column_values = false;
 
     // Index definitions: column index -> key extractor
     std::vector<std::pair<int, std::function<int64_t(const RowData&)>>> index_defs;
@@ -1017,9 +1085,12 @@ struct CachedTableDef {
         return -1;
     }
 
-    const FilterDef* find_filter(int col_index) const {
+    // Find a filter for (column, constraint-op). A column may carry more than one
+    // filter (e.g. an EQ filter and a LIKE/prefix filter on the same column), so
+    // the operator must be matched too.
+    const FilterDef* find_filter(int col_index, int op = SQLITE_INDEX_CONSTRAINT_EQ) const {
         for (const auto& f : filters) {
-            if (f.column_index == col_index) return &f;
+            if (f.column_index == col_index && f.op == op) return &f;
         }
         return nullptr;
     }
@@ -1107,6 +1178,23 @@ inline void cached_table_invalidate_after_mutation(const CachedTableDef<RowData>
     def->shared_cache->built = false;
     def->shared_cache->mutation_snapshot = !def->shared_cache->data.empty();
 }
+
+// Decide whether a LIKE/GLOB constraint is worth routing to a prefix filter:
+// true iff the pattern has a usable literal prefix (its first character is not a
+// wildcard/escape). If the right-hand side is not available at plan time (e.g. a
+// bound parameter), return true and let the iterator extract the prefix at filter
+// time -- it is always a correct superset, so the worst case is a full walk.
+inline bool like_constraint_has_usable_prefix(sqlite3_index_info* pInfo, int i) {
+    sqlite3_value* rhs = nullptr;
+    int rc = sqlite3_vtab_rhs_value(pInfo, i, &rhs);
+    if (rc != SQLITE_OK || rhs == nullptr) {
+        return true;  // unknown at plan time -> claim; iterator stays a superset
+    }
+    const unsigned char* text = sqlite3_value_text(rhs);
+    if (!text) return false;
+    const char c0 = static_cast<char>(text[0]);
+    return c0 != '\0' && c0 != '%' && c0 != '_' && c0 != '\\';
+}
 } // namespace detail
 
 template<typename RowData>
@@ -1140,6 +1228,11 @@ template<typename RowData>
 struct CachedVtab {
     sqlite3_vtab base;
     const CachedTableDef<RowData>* def;
+    // NOTE: per-query projection state (colUsed) is NOT stored here. SQLite
+    // reuses one vtab object across cursors, table aliases, and interleaved
+    // prepared statements, so stashing colUsed on the vtab lets one scan clobber
+    // another's projection. It is passed per plan via idxStr (xBestIndex ->
+    // xFilter) instead.
 };
 
 // SQLite callbacks for cached tables
@@ -1238,11 +1331,19 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
 
     // During UPDATE, SQLite may ask for unchanged column values. Returning
     // without a value marks the column as SQLITE_NOCHANGE in xUpdate.
-    // Only safe when the update handler can look up the original row by rowid
-    // in the shared cache. Without shared cache, row_from_argv needs real
-    // column values — returning NOCHANGE would cause it to read 0/NULL for
-    // unchanged fields like ea or func_addr, breaking write operations.
-    if (sqlite3_vtab_nochange(ctx) && cursor->def->use_shared_cache) {
+    // Safe only when the update handler reconstructs the original row by rowid:
+    //   - a POSITIONAL shared-cache index (use_shared_cache and no stable
+    //     rowid_fn -- with rowid_fn the rowid is a key, not a position, so
+    //     xUpdate refuses positional reconstruction), OR
+    //   - a resolving row_lookup.
+    // and never when the table opts out via update_from_column_values. Otherwise
+    // xUpdate reconstructs from real argv values, so reporting NOCHANGE would
+    // feed row_from_argv 0/NULL for unchanged identity fields (ea, func_addr).
+    // This MUST match cached_vtab_update's reconstruct_by_rowid below.
+    if (sqlite3_vtab_nochange(ctx)
+        && !cursor->def->update_from_column_values
+        && (((!cursor->def->rowid_fn) && cursor->def->use_shared_cache)
+            || cursor->def->row_lookup)) {
         return to_sqlite_status(Status::ok);
     }
 
@@ -1299,6 +1400,7 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
 template<typename RowData>
 inline int cached_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid) {
     auto* cursor = reinterpret_cast<CachedCursor<RowData>*>(pCursor);
+    const auto* def = cursor->def;
     if (cursor->using_iterator && cursor->iterator) {
         if (cursor->iterator_eof) {
             *pRowid = 0;
@@ -1307,8 +1409,32 @@ inline int cached_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid
         *pRowid = cursor->iterator->rowid();
     } else if (cursor->using_rowid_lookup) {
         *pRowid = cursor->rowid_lookup_eof ? 0 : cursor->rowid_lookup_id;
+    } else if (cursor->using_index) {
+        // Index path: row lives in the shared cache; honor rowid_fn if set.
+        if (def->rowid_fn && cursor->index_matches &&
+            cursor->index_pos < cursor->index_matches->size()) {
+            size_t row_idx = (*cursor->index_matches)[cursor->index_pos];
+            const auto& shared = def->shared_cache;
+            if (shared && row_idx < shared->data.size()) {
+                *pRowid = def->rowid_fn(shared->data[row_idx]);
+                return to_sqlite_status(Status::ok);
+            }
+        }
+        *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
     } else if (cursor->using_count_only) {
         *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
+    } else if (def->rowid_fn) {
+        // Full scan: report a stable rowid (e.g. ordinal/ea) instead of the cache
+        // position, so it agrees with what filter iterators return and with
+        // row_lookup()-based UPDATE/DELETE reconstruction.
+        const RowData* r = nullptr;
+        if (def->use_shared_cache && def->shared_cache &&
+            cursor->current_row < def->shared_cache->data.size()) {
+            r = &def->shared_cache->data[cursor->current_row];
+        } else if (cursor->current_row < cursor->cache.size()) {
+            r = &cursor->cache[cursor->current_row];
+        }
+        *pRowid = r ? def->rowid_fn(*r) : static_cast<sqlite3_int64>(cursor->current_row);
     } else {
         *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
     }
@@ -1316,7 +1442,7 @@ inline int cached_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid
 }
 
 template<typename RowData>
-inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
+inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxStr,
                               int argc, sqlite3_value** argv) {
     auto* cursor = reinterpret_cast<CachedCursor<RowData>*>(pCursor);
 
@@ -1455,10 +1581,20 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
         if (!get_vtab_error().empty()) {
             return return_vtab_error(pCursor->pVtab);
         }
-    } else if (cursor->def->cache_builder_fn) {
+    } else if (cursor->def->projection_cache_builder_fn || cursor->def->cache_builder_fn) {
         cursor->cache.clear();
         clear_vtab_error();
-        cursor->def->cache_builder_fn(cursor->cache);
+        if (cursor->def->projection_cache_builder_fn) {
+            // colUsed arrives per-plan via idxStr from xBestIndex (not shared
+            // vtab state). Absent/unparseable => assume all columns (~0, safe).
+            uint64_t col_used = ~0ull;
+            if (idxStr && *idxStr) {
+                col_used = static_cast<uint64_t>(strtoull(idxStr, nullptr, 10));
+            }
+            cursor->def->projection_cache_builder_fn(cursor->cache, col_used);
+        } else {
+            cursor->def->cache_builder_fn(cursor->cache);
+        }
         if (!get_vtab_error().empty()) {
             cursor->cache.clear();
             return return_vtab_error(pCursor->pVtab);
@@ -1475,6 +1611,19 @@ template<typename RowData>
 inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
     auto* vtab = reinterpret_cast<CachedVtab<RowData>*>(pVtab);
     const auto* def = vtab->def;
+
+    // Carry the columns this query reads (colUsed) to xFilter via idxStr so a
+    // projection-aware builder can skip expensive unused columns. Passing it per
+    // plan (not on the shared vtab) keeps self-joins / aliases / interleaved
+    // statements from clobbering each other's projection. Only allocated for
+    // projection-aware tables; idxStr stays null otherwise (no behavior change).
+    if (def->projection_cache_builder_fn) {
+        if (char* s = sqlite3_mprintf("%llu",
+                static_cast<unsigned long long>(pInfo->colUsed))) {
+            pInfo->idxStr = s;
+            pInfo->needToFreeIdxStr = 1;
+        }
+    }
 
     // Track best option: filter, index, or full scan
     const FilterDef* best_filter = nullptr;
@@ -1495,15 +1644,36 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
         if (!constraint.usable) continue;
-        if (constraint.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+
+        const int op = constraint.op;
+        const bool is_eq = (op == SQLITE_INDEX_CONSTRAINT_EQ);
+        const bool is_like = (op == SQLITE_INDEX_CONSTRAINT_LIKE ||
+                              op == SQLITE_INDEX_CONSTRAINT_GLOB);
+        if (!is_eq && !is_like) continue;
 
         if (constraint.iColumn < 0) {
-            best_rowid_constraint_idx = i;
+            if (is_eq) best_rowid_constraint_idx = i;  // rowid only via equality
             continue;
         }
 
-        // Check for explicit filter
-        const FilterDef* filter = def->find_filter(constraint.iColumn);
+        if (is_like) {
+            // Prefix/LIKE pushdown: a best-effort superset filter. omit stays 0
+            // (set below) so SQLite re-applies the real pattern test. Only claim
+            // the constraint when the pattern has a usable literal prefix -- a
+            // leading-wildcard pattern would force the iterator to walk/return
+            // everything, so it is left to the full scan instead.
+            const FilterDef* filter = def->find_filter(constraint.iColumn, op);
+            if (filter && filter->estimated_cost < best_cost &&
+                detail::like_constraint_has_usable_prefix(pInfo, i)) {
+                best_filter = filter;
+                best_filter_constraint_idx = i;
+                best_cost = filter->estimated_cost;
+            }
+            continue;
+        }
+
+        // Equality: check for explicit filter
+        const FilterDef* filter = def->find_filter(constraint.iColumn, SQLITE_INDEX_CONSTRAINT_EQ);
         if (filter && filter->estimated_cost < best_cost) {
             best_filter = filter;
             best_filter_constraint_idx = i;
@@ -1545,7 +1715,11 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         pInfo->estimatedRows = 5;  // Assume small result set
     } else if (best_filter && best_filter_constraint_idx >= 0) {
         pInfo->aConstraintUsage[best_filter_constraint_idx].argvIndex = 1;
-        pInfo->aConstraintUsage[best_filter_constraint_idx].omit = 1;
+        // EQ filters are trusted (omit). LIKE/GLOB prefix filters are a superset
+        // optimization -- leave the constraint in place so SQLite re-checks the
+        // exact pattern (correctness regardless of the iterator's prefix logic).
+        pInfo->aConstraintUsage[best_filter_constraint_idx].omit =
+            (best_filter->op == SQLITE_INDEX_CONSTRAINT_EQ) ? 1 : 0;
         pInfo->idxNum = best_filter->filter_id;
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
@@ -1577,14 +1751,30 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         RowData temp_row{};
         RowData* row_ptr = nullptr;
 
-        if (shared && shared->built && raw_rowid >= 0 && rowid < shared->data.size()) {
+        // Positional cache lookups (shared->data[rowid] / cache_builder[rowid])
+        // are valid ONLY when the rowid is a cache position: not opted out
+        // (reconstruct_by_rowid) and no stable rowid_fn. An opt-out table's
+        // filter-iterator rowid may overlap a cache index, so it must resolve via
+        // row_lookup (mirrors the xUpdate reconstruction; see CachedTableDef).
+        const bool reconstruct_by_rowid =
+            !def->update_from_column_values &&
+            (((!def->rowid_fn) && def->use_shared_cache) || static_cast<bool>(def->row_lookup));
+
+        if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
+            raw_rowid >= 0 && rowid < shared->data.size()) {
             row_ptr = &shared->data[rowid];
-        } else if (shared && shared->mutation_snapshot && !def->row_lookup &&
-                   raw_rowid >= 0 && rowid < shared->data.size()) {
+        } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->mutation_snapshot &&
+                   !def->row_lookup && raw_rowid >= 0 && rowid < shared->data.size()) {
             row_ptr = &shared->data[rowid];
         } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
             row_ptr = &temp_row;
-        } else if (!def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
+        } else if (!def->rowid_fn && !def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
+            // Non-shared positional rebuild: a full-scan rowid IS the row's index
+            // in the freshly rebuilt cache (exact, no overlap risk), so it is
+            // correct even for opt-out tables -- e.g. names (no_shared_cache,
+            // opt-out, row_lookup keyed by ea) whose DELETE rowid is a cache
+            // position that row_lookup cannot resolve. Only the *shared* positional
+            // branches above are gated on reconstruct_by_rowid.
             std::vector<RowData> rows;
             def->cache_builder_fn(rows);
             if (rowid < rows.size()) {
@@ -1631,27 +1821,69 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         RowData* row_ptr = nullptr;
         RowData temp_row{};
 
-        if (shared && shared->built && raw_rowid >= 0 && old_rowid < shared->data.size()) {
+        // Reconstruct-by-rowid (and thus NOCHANGE-eligible) exactly when the row
+        // can be resolved from the rowid alone: a POSITIONAL shared-cache index
+        // (no stable rowid_fn) or a resolving row_lookup -- and never when opted
+        // out. MUST match the cached_vtab_column() NOCHANGE gate. When true,
+        // unchanged identity columns arrive as NOCHANGE/0/NULL, so row_from_argv
+        // must NOT be used even if rowid resolution later fails (it would write
+        // the wrong row); fall through to read_only instead.
+        const bool reconstruct_by_rowid =
+            !def->update_from_column_values &&
+            (((!def->rowid_fn) && def->use_shared_cache) || static_cast<bool>(def->row_lookup));
+
+        if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
+            raw_rowid >= 0 && old_rowid < shared->data.size()) {
+            // Positional shared-cache reconstruction -- valid only when the rowid
+            // is a cache position: not opted out (reconstruct_by_rowid) and no
+            // stable rowid_fn. An opt-out table's filter-iterator rowid may
+            // overlap a cache index, so it must reconstruct from argv instead.
             row_ptr = &shared->data[old_rowid];
-        } else if (shared && shared->mutation_snapshot && !def->row_lookup &&
-                   raw_rowid >= 0 && old_rowid < shared->data.size()) {
+        } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->mutation_snapshot &&
+                   !def->row_lookup && raw_rowid >= 0 && old_rowid < shared->data.size()) {
             row_ptr = &shared->data[old_rowid];
-        } else if (def->row_from_argv) {
-            // Build temp row from argv column values.
-            // Handles the filter_eq path where rows come from an iterator.
+        } else if (reconstruct_by_rowid && def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
+            // Trusted rowid: resolves to the exact row (e.g. a filter iterator
+            // rowid that round-trips through row_lookup). NOCHANGE is enabled.
+            row_ptr = &temp_row;
+        } else if (!reconstruct_by_rowid && def->row_from_argv) {
+            // NOCHANGE is disabled for this table, so unchanged identity columns
+            // (ea, func_addr, ...) carry their REAL values in argv. Reconstruct
+            // from them -- the path for opt-out tables and for tables whose rowid
+            // cannot be resolved to a row (no positional cache, no row_lookup,
+            // e.g. shared-cache + rowid_fn without row_lookup).
             detail::with_args(argc, argv, [&](FunctionArg* args) {
                 def->row_from_argv(temp_row, argc, args);
             });
             row_ptr = &temp_row;
-        } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
-            row_ptr = &temp_row;
-        } else if (!def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
+        } else if (!def->update_from_column_values && !def->rowid_fn &&
+                   !def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
+            // Position-based rebuild: a full-scan rowid is the row's index in the
+            // cache_builder output (only valid when the rowid is positional, i.e.
+            // no rowid_fn, and not opted out). NOCHANGE is off here, so safe.
             std::vector<RowData> rows;
             def->cache_builder_fn(rows);
             if (old_rowid < rows.size()) {
                 temp_row = std::move(rows[old_rowid]);
                 row_ptr = &temp_row;
             }
+        } else if (def->row_from_argv) {
+            // Last-resort reconstruction via row_populator. CONTRACT: when this
+            // path can run under NOCHANGE (reconstruct_by_rowid tables whose
+            // positional/row_lookup resolution did not fire, e.g. a not-yet-built
+            // shared cache reached via filter_eq), the populator MUST resolve the
+            // row from the rowid in argv[0] (real even under NOCHANGE) and apply
+            // only non-NOCHANGE column values. Populators that read identity from
+            // argv COLUMNS must keep NOCHANGE disabled -- by opting out, or by
+            // exposing a stable rowid_fn without a row_lookup -- so those columns
+            // carry real values (see the cached_vtab_column() NOCHANGE gate).
+            detail::with_args(argc, argv, [&](FunctionArg* args) {
+                def->row_from_argv(temp_row, argc, args);
+            });
+            row_ptr = &temp_row;
+        } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
+            // Safe rowid resolution (row_lookup returns a real row, never argv).
+            row_ptr = &temp_row;
         } else {
             return to_sqlite_status(Status::read_only);
         }
@@ -1688,12 +1920,14 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         }
 
         bool ok = false;
+        clear_vtab_error();
         detail::with_args(argc - 2, &argv[2], [&](FunctionArg* args) {
             ok = def->insert_row(argc - 2, args);
         });
         if (!ok) {
-            return to_sqlite_status(Status::error);
+            return return_vtab_error(pVtab);
         }
+        clear_vtab_error();
         def->invalidate_cache();
         if (def->after_modify) def->after_modify("INSERT INTO " + def->name);
         return to_sqlite_status(Status::ok);
@@ -1705,7 +1939,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
 template<typename RowData>
 inline sqlite3_module create_cached_module() {
     sqlite3_module mod = {};
-    mod.iVersion = 1;
+    mod.iVersion = 3;
     mod.xCreate = cached_vtab_connect<RowData>;
     mod.xConnect = cached_vtab_connect<RowData>;
     mod.xBestIndex = cached_vtab_best_index<RowData>;
@@ -1782,6 +2016,16 @@ public:
 
     CachedTableBuilder& cache_builder(std::function<void(std::vector<RowData>&)> fn) {
         def_.cache_builder_fn = std::move(fn);
+        return *this;
+    }
+
+    // Projection-aware builder for query-scoped (no_shared_cache) tables: gets
+    // the colUsed bitmask so it can skip materializing unused expensive columns.
+    // Used INSTEAD of cache_builder() for non-shared full-scan builds; keep a
+    // cache_builder() too as the fallback for any other path.
+    CachedTableBuilder& projection_cache_builder(
+            std::function<void(std::vector<RowData>&, uint64_t)> fn) {
+        def_.projection_cache_builder_fn = std::move(fn);
         return *this;
     }
 
@@ -1967,6 +2211,35 @@ public:
         return *this;
     }
 
+    /**
+     * Add a prefix (LIKE) pushdown filter for a text column.
+     *
+     * Matches `WHERE column LIKE 'prefix%'` constraints. The factory receives the
+     * full LIKE pattern (e.g. "webs%") and returns an iterator that yields a
+     * SUPERSET of the matching rows -- SQLite re-applies the exact LIKE test
+     * afterwards (the constraint is not omitted), so the iterator only needs to be
+     * a correct over-approximation (e.g. a case-insensitive prefix scan). This is
+     * the right tool when the backing store has no sorted index and the cost is
+     * dominated by per-row rendering: the iterator does cheap identity comparisons
+     * and only renders the rows that pass the prefix.
+     *
+     * Default cost (50) sits above EQ filters (so exact lookups win) but well
+     * below a full scan.
+     */
+    CachedTableBuilder& filter_prefix(const char* column_name,
+                                       std::function<std::unique_ptr<RowIterator>(const std::string&)> factory,
+                                       double cost = 50.0, double est_rows = 20.0) {
+        int col_idx = def_.find_column(column_name);
+        if (col_idx < 0) return *this;
+        int filter_id = static_cast<int>(def_.filters.size()) + 1;
+        def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
+            [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                const char* text = val.as_c_str();
+                return factory(text ? std::string(text) : std::string());
+            }, SQLITE_INDEX_CONSTRAINT_LIKE);
+        return *this;
+    }
+
     CachedTableBuilder& row_populator(std::function<void(RowData&, int argc, FunctionArg* argv)> fn) {
         def_.row_from_argv = std::move(fn);
         return *this;
@@ -1974,6 +2247,30 @@ public:
 
     CachedTableBuilder& row_lookup(std::function<bool(RowData&, int64_t)> fn) {
         def_.row_lookup = std::move(fn);
+        return *this;
+    }
+
+    // Set a stable rowid for full-scan/index cursors (see CachedTableDef::rowid_fn).
+    CachedTableBuilder& rowid(std::function<int64_t(const RowData&)> fn) {
+        def_.rowid_fn = std::move(fn);
+        return *this;
+    }
+
+    /**
+     * Opt OUT of rowid-based UPDATE reconstruction + the SQLITE_NOCHANGE
+     * optimization. Set this when the table's rowid is NOT a reliable lookup key
+     * for UPDATE: row_lookup() cannot resolve every rowid the scans produce to
+     * the exact row (e.g. names -- full-scan rowid is a cache position but
+     * row_lookup() expects an ea; ctree_labels -- the func filter iterator's
+     * rowid is func-local but row_lookup() expects a global index). Such tables
+     * are reconstructed from the real column values in argv, which requires
+     * NOCHANGE to stay disabled so unchanged identity columns carry real values.
+     * Leave OFF (default) for tables whose row_lookup() resolves their scan
+     * rowids and for tables with many/paired writable columns that rely on
+     * unchanged columns being skipped during xUpdate.
+     */
+    CachedTableBuilder& update_from_column_values(bool value = true) {
+        def_.update_from_column_values = value;
         return *this;
     }
 
@@ -2774,7 +3071,7 @@ inline int generator_vtab_read_only_update(sqlite3_vtab*, int, sqlite3_value**, 
 template<typename RowData>
 inline sqlite3_module create_generator_module() {
     sqlite3_module mod = {};
-    mod.iVersion = 1;
+    mod.iVersion = 3;
     mod.xCreate = generator_vtab_connect<RowData>;
     mod.xConnect = generator_vtab_connect<RowData>;
     mod.xBestIndex = generator_vtab_best_index<RowData>;
