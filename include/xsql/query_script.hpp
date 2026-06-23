@@ -367,6 +367,87 @@ inline std::string script_result_to_text(const ScriptResult& r) {
     return out.str();
 }
 
+// ----- CSV / TSV formatters --------------------------------------------------
+//
+// Delimited renderers for direct terminal / unix-pipe consumption. JSON remains
+// the canonical machine format (see script_result_to_json); these are for humans
+// and shell tools. NULL sentinels render as empty fields. Single-statement output
+// is a pristine table (header row + data rows); multi-statement output prefixes
+// each table with a `# statement i/N` comment line and a blank separator.
+
+namespace detail {
+
+inline void append_delimited_field(std::string& out, const std::string& v, bool csv) {
+    if (v == "NULL") return;  // NULL -> empty field (matches JSON null semantics)
+    if (csv) {
+        // RFC 4180: quote when the field contains delimiter, quote, or newline.
+        if (v.find_first_of(",\"\n\r") == std::string::npos) {
+            out += v;
+            return;
+        }
+        out.push_back('"');
+        for (char c : v) {
+            if (c == '"') out += "\"\"";
+            else out.push_back(c);
+        }
+        out.push_back('"');
+    } else {
+        // TSV has no quoting; neutralize embedded tab/newline to keep one record
+        // per line.
+        for (char c : v) {
+            out.push_back((c == '\t' || c == '\n' || c == '\r') ? ' ' : c);
+        }
+    }
+}
+
+inline std::string render_statement_delimited(const ScriptStatementResult& r,
+                                              char delim, bool csv) {
+    std::string out;
+    auto write_row = [&](const std::vector<std::string>& cells) {
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            if (i) out.push_back(delim);
+            append_delimited_field(out, cells[i], csv);
+        }
+        out.push_back('\n');
+    };
+    write_row(r.columns);
+    for (const auto& row : r.rows) write_row(row);
+    return out;
+}
+
+inline std::string script_result_to_delimited(const ScriptResult& r,
+                                               char delim, bool csv) {
+    if (!r.parse_error.empty()) {
+        return "# PARSE ERROR: " + r.parse_error + "\n";
+    }
+    std::string out;
+    const bool multi = r.results.size() > 1;
+    for (std::size_t i = 0; i < r.results.size(); ++i) {
+        const auto& s = r.results[i];
+        if (multi) {
+            out += "# statement " + std::to_string(s.statement_index + 1) + "/" +
+                   std::to_string(r.statement_count) + "\n";
+        }
+        if (s.success) {
+            out += render_statement_delimited(s, delim, csv);
+        } else {
+            out += "# ERROR: " + s.error + "\n";
+        }
+        if (multi && i + 1 < r.results.size()) out.push_back('\n');
+    }
+    return out;
+}
+
+} // namespace detail
+
+inline std::string script_result_to_csv(const ScriptResult& r) {
+    return detail::script_result_to_delimited(r, ',', /*csv=*/true);
+}
+
+inline std::string script_result_to_tsv(const ScriptResult& r) {
+    return detail::script_result_to_delimited(r, '\t', /*csv=*/false);
+}
+
 // ----- Convenience: drive run_script directly against an xsql::Database ------
 //
 // Default executor adapter for products that use xsql::Database. Wraps each
