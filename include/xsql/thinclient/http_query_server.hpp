@@ -133,6 +133,14 @@ struct http_query_server_config {
     /// run_until_stopped() / process_one_command(). Required for tools
     /// with thread-affinity constraints.
     bool use_queue = false;
+
+    /// If true (and use_queue is false), serialize /query execution under an
+    /// internal mutex so concurrent requests run one-at-a-time. For executors
+    /// that are not concurrency-safe (e.g. a per-engine DB handle) but run on
+    /// the HTTP worker rather than a main-thread queue (REPL/background/plugin
+    /// servers). Locks per request (around the whole script), preserving
+    /// multi-statement atomicity. Ignored when use_queue is true.
+    bool serialize_requests = false;
 };
 
 // ============================================================================
@@ -518,6 +526,13 @@ private:
             }
 
             try {
+                // Serialize concurrent requests for non-queue executors that
+                // aren't concurrency-safe (REPL/background/plugin servers).
+                std::unique_lock<std::mutex> serialize_lock(serialize_mutex_, std::defer_lock);
+                if (config_.serialize_requests && !config_.use_queue) {
+                    serialize_lock.lock();
+                }
+
                 // Output format (default json). text/csv/tsv are for direct
                 // terminal/pipe use; json stays the canonical format.
                 std::string format = "json";
@@ -623,7 +638,8 @@ private:
     http_query_server_config config_;
     std::unique_ptr<httplib::Server> svr_;
     std::thread server_thread_;
-    std::mutex stop_mutex_;  // serializes stop() teardown across threads
+    std::mutex stop_mutex_;       // serializes stop() teardown across threads
+    std::mutex serialize_mutex_;  // serializes /query when serialize_requests
     std::atomic<bool> running_{false};
     int port_{0};
 
