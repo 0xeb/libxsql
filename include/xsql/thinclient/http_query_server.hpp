@@ -92,6 +92,17 @@ struct http_query_server_config {
     using query_fn_t = std::function<std::string(const std::string& sql)>;
     query_fn_t query_fn;
 
+    /// Preferred callback: a single-statement executor. When set, the server
+    /// owns multi-statement orchestration (xsql::run_script), query-string
+    /// option parsing (continue_on_error / include_sql), and output formatting
+    /// (json/text/csv/tsv) directly from the ScriptResult — no JSON round-trip.
+    /// Takes precedence over query_fn. The executor runs one statement and fills
+    /// `out`; it is invoked on the worker thread (use_queue=false) or the main
+    /// thread via the queue (use_queue=true), same threading contract as query_fn.
+    using statement_executor_t =
+        std::function<void(const std::string& sql, xsql::ScriptStatementResult& out)>;
+    statement_executor_t statement_executor;
+
     /// Optional: extra fields merged into GET /status response.
     /// Return a JSON object; its fields are merged with the base response.
     using status_fn_t = std::function<xsql::json()>;
@@ -256,19 +267,44 @@ private:
 
     struct pending_command {
         std::string sql;
-        std::string result;
+        std::string result;              // legacy query_fn path: JSON string
+        bool use_executor = false;       // executor path: fill script_result
+        xsql::ScriptOptions opts;
+        xsql::ScriptResult script_result;
         bool completed = false;
         std::mutex done_mutex;
         std::condition_variable done_cv;
     };
 
-    std::string queue_and_wait(const std::string& sql) {
-        if (!running_.load()) {
-            return xsql::json{{"success", false}, {"error", "Server not running"}}.dump();
-        }
+    static xsql::ScriptResult make_error_script_result(const std::string& msg) {
+        xsql::ScriptResult r;
+        r.success = false;
+        r.parse_error = msg;
+        return r;
+    }
 
-        auto cmd = std::make_shared<pending_command>();
-        cmd->sql = sql;
+    // Render a ScriptResult into the response per the `format` query param.
+    static void set_formatted(httplib::Response& res, const xsql::ScriptResult& sr,
+                              const std::string& format, bool include_sql) {
+        if (format == "text") {
+            res.set_content(xsql::script_result_to_text(sr), "text/plain");
+        } else if (format == "csv") {
+            res.set_content(xsql::script_result_to_csv(sr), "text/csv");
+        } else if (format == "tsv") {
+            res.set_content(xsql::script_result_to_tsv(sr), "text/tab-separated-values");
+        } else {
+            res.set_content(xsql::script_result_to_json(sr, include_sql), "application/json");
+        }
+    }
+
+    enum class admit_result { ok, not_running, queue_full, timeout };
+
+    // Admit a command to the queue and wait for the main thread to run it.
+    // Shared by the legacy string path and the executor path.
+    admit_result admit_and_wait(const std::shared_ptr<pending_command>& cmd) {
+        if (!running_.load()) {
+            return admit_result::not_running;
+        }
 
         int queue_timeout_ms = config_.queue_admission_timeout_ms;
         if (config_.queue_admission_timeout_ms_fn) {
@@ -285,11 +321,7 @@ private:
                 max_queue = config_.max_queue_fn();
             }
             if (max_queue > 0 && pending_commands_.size() >= max_queue) {
-                return xsql::json{
-                    {"success", false},
-                    {"error", "Queue full"},
-                    {"hint", "Reduce concurrency or increase max_queue"}
-                }.dump();
+                return admit_result::queue_full;
             }
             pending_commands_.push(cmd);
         }
@@ -304,15 +336,49 @@ private:
                 }
             } else if (!cmd->done_cv.wait_for(lock, std::chrono::milliseconds(queue_timeout_ms),
                                               [&]() { return cmd->completed; })) {
-                return xsql::json{
-                    {"success", false},
-                    {"error", "Request timed out while waiting in queue"},
-                    {"hint", "Reduce concurrency or increase queue_admission_timeout_ms"}
-                }.dump();
+                return admit_result::timeout;
             }
         }
+        return admit_result::ok;
+    }
 
+    std::string queue_and_wait(const std::string& sql) {
+        auto cmd = std::make_shared<pending_command>();
+        cmd->sql = sql;
+        switch (admit_and_wait(cmd)) {
+            case admit_result::not_running:
+                return xsql::json{{"success", false}, {"error", "Server not running"}}.dump();
+            case admit_result::queue_full:
+                return xsql::json{
+                    {"success", false}, {"error", "Queue full"},
+                    {"hint", "Reduce concurrency or increase max_queue"}}.dump();
+            case admit_result::timeout:
+                return xsql::json{
+                    {"success", false}, {"error", "Request timed out while waiting in queue"},
+                    {"hint", "Reduce concurrency or increase queue_admission_timeout_ms"}}.dump();
+            case admit_result::ok:
+                break;
+        }
         return cmd->result;
+    }
+
+    xsql::ScriptResult queue_and_wait_script(const std::string& sql,
+                                             const xsql::ScriptOptions& opts) {
+        auto cmd = std::make_shared<pending_command>();
+        cmd->sql = sql;
+        cmd->use_executor = true;
+        cmd->opts = opts;
+        switch (admit_and_wait(cmd)) {
+            case admit_result::not_running:
+                return make_error_script_result("Server not running");
+            case admit_result::queue_full:
+                return make_error_script_result("Queue full");
+            case admit_result::timeout:
+                return make_error_script_result("Request timed out while waiting in queue");
+            case admit_result::ok:
+                break;
+        }
+        return cmd->script_result;
     }
 
     bool process_one_command_internal(std::chrono::milliseconds timeout) {
@@ -333,13 +399,20 @@ private:
         if (!cmd) return false;
 
         try {
-            if (config_.query_fn) {
+            if (cmd->use_executor && config_.statement_executor) {
+                cmd->script_result =
+                    xsql::run_script(cmd->sql, cmd->opts, config_.statement_executor);
+            } else if (config_.query_fn) {
                 cmd->result = config_.query_fn(cmd->sql);
             } else {
                 cmd->result = xsql::json{{"success", false}, {"error", "No query handler"}}.dump();
             }
         } catch (const std::exception& e) {
-            cmd->result = xsql::json{{"success", false}, {"error", e.what()}}.dump();
+            if (cmd->use_executor) {
+                cmd->script_result = make_error_script_result(e.what());
+            } else {
+                cmd->result = xsql::json{{"success", false}, {"error", e.what()}}.dump();
+            }
         }
 
         {
@@ -439,42 +512,48 @@ private:
             }
 
             try {
-                std::string result;
-                if (config_.use_queue) {
-                    result = queue_and_wait(req.body);
-                } else {
-                    if (!config_.query_fn) {
-                        res.status = 500;
-                        res.set_content(
-                            xsql::json{{"success", false}, {"error", "Query callback not set"}}.dump(),
-                            "application/json");
-                        return;
-                    }
-                    result = config_.query_fn(req.body);
-                }
-                // Optional output format (default json). text/csv/tsv are for
-                // direct terminal/pipe use; json stays the canonical format.
-                // The callback/queue produce JSON, so for non-json we re-parse
-                // the envelope and re-render (cost paid only on human requests).
+                // Output format (default json). text/csv/tsv are for direct
+                // terminal/pipe use; json stays the canonical format.
                 std::string format = "json";
                 auto fmt_it = req.params.find("format");
                 if (fmt_it != req.params.end() && !fmt_it->second.empty()) {
                     format = fmt_it->second;
                 }
-                if (format == "text") {
-                    res.set_content(
-                        xsql::script_result_to_text(xsql::json_to_script_result(result)),
-                        "text/plain");
-                } else if (format == "csv") {
-                    res.set_content(
-                        xsql::script_result_to_csv(xsql::json_to_script_result(result)),
-                        "text/csv");
-                } else if (format == "tsv") {
-                    res.set_content(
-                        xsql::script_result_to_tsv(xsql::json_to_script_result(result)),
-                        "text/tab-separated-values");
+
+                if (config_.statement_executor) {
+                    // Preferred path: the server owns option parsing + run_script
+                    // + formatting, straight from the ScriptResult (no round-trip).
+                    xsql::ScriptOptions opts;
+                    auto cont_it = req.params.find("continue_on_error");
+                    if (cont_it != req.params.end() && cont_it->second == "1") {
+                        opts.continue_on_error = true;
+                    }
+                    auto incl_it = req.params.find("include_sql");
+                    if (incl_it != req.params.end() && incl_it->second == "1") {
+                        opts.include_sql = true;
+                    }
+                    xsql::ScriptResult script = config_.use_queue
+                        ? queue_and_wait_script(req.body, opts)
+                        : xsql::run_script(req.body, opts, config_.statement_executor);
+                    set_formatted(res, script, format, opts.include_sql);
+                } else if (config_.query_fn) {
+                    // Legacy path: callback returns a JSON string. Re-parse only
+                    // for non-json formats (continue_on_error/include_sql are not
+                    // available here — the callback owns its own ScriptOptions).
+                    std::string result = config_.use_queue
+                        ? queue_and_wait(req.body)
+                        : config_.query_fn(req.body);
+                    if (format == "json") {
+                        res.set_content(result, "application/json");
+                    } else {
+                        set_formatted(res, xsql::json_to_script_result(result), format, false);
+                    }
                 } else {
-                    res.set_content(result, "application/json");
+                    res.status = 500;
+                    res.set_content(
+                        xsql::json{{"success", false}, {"error", "Query callback not set"}}.dump(),
+                        "application/json");
+                    return;
                 }
             } catch (const std::exception& e) {
                 res.status = 500;
