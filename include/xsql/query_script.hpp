@@ -17,6 +17,7 @@
  */
 
 #include <xsql/database.hpp>
+#include <xsql/json.hpp>
 #include <xsql/script.hpp>
 
 #include <cstddef>
@@ -298,6 +299,71 @@ inline std::string script_result_to_json(const ScriptResult& r,
 
     out.push_back('}');
     return out;
+}
+
+// ----- JSON parser (inverse of script_result_to_json) ------------------------
+//
+// Rebuilds a ScriptResult from the canonical envelope. Used by HTTP servers that
+// already hold a serialized JSON result (e.g. the thinclient's string-based query
+// callback / queue) but want to re-render it as text/csv/tsv. NULL cells (JSON
+// `null`) are restored to the "NULL" sentinel so the formatters treat them
+// consistently. Tolerant of missing/extra fields; on unparseable input returns a
+// failed ScriptResult carrying parse_error.
+
+inline ScriptResult json_to_script_result(const std::string& json_str) {
+    ScriptResult r;
+    json j = json::parse(json_str, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object()) {
+        r.success = false;
+        r.parse_error = "json_to_script_result: could not parse result JSON";
+        return r;
+    }
+    r.success         = j.value("success", false);
+    r.statement_count = j.value("statement_count", static_cast<std::size_t>(0));
+    r.row_count_total = j.value("row_count_total", static_cast<std::size_t>(0));
+    r.elapsed_ms_total = j.value("elapsed_ms_total", 0.0);
+    if (j.contains("parse_error") && j["parse_error"].is_string()) {
+        r.parse_error = j["parse_error"].get<std::string>();
+    }
+    if (j.contains("first_error_index") && j["first_error_index"].is_number_unsigned()) {
+        r.first_error_index = j["first_error_index"].get<std::size_t>();
+    }
+    if (j.contains("results") && j["results"].is_array()) {
+        for (const auto& js : j["results"]) {
+            if (!js.is_object()) continue;
+            ScriptStatementResult s;
+            s.statement_index = js.value("statement_index", static_cast<std::size_t>(0));
+            s.success    = js.value("success", false);
+            s.row_count  = js.value("row_count", static_cast<std::size_t>(0));
+            s.elapsed_ms = js.value("elapsed_ms", 0.0);
+            if (js.contains("error") && js["error"].is_string()) {
+                s.error = js["error"].get<std::string>();
+            }
+            if (js.contains("sql") && js["sql"].is_string()) {
+                s.sql = js["sql"].get<std::string>();
+            }
+            if (js.contains("columns") && js["columns"].is_array()) {
+                for (const auto& c : js["columns"]) {
+                    s.columns.push_back(c.is_string() ? c.get<std::string>() : c.dump());
+                }
+            }
+            if (js.contains("rows") && js["rows"].is_array()) {
+                for (const auto& jr : js["rows"]) {
+                    std::vector<std::string> row;
+                    if (jr.is_array()) {
+                        for (const auto& cell : jr) {
+                            if (cell.is_null())        row.emplace_back("NULL");
+                            else if (cell.is_string()) row.push_back(cell.get<std::string>());
+                            else                       row.push_back(cell.dump());
+                        }
+                    }
+                    s.rows.push_back(std::move(row));
+                }
+            }
+            r.results.push_back(std::move(s));
+        }
+    }
+    return r;
 }
 
 // ----- Text formatter --------------------------------------------------------

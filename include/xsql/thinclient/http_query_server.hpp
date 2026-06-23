@@ -47,6 +47,7 @@
 #endif
 
 #include <xsql/json.hpp>
+#include <xsql/query_script.hpp>
 #include <xsql/thinclient/clipboard.hpp>
 
 #include <atomic>
@@ -451,7 +452,30 @@ private:
                     }
                     result = config_.query_fn(req.body);
                 }
-                res.set_content(result, "application/json");
+                // Optional output format (default json). text/csv/tsv are for
+                // direct terminal/pipe use; json stays the canonical format.
+                // The callback/queue produce JSON, so for non-json we re-parse
+                // the envelope and re-render (cost paid only on human requests).
+                std::string format = "json";
+                auto fmt_it = req.params.find("format");
+                if (fmt_it != req.params.end() && !fmt_it->second.empty()) {
+                    format = fmt_it->second;
+                }
+                if (format == "text") {
+                    res.set_content(
+                        xsql::script_result_to_text(xsql::json_to_script_result(result)),
+                        "text/plain");
+                } else if (format == "csv") {
+                    res.set_content(
+                        xsql::script_result_to_csv(xsql::json_to_script_result(result)),
+                        "text/csv");
+                } else if (format == "tsv") {
+                    res.set_content(
+                        xsql::script_result_to_tsv(xsql::json_to_script_result(result)),
+                        "text/tab-separated-values");
+                } else {
+                    res.set_content(result, "application/json");
+                }
             } catch (const std::exception& e) {
                 res.status = 500;
                 res.set_content(
