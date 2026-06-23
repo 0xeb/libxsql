@@ -226,13 +226,19 @@ public:
         return process_one_command_internal(std::chrono::milliseconds(0));
     }
 
-    /** Stop the server gracefully. */
+    /** Stop the server gracefully. Safe to call concurrently / repeatedly:
+     *  the POST /shutdown handler stops from a detached thread while a
+     *  run_until_stopped() owner and the destructor may also call stop(). The
+     *  teardown (svr_->stop / join / reset) is serialized so the worker thread
+     *  is joined exactly once (a bare joinable()+join() race aborts with
+     *  "thread::join failed"). */
     void stop() {
         running_.store(false);
         queue_cv_.notify_all();
         drain_pending_commands(
             xsql::json{{"success", false}, {"error", "HTTP server stopped"}}.dump());
 
+        std::lock_guard<std::mutex> teardown_lock(stop_mutex_);
         if (svr_ && svr_->is_running()) {
             svr_->stop();
         }
@@ -617,6 +623,7 @@ private:
     http_query_server_config config_;
     std::unique_ptr<httplib::Server> svr_;
     std::thread server_thread_;
+    std::mutex stop_mutex_;  // serializes stop() teardown across threads
     std::atomic<bool> running_{false};
     int port_{0};
 
