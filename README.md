@@ -6,6 +6,8 @@ SQL is the universal query language. By exposing your application's data as SQL 
 
 Build a CLI tool with libxsql, and any agent (Claude Code, Codex, Copilot) can query your application's internals with zero additional work.
 
+> **Rust port:** [libxsql-rs](https://github.com/0xeb/libxsql-rs) — the same fluent virtual-table API, idiomatic Rust.
+
 ## Features
 
 - **Fluent builder API** - Define tables in 20-50 lines instead of 250-400
