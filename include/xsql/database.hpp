@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
  * xsql/database.hpp - RAII SQLite database wrapper with query helpers
@@ -20,6 +19,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+struct sqlite3;
 
 namespace xsql {
 
@@ -46,11 +47,18 @@ bool register_generator_vtable(Database& db,
 
 struct Row {
     std::vector<std::string> values;
+    // Per-cell SQL-NULL flags, parallel to `values` (nonzero => the cell was SQL
+    // NULL). May be left empty by legacy producers; consumers must treat an empty
+    // `nulls` vector as "nullness unknown" and fall back to their prior behavior.
+    // This lets a genuine text value (even the literal string "NULL" or "") be
+    // distinguished from a real SQL NULL on every output path.
+    std::vector<char> nulls;
 
     const std::string& operator[](size_t i) const { return values[i]; }
     std::string& operator[](size_t i) { return values[i]; }
     size_t size() const { return values.size(); }
     bool empty() const { return values.empty(); }
+    bool is_null(size_t i) const { return i < nulls.size() && nulls[i] != 0; }
 };
 
 struct QueryOptions {
@@ -191,6 +199,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     void* native_handle_unsafe() const;
+    sqlite3* sqlite_handle() const;
 
     template<typename RowData>
     friend bool register_cached_vtable(Database& db,

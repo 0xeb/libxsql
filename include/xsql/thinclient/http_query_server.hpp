@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -59,6 +58,7 @@
 #include <queue>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <exception>
@@ -93,15 +93,32 @@ struct http_query_server_config {
     query_fn_t query_fn;
 
     /// Preferred callback: a single-statement executor. When set, the server
-    /// owns multi-statement orchestration (xsql::run_script), query-string
-    /// option parsing (continue_on_error / include_sql), and output formatting
-    /// (json/text/csv/tsv) directly from the ScriptResult — no JSON round-trip.
+    /// owns multi-statement orchestration (xsql::run_script), option parsing
+    /// (continue_on_error / include_sql, from query string OR a JSON request
+    /// body), and output formatting (json/text/csv/tsv) directly from the
+    /// ScriptResult — no JSON round-trip.
     /// Takes precedence over query_fn. The executor runs one statement and fills
     /// `out`; it is invoked on the worker thread (use_queue=false) or the main
     /// thread via the queue (use_queue=true), same threading contract as query_fn.
     using statement_executor_t =
         std::function<void(const std::string& sql, xsql::ScriptStatementResult& out)>;
     statement_executor_t statement_executor;
+
+    /// Optional: a whole-script executor. When set, the server parses the
+    /// options (continue_on_error / include_sql, from query string OR a JSON
+    /// request body) and delegates the ENTIRE script to this callback, which
+    /// owns multi-statement orchestration
+    /// itself. Use this when the engine must wrap the whole run (e.g. batch /
+    /// cache-refresh semantics that guarantee a later statement never reads
+    /// stale data after an earlier mutation) rather than executing statements
+    /// independently. The returned ScriptResult is formatted by the server
+    /// (json/text/csv/tsv). Takes precedence over statement_executor and
+    /// query_fn. Intended for direct/serialize_requests executors (not the
+    /// use_queue main-thread path); thread safety is the caller's responsibility.
+    using script_executor_t =
+        std::function<xsql::ScriptResult(const std::string& script,
+                                         const xsql::ScriptOptions& opts)>;
+    script_executor_t script_executor;
 
     /// Optional: extra fields merged into GET /status response.
     /// Return a JSON object; its fields are merged with the base response.
@@ -150,9 +167,40 @@ struct http_query_server_config {
 class http_query_server {
 public:
     explicit http_query_server(const http_query_server_config& config)
-        : config_(config) {}
+        : config_(config) {
+        // A whole-script executor has no main-thread queue path: the queue only
+        // drives statement_executor (xsql::run_script on the main thread). With
+        // use_queue=true the /query handler would still call script_executor
+        // directly on an httplib worker thread, silently violating the
+        // thread-affinity contract that use_queue exists to enforce. Reject the
+        // combination loudly at construction rather than mis-executing at runtime.
+        if (config_.script_executor && config_.use_queue) {
+            throw std::invalid_argument(
+                "http_query_server: script_executor is incompatible with use_queue "
+                "(the whole-script executor runs on the httplib worker thread and "
+                "has no main-thread queue path). Use statement_executor for the "
+                "queued/main-thread path, or set use_queue=false.");
+        }
+    }
 
-    ~http_query_server() { stop(); }
+    ~http_query_server() {
+        stop();
+        // Block until any detached POST /shutdown thread has finished touching
+        // our members (it decrements the latch after its own stop() returns).
+        //
+        // Deliberate trade-off: this wait is intentionally UNBOUNDED (no timeout).
+        // The latch only clears once the detached stop() returns, and stop() can
+        // only return after the server thread — and thus any in-flight query —
+        // has drained. If a query_fn/executor wedges (an engine deadlock, an
+        // infinite loop in a user callback), the destructor hangs here forever.
+        // That is preferred over a timed wait: a timeout would let the destructor
+        // proceed and free members the detached thread is still reading, i.e. a
+        // use-after-free. We choose a diagnosable hang over silent memory
+        // corruption. If you hit this hang, the bug is a non-terminating
+        // query_fn/executor, not this latch.
+        std::unique_lock<std::mutex> lk(shutdown_latch_mu_);
+        shutdown_latch_cv_.wait(lk, [this] { return shutdown_threads_inflight_ == 0; });
+    }
 
     // Non-copyable
     http_query_server(const http_query_server&) = delete;
@@ -243,8 +291,7 @@ public:
     void stop() {
         running_.store(false);
         queue_cv_.notify_all();
-        drain_pending_commands(
-            xsql::json{{"success", false}, {"error", "HTTP server stopped"}}.dump());
+        drain_pending_commands("HTTP server stopped");
 
         std::lock_guard<std::mutex> teardown_lock(stop_mutex_);
         if (svr_ && svr_->is_running()) {
@@ -286,6 +333,7 @@ private:
         xsql::ScriptOptions opts;
         xsql::ScriptResult script_result;
         bool completed = false;
+        bool cancelled = false;          // waiter timed out/abandoned; worker must skip
         std::mutex done_mutex;
         std::condition_variable done_cv;
     };
@@ -334,7 +382,15 @@ private:
             if (config_.max_queue_fn) {
                 max_queue = config_.max_queue_fn();
             }
-            if (max_queue > 0 && pending_commands_.size() >= max_queue) {
+            // max_queue bounds outstanding requests = those waiting in the queue
+            // PLUS the one currently in-flight on the main thread (processing_).
+            // The worker pops a command before running it, so an in-flight command
+            // is no longer in pending_commands_; counting processing_ keeps this
+            // path's effective ceiling identical to the serialize path (which
+            // counts its lock holder via serialize_pending_). See POST /query.
+            const size_t outstanding =
+                pending_commands_.size() + (processing_ ? 1 : 0);
+            if (max_queue > 0 && outstanding >= max_queue) {
                 return admit_result::queue_full;
             }
             pending_commands_.push(cmd);
@@ -350,6 +406,15 @@ private:
                 }
             } else if (!cmd->done_cv.wait_for(lock, std::chrono::milliseconds(queue_timeout_ms),
                                               [&]() { return cmd->completed; })) {
+                // Timed out waiting in the queue. The command may still be sitting
+                // in pending_commands_ (shared_ptr keeps it alive); mark it
+                // cancelled so the worker skips it instead of running a request the
+                // client has already abandoned. If it completed in the race window,
+                // honor the result rather than discarding it.
+                if (cmd->completed) {
+                    return admit_result::ok;
+                }
+                cmd->cancelled = true;
                 return admit_result::timeout;
             }
         }
@@ -407,10 +472,32 @@ private:
             if (!pending_commands_.empty()) {
                 cmd = pending_commands_.front();
                 pending_commands_.pop();
+                // Count this command as in-flight so admit_and_wait's max_queue
+                // ceiling stays exact across the pop→run→complete window.
+                processing_ = true;
             }
         }
 
         if (!cmd) return false;
+
+        // Clear processing_ on every exit path once we've popped a command.
+        struct ProcessingGuard {
+            std::mutex& m;
+            bool& flag;
+            ~ProcessingGuard() {
+                std::lock_guard<std::mutex> lock(m);
+                flag = false;
+            }
+        } processing_guard{queue_mutex_, processing_};
+
+        // Skip a command whose waiter already timed out / was drained: the client
+        // is gone, so running it (especially an engine mutation) would be wrong.
+        {
+            std::lock_guard<std::mutex> lock(cmd->done_mutex);
+            if (cmd->cancelled || cmd->completed) {
+                return true;  // popped and discarded; nothing to execute
+            }
+        }
 
         try {
             if (cmd->use_executor && config_.statement_executor) {
@@ -437,12 +524,21 @@ private:
         return true;
     }
 
-    void drain_pending_commands(const std::string& result) {
+    // Fail every queued command on shutdown. Each waiter reads back a different
+    // field depending on its path: the legacy query_fn path returns cmd->result
+    // (a JSON string), while the executor path returns cmd->script_result. Filling
+    // only cmd->result left executor waiters with a default-constructed, message-
+    // less ScriptResult (silent failure on stop). Branch on use_executor so both
+    // paths surface the shutdown reason.
+    void drain_pending_commands(const std::string& message) {
         std::queue<std::shared_ptr<pending_command>> pending;
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             std::swap(pending, pending_commands_);
         }
+
+        const std::string legacy_json =
+            xsql::json{{"success", false}, {"error", message}}.dump();
 
         while (!pending.empty()) {
             auto cmd = pending.front();
@@ -452,7 +548,11 @@ private:
             {
                 std::lock_guard<std::mutex> lock(cmd->done_mutex);
                 if (!cmd->completed) {
-                    cmd->result = result;
+                    if (cmd->use_executor) {
+                        cmd->script_result = make_error_script_result(message);
+                    } else {
+                        cmd->result = legacy_json;
+                    }
                     cmd->completed = true;
                 }
             }
@@ -528,23 +628,142 @@ private:
             try {
                 // Serialize concurrent requests for non-queue executors that
                 // aren't concurrency-safe (REPL/background/plugin servers).
-                std::unique_lock<std::mutex> serialize_lock(serialize_mutex_, std::defer_lock);
+                // Honor the SAME effective admission ceiling as the queue path:
+                // max_queue bounds outstanding requests = those waiting PLUS the
+                // one in-flight. serialize_pending_ counts requests waiting for OR
+                // holding the serialize lock (the holder is the in-flight one), so
+                // `now_pending > max_q` rejects exactly when the queue path's
+                // `pending + processing >= max_queue` does. Limits: max_queue ->
+                // 503, queue_admission_timeout_ms -> 408.
+                std::unique_lock<std::timed_mutex> serialize_lock(serialize_mutex_, std::defer_lock);
+                struct PendingGuard {
+                    std::atomic<size_t>* counter;
+                    bool engaged = false;
+                    ~PendingGuard() {
+                        if (engaged) counter->fetch_sub(1, std::memory_order_acq_rel);
+                    }
+                } pending_guard{&serialize_pending_};
                 if (config_.serialize_requests && !config_.use_queue) {
-                    serialize_lock.lock();
+                    const size_t max_q = config_.max_queue_fn ? config_.max_queue_fn()
+                                                              : config_.max_queue;
+                    const size_t now_pending =
+                        serialize_pending_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    pending_guard.engaged = true;
+                    if (max_q > 0 && now_pending > max_q) {
+                        res.status = 503;
+                        res.set_content(xsql::json{
+                            {"success", false}, {"error", "Queue full"},
+                            {"hint", "Reduce concurrency or increase max_queue"}}.dump(),
+                            "application/json");
+                        return;
+                    }
+                    int timeout_ms = config_.queue_admission_timeout_ms_fn
+                        ? config_.queue_admission_timeout_ms_fn()
+                        : config_.queue_admission_timeout_ms;
+                    if (timeout_ms < 0) timeout_ms = 0;
+                    if (timeout_ms == 0) {
+                        serialize_lock.lock();
+                    } else if (!serialize_lock.try_lock_for(
+                                   std::chrono::milliseconds(timeout_ms))) {
+                        res.status = 408;
+                        res.set_content(xsql::json{
+                            {"success", false},
+                            {"error", "Request timed out while waiting for serialization"},
+                            {"hint", "Reduce concurrency or increase queue_admission_timeout_ms"}}.dump(),
+                            "application/json");
+                        return;
+                    }
                 }
 
                 // Output format (default json). text/csv/tsv are for direct
-                // terminal/pipe use; json stays the canonical format.
+                // terminal/pipe use; json stays the canonical format. An
+                // unrecognized value is a 400 (do not silently fall through to
+                // json), matching the strict JSON-body handling below.
                 std::string format = "json";
                 auto fmt_it = req.params.find("format");
                 if (fmt_it != req.params.end() && !fmt_it->second.empty()) {
                     format = fmt_it->second;
+                    if (format != "json" && format != "text" &&
+                        format != "csv" && format != "tsv") {
+                        res.status = 400;
+                        res.set_content(
+                            xsql::json{{"success", false},
+                                       {"error", "unrecognized ?format '" + format +
+                                            "' (expected json, text, csv, or tsv)"}}.dump(),
+                            "application/json");
+                        return;
+                    }
                 }
 
-                if (config_.statement_executor) {
-                    // Preferred path: the server owns option parsing + run_script
-                    // + formatting, straight from the ScriptResult (no round-trip).
-                    xsql::ScriptOptions opts;
+                // Resolve the SQL text + script options. Two request shapes are
+                // accepted:
+                //   1. Raw-SQL body (default): the body IS the SQL;
+                //      continue_on_error / include_sql come from query params.
+                //   2. JSON body: {"sql": "...", "continue_on_error": bool,
+                //      "include_sql": bool}.
+                // When Content-Type is application/json the body MUST be a JSON
+                // object carrying a string "sql" -- a malformed or sql-less body
+                // is a 400, NOT silently run as raw SQL. Without that content
+                // type, a leading '{' is only a lenient hint: parse it if it is
+                // valid JSON-with-sql, otherwise treat the body as raw SQL. Query
+                // params still apply and either source enabling a flag wins.
+                std::string sql_text = req.body;
+                bool json_continue_on_error = false;
+                bool json_include_sql = false;
+                {
+                    const std::string ctype = req.get_header_value("Content-Type");
+                    const bool json_declared =
+                        ctype.find("application/json") != std::string::npos;
+                    const bool looks_json =
+                        json_declared || (!req.body.empty() && req.body.front() == '{');
+                    if (looks_json) {
+                        xsql::json body =
+                            xsql::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+                        const bool has_sql = body.is_object() && body.contains("sql") &&
+                                             body["sql"].is_string();
+                        if (has_sql) {
+                            sql_text = body["sql"].get<std::string>();
+                            auto read_flag = [&body](const char* key) -> bool {
+                                if (!body.contains(key)) return false;
+                                const auto& v = body[key];
+                                if (v.is_boolean()) return v.get<bool>();
+                                if (v.is_number()) return v.get<double>() != 0;
+                                if (v.is_string()) {
+                                    const auto s = v.get<std::string>();
+                                    return s == "1" || s == "true";
+                                }
+                                return false;
+                            };
+                            json_continue_on_error = read_flag("continue_on_error");
+                            json_include_sql = read_flag("include_sql");
+                        } else if (json_declared) {
+                            // Declared application/json but not a usable
+                            // {"sql": "..."} object -> reject rather than guess.
+                            res.status = 400;
+                            res.set_content(
+                                xsql::json{{"success", false},
+                                           {"error", body.is_discarded()
+                                                ? "malformed JSON request body"
+                                                : "JSON request body must be an "
+                                                  "object with a string \"sql\""}}.dump(),
+                                "application/json");
+                            return;
+                        }
+                        // else: undeclared leading-'{' that isn't valid
+                        // JSON-with-sql -> fall through and treat body as raw SQL.
+                    }
+                }
+                if (sql_text.empty()) {
+                    res.status = 400;
+                    res.set_content(
+                        xsql::json{{"success", false}, {"error", "Empty query"}}.dump(),
+                        "application/json");
+                    return;
+                }
+
+                // Merge options from query params and the JSON body; either source
+                // setting a flag true enables it.
+                auto parse_opts = [&](xsql::ScriptOptions& opts) {
                     auto cont_it = req.params.find("continue_on_error");
                     if (cont_it != req.params.end() && cont_it->second == "1") {
                         opts.continue_on_error = true;
@@ -553,17 +772,34 @@ private:
                     if (incl_it != req.params.end() && incl_it->second == "1") {
                         opts.include_sql = true;
                     }
+                    if (json_continue_on_error) opts.continue_on_error = true;
+                    if (json_include_sql) opts.include_sql = true;
+                };
+
+                if (config_.script_executor) {
+                    // Engine-owned orchestration: the server parses options and
+                    // formatting but hands the whole script to the executor so it
+                    // can wrap the run (batch/refresh semantics). No round-trip.
+                    xsql::ScriptOptions opts;
+                    parse_opts(opts);
+                    xsql::ScriptResult script = config_.script_executor(sql_text, opts);
+                    set_formatted(res, script, format, opts.include_sql);
+                } else if (config_.statement_executor) {
+                    // Preferred path: the server owns option parsing + run_script
+                    // + formatting, straight from the ScriptResult (no round-trip).
+                    xsql::ScriptOptions opts;
+                    parse_opts(opts);
                     xsql::ScriptResult script = config_.use_queue
-                        ? queue_and_wait_script(req.body, opts)
-                        : xsql::run_script(req.body, opts, config_.statement_executor);
+                        ? queue_and_wait_script(sql_text, opts)
+                        : xsql::run_script(sql_text, opts, config_.statement_executor);
                     set_formatted(res, script, format, opts.include_sql);
                 } else if (config_.query_fn) {
                     // Legacy path: callback returns a JSON string. Re-parse only
                     // for non-json formats (continue_on_error/include_sql are not
                     // available here — the callback owns its own ScriptOptions).
                     std::string result = config_.use_queue
-                        ? queue_and_wait(req.body)
-                        : config_.query_fn(req.body);
+                        ? queue_and_wait(sql_text)
+                        : config_.query_fn(sql_text);
                     if (format == "json") {
                         res.set_content(result, "application/json");
                     } else {
@@ -624,10 +860,31 @@ private:
             res.set_content(
                 xsql::json{{"success", true}, {"message", "Shutting down"}}.dump(),
                 "application/json");
-            std::thread([this] {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                stop();
-            }).detach();
+            {
+                std::lock_guard<std::mutex> lk(shutdown_latch_mu_);
+                ++shutdown_threads_inflight_;
+            }
+            try {
+                std::thread([this] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    stop();
+                    // Release the latch only after stop() has fully returned, so
+                    // the destructor cannot race ahead and free members we still
+                    // touch.
+                    std::lock_guard<std::mutex> lk(shutdown_latch_mu_);
+                    --shutdown_threads_inflight_;
+                    shutdown_latch_cv_.notify_all();
+                }).detach();
+            } catch (...) {
+                // The std::thread constructor threw (e.g. resource exhaustion),
+                // so the detached lambda that owes the decrement will never run.
+                // Undo the increment ourselves and wake the destructor's
+                // unbounded wait — otherwise it hangs forever on a thread that
+                // was never started.
+                std::lock_guard<std::mutex> lk(shutdown_latch_mu_);
+                --shutdown_threads_inflight_;
+                shutdown_latch_cv_.notify_all();
+            }
         });
     }
 
@@ -638,8 +895,16 @@ private:
     http_query_server_config config_;
     std::unique_ptr<httplib::Server> svr_;
     std::thread server_thread_;
-    std::mutex stop_mutex_;       // serializes stop() teardown across threads
-    std::mutex serialize_mutex_;  // serializes /query when serialize_requests
+    std::mutex stop_mutex_;            // serializes stop() teardown across threads
+    // Latch for detached POST /shutdown threads: the handler spawns a detached
+    // thread that sleeps then calls stop(), touching our members. The destructor
+    // waits on this latch so it never frees those members out from under a still-
+    // running shutdown thread.
+    std::mutex shutdown_latch_mu_;
+    std::condition_variable shutdown_latch_cv_;
+    std::size_t shutdown_threads_inflight_{0};
+    std::timed_mutex serialize_mutex_; // serializes /query when serialize_requests
+    std::atomic<size_t> serialize_pending_{0};  // in-flight+waiting serialize requests
     std::atomic<bool> running_{false};
     int port_{0};
 
@@ -649,6 +914,7 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::queue<std::shared_ptr<pending_command>> pending_commands_;
+    bool processing_ = false;  // a popped command is in-flight (counts toward max_queue)
 };
 
 // ============================================================================

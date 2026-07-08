@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -126,9 +125,23 @@ public:
      * Start server in background thread.
      */
     void run_async() {
-        server_thread_ = std::thread([this] { run(); });
-        // Wait for server to start
-        while (!running_ && !svr_.is_running()) {
+        // Wait until the server is actually listening OR the worker returns.
+        // run() sets running_ = true then blocks in listen(); on a bind failure
+        // (e.g. the port is already in use) it returns almost immediately without
+        // svr_.is_running() ever flipping true. Polling only svr_.is_running()
+        // would therefore spin until a timeout on every bind failure, so we also
+        // watch thread_finished_, which the worker sets the instant run() returns
+        // — that makes a failed bind surface immediately, not after a fixed wait.
+        // The deadline is a last-resort guard against a listen() that neither
+        // starts serving nor returns.
+        thread_finished_.store(false);
+        server_thread_ = std::thread([this] {
+            run();
+            thread_finished_.store(true);
+        });
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!svr_.is_running() && !thread_finished_.load() &&
+               std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
@@ -197,6 +210,10 @@ private:
     httplib::Server svr_;
     std::thread server_thread_;
     std::atomic<bool> running_;
+    // Set true by the run_async worker the moment run() returns, so the
+    // start-up wait can distinguish "still binding" from "worker exited (bind
+    // failed)" without spinning to the deadline.
+    std::atomic<bool> thread_finished_{false};
     std::atomic<int> actual_port_{0};
 };
 

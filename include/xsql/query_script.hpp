@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -16,6 +15,7 @@
  * receive aggregated results, fail-fast or continue-on-error.
  */
 
+#include <xsql/cli/table_printer.hpp>
 #include <xsql/database.hpp>
 #include <xsql/json.hpp>
 #include <xsql/script.hpp>
@@ -44,6 +44,13 @@ struct ScriptStatementResult {
     bool success = false;
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
+    // Per-cell SQL-NULL flags, parallel to `rows` (nonzero => the cell was SQL
+    // NULL; its `rows` entry is then an empty/placeholder string). A row with no
+    // corresponding `cell_null` entry — or a shorter inner vector — falls back to
+    // the legacy `"NULL"`-sentinel interpretation, so older executors that only
+    // fill `rows` keep working. When populated, a genuine text value equal to
+    // "NULL" (mask 0) is rendered distinctly from a real SQL NULL (mask 1).
+    std::vector<std::vector<char>> cell_null;
     std::size_t row_count = 0;
     double elapsed_ms = 0.0;
     std::string error;   // empty when success
@@ -52,7 +59,9 @@ struct ScriptStatementResult {
     bool is_null_cell(std::size_t row_index, std::size_t col_index) const {
         if (row_index >= rows.size()) return false;
         if (col_index >= rows[row_index].size()) return false;
-        return rows[row_index][col_index] == "NULL";
+        if (row_index < cell_null.size() && col_index < cell_null[row_index].size())
+            return cell_null[row_index][col_index] != 0;
+        return rows[row_index][col_index] == "NULL";   // legacy fallback
     }
 };
 
@@ -224,7 +233,9 @@ inline void append_statement_json(std::string& out,
         const auto& row = r.rows[i];
         for (std::size_t j = 0; j < row.size(); ++j) {
             if (j) out.push_back(',');
-            if (row[j] == "NULL") {
+            // Per-cell nullness via is_null_cell so a jagged/short cell_null row
+            // still falls back to the "NULL" sentinel exactly like the text path.
+            if (r.is_null_cell(i, j)) {
                 out += "null";
             } else {
                 append_json_string(out, row[j]);
@@ -256,7 +267,15 @@ inline std::string script_result_to_json(const ScriptResult& r,
                                          bool include_sql = false)
 {
     std::string out;
-    out.reserve(256 + r.results.size() * 64);
+    // Cell-aware size hint: ~24 bytes per rendered cell (quotes, escapes,
+    // separators) + fixed per-statement envelope. Growth still works if a
+    // result under-fits; this only trims re-allocations on large row sets.
+    std::size_t est = 256;
+    for (const auto& s : r.results) {
+        est += 160 + s.sql.size() + s.columns.size() * 24 +
+               s.rows.size() * (8 + s.columns.size() * 24);
+    }
+    out.reserve(est);
 
     if (!r.parse_error.empty()) {
         out += "{\"success\":false";
@@ -306,9 +325,10 @@ inline std::string script_result_to_json(const ScriptResult& r,
 // Rebuilds a ScriptResult from the canonical envelope. Used by HTTP servers that
 // already hold a serialized JSON result (e.g. the thinclient's string-based query
 // callback / queue) but want to re-render it as text/csv/tsv. NULL cells (JSON
-// `null`) are restored to the "NULL" sentinel so the formatters treat them
-// consistently. Tolerant of missing/extra fields; on unparseable input returns a
-// failed ScriptResult carrying parse_error.
+// `null`) are recorded in the per-cell `cell_null` mask (distinct from a genuine
+// text value "NULL") so the formatters render them correctly. Tolerant of
+// missing/extra fields; on unparseable input returns a failed ScriptResult
+// carrying parse_error.
 
 inline ScriptResult json_to_script_result(const std::string& json_str) {
     ScriptResult r;
@@ -324,6 +344,15 @@ inline ScriptResult json_to_script_result(const std::string& json_str) {
     r.elapsed_ms_total = j.value("elapsed_ms_total", 0.0);
     if (j.contains("parse_error") && j["parse_error"].is_string()) {
         r.parse_error = j["parse_error"].get<std::string>();
+    }
+    // A request-level failure envelope carries a top-level string "error" and
+    // (typically) no "results" and no "parse_error" — e.g. {"success":false,
+    // "error":"..."}. Without this, such an envelope round-tripped through the
+    // ?format=text|csv|tsv path yields an empty ScriptResult -> empty body.
+    // Surface it as parse_error so the formatters emit the message.
+    if (r.parse_error.empty() && !r.success &&
+        j.contains("error") && j["error"].is_string()) {
+        r.parse_error = j["error"].get<std::string>();
     }
     if (j.contains("first_error_index") && j["first_error_index"].is_number_unsigned()) {
         r.first_error_index = j["first_error_index"].get<std::size_t>();
@@ -350,14 +379,19 @@ inline ScriptResult json_to_script_result(const std::string& json_str) {
             if (js.contains("rows") && js["rows"].is_array()) {
                 for (const auto& jr : js["rows"]) {
                     std::vector<std::string> row;
+                    std::vector<char> rnull;
                     if (jr.is_array()) {
                         for (const auto& cell : jr) {
-                            if (cell.is_null())        row.emplace_back("NULL");
-                            else if (cell.is_string()) row.push_back(cell.get<std::string>());
-                            else                       row.push_back(cell.dump());
+                            // JSON null -> real SQL NULL (mask 1); a JSON *string*
+                            // "NULL" stays an ordinary value (mask 0), so the two
+                            // are no longer conflated on the round trip.
+                            if (cell.is_null())        { row.emplace_back("");                 rnull.push_back(1); }
+                            else if (cell.is_string()) { row.push_back(cell.get<std::string>()); rnull.push_back(0); }
+                            else                       { row.push_back(cell.dump());             rnull.push_back(0); }
                         }
                     }
                     s.rows.push_back(std::move(row));
+                    s.cell_null.push_back(std::move(rnull));
                 }
             }
             r.results.push_back(std::move(s));
@@ -371,40 +405,24 @@ inline ScriptResult json_to_script_result(const std::string& json_str) {
 namespace detail {
 
 inline std::string render_statement_table(const ScriptStatementResult& r) {
-    if (r.columns.empty()) {
-        return "(no result)";
-    }
-    std::vector<std::size_t> widths(r.columns.size(), 0);
-    for (std::size_t i = 0; i < r.columns.size(); ++i) {
-        widths[i] = r.columns[i].size();
-    }
-    for (const auto& row : r.rows) {
-        for (std::size_t i = 0; i < row.size() && i < widths.size(); ++i) {
-            widths[i] = std::max(widths[i], row[i].size());
-        }
-    }
-
-    std::ostringstream out;
-    auto write_row = [&](const std::vector<std::string>& cells) {
-        for (std::size_t i = 0; i < cells.size(); ++i) {
-            if (i) out << "  ";
-            out << cells[i];
-            if (i + 1 < cells.size() && cells[i].size() < widths[i]) {
-                out << std::string(widths[i] - cells[i].size(), ' ');
-            }
-        }
-        out << '\n';
+    // Human-readable NULL: a real SQL NULL is shown as the text "NULL" (as before);
+    // a genuine text value "NULL" is shown as itself — indistinguishable in this
+    // human table (acceptable), but json/csv/tsv keep them distinct via cell_null.
+    auto display = [&](std::size_t ri, std::size_t ci) -> std::string {
+        return r.is_null_cell(ri, ci) ? std::string("NULL") : r.rows[ri][ci];
     };
 
-    write_row(r.columns);
-    std::vector<std::string> sep;
-    sep.reserve(widths.size());
-    for (auto w : widths) sep.emplace_back(w, '-');
-    write_row(sep);
-    for (const auto& row : r.rows) {
-        write_row(row);
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(r.rows.size());
+    for (std::size_t ri = 0; ri < r.rows.size(); ++ri) {
+        std::vector<std::string> row;
+        row.reserve(r.rows[ri].size());
+        for (std::size_t ci = 0; ci < r.rows[ri].size(); ++ci) {
+            row.push_back(display(ri, ci));
+        }
+        rows.push_back(std::move(row));
     }
-    return out.str();
+    return xsql::cli::print_table(r.columns, rows);
 }
 
 } // namespace detail
@@ -437,14 +455,26 @@ inline std::string script_result_to_text(const ScriptResult& r) {
 //
 // Delimited renderers for direct terminal / unix-pipe consumption. JSON remains
 // the canonical machine format (see script_result_to_json); these are for humans
-// and shell tools. NULL sentinels render as empty fields. Single-statement output
-// is a pristine table (header row + data rows); multi-statement output prefixes
-// each table with a `# statement i/N` comment line and a blank separator.
+// and shell tools. A real SQL NULL renders as an empty field. Single-statement
+// output is a pristine table (header row + data rows); multi-statement output
+// prefixes each table with a `# statement i/N` comment line and a blank separator.
+//
+// NULL fidelity (fixed): SQL NULL is tracked by the per-cell `cell_null` mask
+// (see ScriptStatementResult), threaded from the executor / Database::query null
+// bitmap through the JSON round trip and into these formatters. A genuine text
+// value equal to "NULL" is therefore rendered distinctly from a real SQL NULL on
+// *every* format — csv/tsv emit the literal "NULL" as a normal field (empty only
+// for a true NULL), and script_result_to_json emits the string "NULL" quoted vs
+// JSON `null` for a true NULL. Executors that leave `cell_null` empty fall back to
+// the legacy `"NULL"`-sentinel behavior (see is_null_cell), preserving old output.
 
 namespace detail {
 
-inline void append_delimited_field(std::string& out, const std::string& v, bool csv) {
-    if (v == "NULL") return;  // NULL -> empty field (matches JSON null semantics)
+inline void append_delimited_field(std::string& out, const std::string& v, bool csv,
+                                   bool is_null) {
+    // A real SQL NULL -> empty field (matches JSON null semantics). A genuine text
+    // value (including the literal "NULL") is rendered as itself.
+    if (is_null) return;
     if (csv) {
         // RFC 4180: quote when the field contains delimiter, quote, or newline.
         if (v.find_first_of(",\"\n\r") == std::string::npos) {
@@ -468,16 +498,29 @@ inline void append_delimited_field(std::string& out, const std::string& v, bool 
 
 inline std::string render_statement_delimited(const ScriptStatementResult& r,
                                               char delim, bool csv) {
+    // A column-less statement (e.g. a successful write) has no header/data row.
+    // Mirror the text renderer's "(no result)" instead of emitting a bare
+    // newline, which reads as a phantom empty record in csv/tsv.
+    if (r.columns.empty()) {
+        return "(no result)\n";
+    }
     std::string out;
-    auto write_row = [&](const std::vector<std::string>& cells) {
-        for (std::size_t i = 0; i < cells.size(); ++i) {
+    // Column headers are never SQL NULL (pass a null-vector of all-false).
+    for (std::size_t i = 0; i < r.columns.size(); ++i) {
+        if (i) out.push_back(delim);
+        append_delimited_field(out, r.columns[i], csv, /*is_null=*/false);
+    }
+    out.push_back('\n');
+    for (std::size_t ri = 0; ri < r.rows.size(); ++ri) {
+        const auto& row = r.rows[ri];
+        for (std::size_t i = 0; i < row.size(); ++i) {
             if (i) out.push_back(delim);
-            append_delimited_field(out, cells[i], csv);
+            // Per-cell nullness via is_null_cell so a jagged/short cell_null row
+            // still falls back to the "NULL" sentinel exactly like the text path.
+            append_delimited_field(out, row[i], csv, r.is_null_cell(ri, i));
         }
         out.push_back('\n');
-    };
-    write_row(r.columns);
-    for (const auto& row : r.rows) write_row(row);
+    }
     return out;
 }
 
@@ -526,15 +569,19 @@ inline ScriptResult run_database_script(Database& db,
 {
     return run_script(script, options,
         [&db](const std::string& sql, ScriptStatementResult& out) {
-            const Result r = db.query(sql);
-            out.columns = r.columns;
+            Result r = db.query(sql);
+            out.columns = std::move(r.columns);
             out.rows.reserve(r.rows.size());
-            for (const auto& row : r.rows) {
-                out.rows.push_back(row.values);
+            out.cell_null.reserve(r.rows.size());
+            for (auto& row : r.rows) {
+                // The Result is dead after this loop; move each row's cells
+                // instead of re-materializing every cell string.
+                out.rows.push_back(std::move(row.values));
+                out.cell_null.push_back(std::move(row.nulls));  // parallel SQL-NULL mask
             }
             out.elapsed_ms = static_cast<double>(r.elapsed_ms);
-            out.error = r.error;
-            out.success = r.error.empty();
+            out.success = r.error.empty();   // before moving r.error
+            out.error = std::move(r.error);
         });
 }
 

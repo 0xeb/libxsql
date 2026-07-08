@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #include <xsql/aggregates.hpp>
 #include <xsql/database.hpp>
@@ -344,8 +343,13 @@ Result Database::query(const char* sql, const QueryOptions& options) {
         if (step == StepResult::row) {
             Row row;
             row.values.reserve(static_cast<size_t>(col_count));
+            row.nulls.reserve(static_cast<size_t>(col_count));
             for (int i = 0; i < col_count; ++i) {
-                row.values.push_back(stmt.column_is_null(i) ? "" : stmt.text(i));
+                const bool is_null = stmt.column_is_null(i);
+                // Carry the real text even for NULL (empty here) but flag it, so a
+                // genuine "" / "NULL" text value stays distinct from SQL NULL.
+                row.values.push_back(is_null ? "" : stmt.text(i));
+                row.nulls.push_back(is_null ? 1 : 0);
             }
             result.rows.push_back(std::move(row));
             continue;
@@ -494,6 +498,10 @@ int Database::changes() const {
 }
 
 void* Database::native_handle_unsafe() const {
+    return impl_ ? impl_->db : nullptr;
+}
+
+sqlite3* Database::sqlite_handle() const {
     return impl_ ? impl_->db : nullptr;
 }
 

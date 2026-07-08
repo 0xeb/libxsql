@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -22,6 +21,13 @@
 #include <sstream>
 #include <iostream>
 #include <cstring>
+
+// Version string, injected by CMake as a PUBLIC compile definition on the xsql
+// target (see libxsql/CMakeLists.txt, fed from ${PROJECT_VERSION}). The fallback
+// only fires if this header is compiled outside that target (a misconfiguration).
+#ifndef XSQL_VERSION_STRING
+#define XSQL_VERSION_STRING "unknown"
+#endif
 
 namespace xsql::thinclient {
 
@@ -178,7 +184,7 @@ public:
 
         // Handle --version
         if (args.version) {
-            std::cout << program_name_ << " version 1.0.2\n";
+            std::cout << program_name_ << " version " << XSQL_VERSION_STRING << "\n";
             return std::nullopt;
         }
 

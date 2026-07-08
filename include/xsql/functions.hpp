@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
  * xsql/functions.hpp - SQL function registration helpers
@@ -44,6 +43,17 @@ public:
 private:
     const void* value_ = nullptr;
 };
+
+// detail::with_args aliases sqlite3_value** argv storage as FunctionArg*. Keep
+// FunctionArg a single pointer-sized wrapper or fail at compile time.
+static_assert(std::is_standard_layout_v<FunctionArg>,
+              "FunctionArg must remain standard-layout for argv aliasing");
+static_assert(std::is_trivially_copyable_v<FunctionArg>,
+              "FunctionArg must remain trivially copyable for argv aliasing");
+static_assert(sizeof(FunctionArg) == sizeof(const void*),
+              "FunctionArg must remain a single pointer-sized wrapper");
+static_assert(alignof(FunctionArg) == alignof(const void*),
+              "FunctionArg alignment must match a pointer");
 
 class QueryRow {
 public:

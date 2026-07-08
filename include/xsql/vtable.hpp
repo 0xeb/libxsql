@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
  * xsql/vtable.hpp - SQLite Virtual Table framework
@@ -78,10 +77,6 @@ inline void destroy_def(void* p) {
     delete static_cast<T*>(p);
 }
 
-inline sqlite3* sqlite_db(void* db_handle) {
-    return reinterpret_cast<sqlite3*>(db_handle);
-}
-
 inline bool register_vtable_sqlite(sqlite3* db, const char* module_name, const VTableDef* def);
 inline bool create_vtable_sqlite(sqlite3* db, const char* table_name, const char* module_name);
 
@@ -94,28 +89,6 @@ template<typename RowData>
 inline bool register_generator_vtable_sqlite(sqlite3* db,
                                              const char* module_name,
                                              const GeneratorTableDef<RowData>* def);
-
-inline bool register_vtable_opaque(void* db_handle, const char* module_name, const VTableDef* def) {
-    return register_vtable_sqlite(sqlite_db(db_handle), module_name, def);
-}
-
-inline bool create_vtable_opaque(void* db_handle, const char* table_name, const char* module_name) {
-    return create_vtable_sqlite(sqlite_db(db_handle), table_name, module_name);
-}
-
-template<typename RowData>
-inline bool register_cached_vtable_opaque(void* db_handle,
-                                          const char* module_name,
-                                          const CachedTableDef<RowData>* def) {
-    return register_cached_vtable_sqlite(sqlite_db(db_handle), module_name, def);
-}
-
-template<typename RowData>
-inline bool register_generator_vtable_opaque(void* db_handle,
-                                             const char* module_name,
-                                             const GeneratorTableDef<RowData>* def) {
-    return register_generator_vtable_sqlite(sqlite_db(db_handle), module_name, def);
-}
 } // namespace detail
 
 inline thread_local std::string g_vtab_error_message;
@@ -285,6 +258,53 @@ struct FilterDef {
           estimated_rows(rows), op(constraint_op), create(std::move(factory)) {}
 };
 
+namespace detail {
+template<typename Columns, typename IsHiddenColumn>
+inline std::string render_table_schema(const std::string& name,
+                                       const Columns& columns,
+                                       IsHiddenColumn is_hidden_column) {
+    std::ostringstream ss;
+    ss << "CREATE TABLE " << name << "(";
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i > 0) ss << ", ";
+        ss << "\"" << columns[i].name << "\" " << column_type_sql(columns[i].type);
+        if (is_hidden_column(i)) ss << " HIDDEN";
+    }
+    ss << ")";
+    return ss.str();
+}
+
+template<typename Columns>
+inline std::string render_table_schema(const std::string& name, const Columns& columns) {
+    return render_table_schema(name, columns, [](size_t) { return false; });
+}
+
+template<typename Columns>
+inline int find_column_index(const Columns& columns, const std::string& col_name) {
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (columns[i].name == col_name) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+inline const FilterDef* find_filter_by_column(const std::vector<FilterDef>& filters,
+                                              int col_index) {
+    for (const auto& f : filters) {
+        if (f.column_index == col_index) return &f;
+    }
+    return nullptr;
+}
+
+inline const FilterDef* find_filter_by_column_and_op(const std::vector<FilterDef>& filters,
+                                                     int col_index,
+                                                     int op) {
+    for (const auto& f : filters) {
+        if (f.column_index == col_index && f.op == op) return &f;
+    }
+    return nullptr;
+}
+} // namespace detail
+
 // ============================================================================
 // Virtual Table Definition
 // ============================================================================
@@ -317,30 +337,17 @@ struct VTableDef {
     std::function<void(const std::string&)> before_modify;
 
     std::string schema() const {
-        std::ostringstream ss;
-        ss << "CREATE TABLE " << name << "(";
-        for (size_t i = 0; i < columns.size(); ++i) {
-            if (i > 0) ss << ", ";
-            ss << "\"" << columns[i].name << "\" " << column_type_sql(columns[i].type);
-        }
-        ss << ")";
-        return ss.str();
+        return detail::render_table_schema(name, columns);
     }
 
     // Find column index by name, -1 if not found
     int find_column(const std::string& col_name) const {
-        for (size_t i = 0; i < columns.size(); ++i) {
-            if (columns[i].name == col_name) return static_cast<int>(i);
-        }
-        return -1;
+        return detail::find_column_index(columns, col_name);
     }
 
     // Find filter for given column, nullptr if none
     const FilterDef* find_filter(int col_index) const {
-        for (const auto& f : filters) {
-            if (f.column_index == col_index) return &f;
-        }
-        return nullptr;
+        return detail::find_filter_by_column(filters, col_index);
     }
 };
 
@@ -569,7 +576,13 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
             return to_sqlite_status(Status::read_only);
         }
 
-        size_t rowid = static_cast<size_t>(sqlite3_value_int64(argv[0]));
+        // A negative rowid cannot map to a valid 0-based row index; reject it
+        // before it wraps to a huge size_t handed to the host delete callback.
+        const int64_t raw_rowid = sqlite3_value_int64(argv[0]);
+        if (raw_rowid < 0) {
+            return to_sqlite_status(Status::error);
+        }
+        size_t rowid = static_cast<size_t>(raw_rowid);
 
         if (def->before_modify) {
             def->before_modify("DELETE FROM " + def->name);
@@ -583,7 +596,13 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
 
     // argc > 1, argv[0] != NULL: UPDATE
     if (argc > 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
-        size_t old_rowid = static_cast<size_t>(sqlite3_value_int64(argv[0]));
+        // A negative rowid cannot map to a valid 0-based row index; reject it
+        // before it wraps to a huge size_t handed to the host column setters.
+        const int64_t raw_rowid = sqlite3_value_int64(argv[0]);
+        if (raw_rowid < 0) {
+            return to_sqlite_status(Status::error);
+        }
+        size_t old_rowid = static_cast<size_t>(raw_rowid);
 
         if (def->before_modify) {
             def->before_modify("UPDATE " + def->name);
@@ -705,11 +724,11 @@ inline bool create_vtable_sqlite(sqlite3* db, const char* table_name, const char
 } // namespace detail
 
 inline bool register_vtable(Database& db, const char* module_name, const VTableDef* def) {
-    return detail::register_vtable_opaque(db.native_handle_unsafe(), module_name, def);
+    return detail::register_vtable_sqlite(db.sqlite_handle(), module_name, def);
 }
 
 inline bool create_vtable(Database& db, const char* table_name, const char* module_name) {
-    return detail::create_vtable_opaque(db.native_handle_unsafe(), table_name, module_name);
+    return detail::create_vtable_sqlite(db.sqlite_handle(), table_name, module_name);
 }
 
 // ============================================================================
@@ -986,6 +1005,98 @@ struct CachedColumnDef {
         : name(n), type(t), writable(w), get(std::move(getter)), set(std::move(setter)) {}
 };
 
+namespace detail {
+template<typename RowData>
+inline CachedColumnDef<RowData> make_row_column(
+        const char* name,
+        ColumnType type,
+        bool writable,
+        std::function<void(FunctionContext&, const RowData&)> getter,
+        std::function<bool(RowData&, FunctionArg)> setter = nullptr) {
+    return CachedColumnDef<RowData>(
+        name, type, writable, std::move(getter), std::move(setter));
+}
+
+template<typename RowData>
+inline std::function<void(FunctionContext&, const RowData&)> row_getter_int64(
+        std::function<int64_t(const RowData&)> getter) {
+    return [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+        ctx.result_int64(getter(row));
+    };
+}
+
+template<typename RowData>
+inline std::function<void(FunctionContext&, const RowData&)> row_getter_int(
+        std::function<int(const RowData&)> getter) {
+    return [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+        ctx.result_int(getter(row));
+    };
+}
+
+template<typename RowData>
+inline std::function<void(FunctionContext&, const RowData&)> row_getter_text(
+        std::function<std::string(const RowData&)> getter) {
+    return [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+        ctx.result_text(getter(row));
+    };
+}
+
+template<typename RowData>
+inline std::function<void(FunctionContext&, const RowData&)> row_getter_nullable_text(
+        std::function<std::optional<std::string>(const RowData&)> getter) {
+    return [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+        auto value = getter(row);
+        if (value.has_value()) {
+            ctx.result_text(*value);
+        } else {
+            ctx.result_null();
+        }
+    };
+}
+
+template<typename RowData>
+inline std::function<void(FunctionContext&, const RowData&)> row_getter_double(
+        std::function<double(const RowData&)> getter) {
+    return [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+        ctx.result_double(getter(row));
+    };
+}
+
+template<typename RowData>
+inline std::function<void(FunctionContext&, const RowData&)> row_getter_blob(
+        std::function<std::vector<uint8_t>(const RowData&)> getter) {
+    return [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+        auto val = getter(row);
+        ctx.result_blob(val.data(), val.size());
+    };
+}
+
+template<typename RowData>
+inline std::function<bool(RowData&, FunctionArg)> row_setter_int64(
+        std::function<bool(RowData&, int64_t)> setter) {
+    return [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+        return setter(row, val.as_int64());
+    };
+}
+
+template<typename RowData>
+inline std::function<bool(RowData&, FunctionArg)> row_setter_int(
+        std::function<bool(RowData&, int)> setter) {
+    return [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+        return setter(row, val.as_int());
+    };
+}
+
+template<typename RowData>
+inline std::function<bool(RowData&, FunctionArg)> row_setter_text(
+        std::function<bool(RowData&, const char*)> setter) {
+    return [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+        const char* text = val.as_c_str();
+        return setter(row, text ? text : "");
+    };
+}
+} // namespace detail
+
 // Index definition for cached tables
 struct CachedIndexDef {
     int column_index;                                        // Which column is indexed
@@ -1063,36 +1174,29 @@ struct CachedTableDef {
     // Index definitions: column index -> key extractor
     std::vector<std::pair<int, std::function<int64_t(const RowData&)>>> index_defs;
 
-    // Shared cache - lazily built on first query, shared across all cursors
+    // Shared cache - lazily built on first query, shared across all cursors for the
+    // engine's lifetime. This is an OPT-OUT model: the default is true, so a table
+    // caches across queries unless it calls .no_shared_cache(). Correct only over
+    // IMMUTABLE data (e.g. clangsql AST, dwarfsql DWARF) or static rows; a table over
+    // MUTABLE engine state MUST opt out with .no_shared_cache() (query-scoped, rebuilt
+    // per statement) or it will serve stale rows after out-of-band edits. (bnsql hit
+    // exactly this and was reverted to query-scoped for every mutable table.)
     bool use_shared_cache = true;
     mutable std::shared_ptr<SharedCache<RowData>> shared_cache;
 
     std::string schema() const {
-        std::ostringstream ss;
-        ss << "CREATE TABLE " << name << "(";
-        for (size_t i = 0; i < columns.size(); ++i) {
-            if (i > 0) ss << ", ";
-            ss << "\"" << columns[i].name << "\" " << column_type_sql(columns[i].type);
-        }
-        ss << ")";
-        return ss.str();
+        return detail::render_table_schema(name, columns);
     }
 
     int find_column(const std::string& col_name) const {
-        for (size_t i = 0; i < columns.size(); ++i) {
-            if (columns[i].name == col_name) return static_cast<int>(i);
-        }
-        return -1;
+        return detail::find_column_index(columns, col_name);
     }
 
     // Find a filter for (column, constraint-op). A column may carry more than one
     // filter (e.g. an EQ filter and a LIKE/prefix filter on the same column), so
     // the operator must be matched too.
     const FilterDef* find_filter(int col_index, int op = SQLITE_INDEX_CONSTRAINT_EQ) const {
-        for (const auto& f : filters) {
-            if (f.column_index == col_index && f.op == op) return &f;
-        }
-        return nullptr;
+        return detail::find_filter_by_column_and_op(filters, col_index, op);
     }
 
     // Find index position for a column (-1 if not indexed)
@@ -1167,7 +1271,8 @@ inline bool cached_table_has_scan_driven_mutation(const CachedTableDef<RowData>*
 
 template<typename RowData>
 inline bool cached_table_supports_count_only_scan(const CachedTableDef<RowData>* def) {
-    return def && def->row_count_fn && !cached_table_has_scan_driven_mutation(def);
+    return def && def->row_count_fn && !def->rowid_fn &&
+           !cached_table_has_scan_driven_mutation(def);
 }
 
 template<typename RowData>
@@ -1177,6 +1282,63 @@ inline void cached_table_invalidate_after_mutation(const CachedTableDef<RowData>
     def->shared_cache->indexes.clear();
     def->shared_cache->built = false;
     def->shared_cache->mutation_snapshot = !def->shared_cache->data.empty();
+}
+
+// Query-scoped scan-driven mutation support. A no_shared_cache table has no
+// stable row set across a multi-row DELETE/UPDATE: each xUpdate would otherwise
+// rebuild from the ALREADY-mutated state, stranding the scan's positional rowids
+// (rebuild-during-mutation is also what crashes engines like BN when a per-row
+// delete redefines a type mid-rebuild). For POSITIONAL query-scoped tables (no
+// row_lookup, no rowid_fn), snapshot the full pre-mutation row set ONCE into the
+// otherwise-unused shared_cache slot; the reconstruction branch in
+// cached_vtab_update reads positions from this stable snapshot -- mirroring
+// SharedCache::mutation_snapshot for shared tables. It is invisible to the read
+// path (xColumn/xRowid gate shared reads on use_shared_cache) and is dropped at
+// the next scan (cached_vtab_filter) = next statement. No-op for shared tables,
+// read-only tables, and tables that reconstruct via row_lookup/rowid_fn.
+template<typename RowData>
+inline bool query_scoped_uses_mutation_snapshot(const CachedTableDef<RowData>* def) {
+    // Only full-scan tables: with a filter_eq iterator, a scan/update rowid can be
+    // iterator-local, not a global cache position, so a positional snapshot would
+    // resolve the wrong row. Such tables keep the per-xUpdate rebuild path.
+    return def && !def->use_shared_cache && !def->row_lookup && !def->rowid_fn &&
+           def->filters.empty() && def->cache_builder_fn &&
+           cached_table_has_scan_driven_mutation(def);
+}
+
+template<typename RowData>
+inline bool ensure_query_scoped_mutation_snapshot(const CachedTableDef<RowData>* def) {
+    if (!query_scoped_uses_mutation_snapshot(def)) return true;
+    if (!def->shared_cache) {
+        def->shared_cache = std::make_shared<SharedCache<RowData>>();
+    }
+    auto& snap = *def->shared_cache;
+    std::lock_guard<std::mutex> lock(snap.mutex);
+    if (!snap.mutation_snapshot) {
+        snap.data.clear();
+        clear_vtab_error();
+        def->cache_builder_fn(snap.data);
+        if (!get_vtab_error().empty()) {
+            snap.data.clear();
+            snap.indexes.clear();
+            snap.mutation_snapshot = false;
+            snap.built = false;
+            return false;
+        }
+        snap.mutation_snapshot = true;
+        snap.built = false;
+    }
+    return true;
+}
+
+template<typename RowData>
+inline void clear_query_scoped_mutation_snapshot(const CachedTableDef<RowData>* def) {
+    if (!def || def->use_shared_cache || !def->shared_cache) return;
+    std::lock_guard<std::mutex> lock(def->shared_cache->mutex);
+    if (def->shared_cache->mutation_snapshot) {
+        def->shared_cache->mutation_snapshot = false;
+        def->shared_cache->data.clear();
+    }
 }
 
 // Decide whether a LIKE/GLOB constraint is worth routing to a prefix filter:
@@ -1216,8 +1378,21 @@ struct CachedCursor {
 
     // Index-based iteration
     bool using_index = false;
-    const std::vector<size_t>* index_matches = nullptr;  // Points into shared_cache->indexes
+    const std::vector<size_t>* index_matches = nullptr;  // Points into *_indexes below
     size_t index_pos = 0;
+    // Row data the index positions point into: shared_cache->data (shared tables)
+    // or index_cache (query-scoped tables). Set per xFilter.
+    const std::vector<RowData>* index_data_source = nullptr;
+
+    // Per-cursor index cache (query-scoped tables): built once on the first index
+    // xFilter and REUSED across subsequent xFilter calls on this cursor (a JOIN's
+    // inner-loop reuses one cursor), so a query-scoped table stays fast in a JOIN
+    // without an engine-lifetime shared cache. Persists across xFilter (not reset
+    // at the top); dropped at xClose with the cursor. Freshness is per statement:
+    // a new statement opens a new cursor, rebuilding from the live source.
+    std::vector<RowData> index_cache;
+    std::vector<std::unordered_map<int64_t, std::vector<size_t>>> cursor_indexes;
+    bool cursor_index_built = false;
 
     // Exact count-only/no-column full scan
     bool using_count_only = false;
@@ -1340,10 +1515,17 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
     // xUpdate reconstructs from real argv values, so reporting NOCHANGE would
     // feed row_from_argv 0/NULL for unchanged identity fields (ea, func_addr).
     // This MUST match cached_vtab_update's reconstruct_by_rowid below.
+    // A query-scoped table with a mutation snapshot also reconstructs by rowid
+    // (positionally, from the stable snapshot), so it is NOCHANGE-eligible too --
+    // essential for tables with multiple setters that map to the SAME underlying
+    // value (e.g. comments' comment/rpt_comment, pseudocode's comment/
+    // comment_placement): without NOCHANGE, the unchanged setter fires with its
+    // stale argv value and clobbers the changed one.
     if (sqlite3_vtab_nochange(ctx)
         && !cursor->def->update_from_column_values
         && (((!cursor->def->rowid_fn) && cursor->def->use_shared_cache)
-            || cursor->def->row_lookup)) {
+            || cursor->def->row_lookup
+            || detail::query_scoped_uses_mutation_snapshot(cursor->def))) {
         return to_sqlite_status(Status::ok);
     }
 
@@ -1369,12 +1551,13 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
         }
         cursor->def->columns[col].get(fctx, cursor->rowid_lookup_row);
     } else if (cursor->using_index) {
-        // Index-based access: get row from shared cache via index
+        // Index-based access: get row via the index's data source (shared cache
+        // for shared tables, the per-cursor index_cache for query-scoped tables).
         if (cursor->index_matches && cursor->index_pos < cursor->index_matches->size()) {
             size_t row_idx = (*cursor->index_matches)[cursor->index_pos];
-            const auto& shared = cursor->def->shared_cache;
-            if (shared && row_idx < shared->data.size()) {
-                cursor->def->columns[col].get(fctx, shared->data[row_idx]);
+            const auto* src = cursor->index_data_source;
+            if (src && row_idx < src->size()) {
+                cursor->def->columns[col].get(fctx, (*src)[row_idx]);
             } else {
                 sqlite3_result_null(ctx);
             }
@@ -1410,17 +1593,25 @@ inline int cached_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid
     } else if (cursor->using_rowid_lookup) {
         *pRowid = cursor->rowid_lookup_eof ? 0 : cursor->rowid_lookup_id;
     } else if (cursor->using_index) {
-        // Index path: row lives in the shared cache; honor rowid_fn if set.
-        if (def->rowid_fn && cursor->index_matches &&
-            cursor->index_pos < cursor->index_matches->size()) {
+        // Index path: rowid honors rowid_fn; otherwise the matched cache POSITION
+        // (row_idx), NOT cursor->current_row (which the index path does not
+        // advance). This must match the full-scan path so positional /
+        // row_lookup()-based UPDATE/DELETE reconstruction resolves the same row --
+        // a query-scoped table with index_on + row_lookup (e.g. idasql `names`)
+        // deletes via this path once index_on is enabled for query-scoped tables.
+        if (cursor->index_matches && cursor->index_pos < cursor->index_matches->size()) {
             size_t row_idx = (*cursor->index_matches)[cursor->index_pos];
-            const auto& shared = def->shared_cache;
-            if (shared && row_idx < shared->data.size()) {
-                *pRowid = def->rowid_fn(shared->data[row_idx]);
-                return to_sqlite_status(Status::ok);
+            if (def->rowid_fn) {
+                const auto* src = cursor->index_data_source;
+                if (src && row_idx < src->size()) {
+                    *pRowid = def->rowid_fn((*src)[row_idx]);
+                    return to_sqlite_status(Status::ok);
+                }
             }
+            *pRowid = static_cast<sqlite3_int64>(row_idx);
+        } else {
+            *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
         }
-        *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
     } else if (cursor->using_count_only) {
         *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
     } else if (def->rowid_fn) {
@@ -1461,6 +1652,11 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
     cursor->cache.clear();
     cursor->cache_built = false;
     cursor->current_row = 0;
+
+    // A new scan begins a new statement: drop any query-scoped mutation snapshot
+    // preserved from a prior scan-driven UPDATE/DELETE (see
+    // ensure_query_scoped_mutation_snapshot). No-op for shared/read-only tables.
+    detail::clear_query_scoped_mutation_snapshot(cursor->def);
 
     if (idxNum == COUNT_ONLY_SCAN && argc == 0 &&
         detail::cached_table_supports_count_only_scan(cursor->def)) {
@@ -1528,29 +1724,57 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
         }
 
         // Check for index-based lookup (idxNum >= INDEX_BASE)
-        if (cursor->def->use_shared_cache && idxNum >= INDEX_BASE) {
+        if (idxNum >= INDEX_BASE) {
             int index_pos = idxNum - INDEX_BASE;
             const auto& index_defs = cursor->def->index_defs;
             if (index_pos >= 0 && static_cast<size_t>(index_pos) < index_defs.size()) {
-                // Ensure cache and indexes are built
                 clear_vtab_error();
-                cursor->def->ensure_cache_built();
-                if (!get_vtab_error().empty()) {
-                    return return_vtab_error(pCursor->pVtab);
-                }
-                const auto& shared = cursor->def->shared_cache;
-                if (shared && shared->built && static_cast<size_t>(index_pos) < shared->indexes.size()) {
-                    int64_t key = FunctionArg(argv[0]).as_int64();
-                    auto it = shared->indexes[index_pos].find(key);
-                    if (it != shared->indexes[index_pos].end()) {
-                        cursor->using_index = true;
-                        cursor->index_matches = &it->second;
-                        cursor->index_pos = 0;
-                    } else {
-                        // No matches - return empty result
-                        cursor->using_index = true;
-                        cursor->index_matches = nullptr;
+                if (cursor->def->use_shared_cache) {
+                    // Shared table: index lives in the engine-lifetime shared cache.
+                    cursor->def->ensure_cache_built();
+                    if (!get_vtab_error().empty()) {
+                        return return_vtab_error(pCursor->pVtab);
                     }
+                    const auto& shared = cursor->def->shared_cache;
+                    if (shared && shared->built && static_cast<size_t>(index_pos) < shared->indexes.size()) {
+                        int64_t key = FunctionArg(argv[0]).as_int64();
+                        auto it = shared->indexes[index_pos].find(key);
+                        cursor->using_index = true;
+                        cursor->index_matches =
+                            (it != shared->indexes[index_pos].end()) ? &it->second : nullptr;
+                        cursor->index_data_source = &shared->data;
+                        cursor->index_pos = 0;
+                        return to_sqlite_status(Status::ok);
+                    }
+                } else if (cursor->def->cache_builder_fn) {
+                    // Query-scoped table: build the per-cursor cache + hash indexes
+                    // ONCE, then reuse across this cursor's xFilter calls (a JOIN's
+                    // inner loop reuses one cursor) so the JOIN stays fast without an
+                    // engine-lifetime shared cache. Rebuilt per statement (new cursor).
+                    if (!cursor->cursor_index_built) {
+                        cursor->index_cache.clear();
+                        cursor->def->cache_builder_fn(cursor->index_cache);
+                        if (!get_vtab_error().empty()) {
+                            cursor->index_cache.clear();
+                            return return_vtab_error(pCursor->pVtab);
+                        }
+                        cursor->cursor_indexes.assign(index_defs.size(), {});
+                        for (size_t ix = 0; ix < index_defs.size(); ++ix) {
+                            auto& index_map = cursor->cursor_indexes[ix];
+                            const auto& key_fn = index_defs[ix].second;
+                            for (size_t row = 0; row < cursor->index_cache.size(); ++row) {
+                                index_map[key_fn(cursor->index_cache[row])].push_back(row);
+                            }
+                        }
+                        cursor->cursor_index_built = true;
+                    }
+                    int64_t key = FunctionArg(argv[0]).as_int64();
+                    auto& index_map = cursor->cursor_indexes[index_pos];
+                    auto it = index_map.find(key);
+                    cursor->using_index = true;
+                    cursor->index_matches = (it != index_map.end()) ? &it->second : nullptr;
+                    cursor->index_data_source = &cursor->index_cache;
+                    cursor->index_pos = 0;
                     return to_sqlite_status(Status::ok);
                 }
             }
@@ -1680,21 +1904,33 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
             best_cost = filter->estimated_cost;
         }
 
-        // Check for indexed column
-        int idx_pos = def->use_shared_cache ? def->find_index(constraint.iColumn) : -1;
+        // Check for indexed column. Query-scoped tables also use it: xFilter builds
+        // the hash index on a per-cursor cache (needs a cache_builder to (re)build).
+        int idx_pos = (def->use_shared_cache || def->cache_builder_fn)
+                          ? def->find_index(constraint.iColumn) : -1;
         if (idx_pos >= 0) {
-            // Index lookups are very cheap (hash lookup)
-            double index_cost = 1.0;
-            if (index_cost < best_cost) {
+            if (def->use_shared_cache) {
+                // Hash lookup on the already-built shared cache is near-free:
+                // compete by cost and displace a costlier filter.
+                double index_cost = 1.0;
+                if (index_cost < best_cost) {
+                    best_index_pos = idx_pos;
+                    best_index_constraint_idx = i;
+                    best_cost = index_cost;
+                    best_filter = nullptr;  // Index beats costlier filter
+                }
+            } else if (best_index_pos < 0) {
+                // Query-scoped: the index scan must first BUILD the per-cursor
+                // cache (a full engine read), so it never outranks an explicit
+                // filter (a targeted engine read). Record it as the fallback
+                // that beats a full scan (built once, reused across a JOIN's
+                // inner loop) — chosen below only when no filter matched.
                 best_index_pos = idx_pos;
                 best_index_constraint_idx = i;
-                best_cost = index_cost;
-                best_filter = nullptr;  // Index beats filter
             }
         }
     }
 
-    // Prefer index over filter if both matched
     if (pInfo->nConstraint == 0 && pInfo->colUsed == 0 &&
         detail::cached_table_supports_count_only_scan(def)) {
         const size_t estimated_rows = estimate_full_scan_rows();
@@ -1707,7 +1943,8 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         pInfo->idxNum = ROWID_FILTER;
         pInfo->estimatedCost = 1.0;
         pInfo->estimatedRows = 1;
-    } else if (best_index_pos >= 0 && best_index_constraint_idx >= 0) {
+    } else if (best_index_pos >= 0 && best_index_constraint_idx >= 0 &&
+               !best_filter) {
         pInfo->aConstraintUsage[best_index_constraint_idx].argvIndex = 1;
         pInfo->aConstraintUsage[best_index_constraint_idx].omit = 1;
         pInfo->idxNum = INDEX_BASE + best_index_pos;
@@ -1747,6 +1984,13 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         const int64_t raw_rowid = sqlite3_value_int64(argv[0]);
         const size_t rowid = raw_rowid >= 0 ? static_cast<size_t>(raw_rowid) : static_cast<size_t>(-1);
 
+        // Query-scoped positional tables: snapshot the pre-mutation row set once
+        // so a multi-row DELETE reconstructs from a STABLE set instead of a
+        // rebuild on the already-mutated state (which strands rowids and can crash
+        // engines that mutate mid-rebuild). No-op otherwise.
+        if (!detail::ensure_query_scoped_mutation_snapshot(def)) {
+            return return_vtab_error(pVtab);
+        }
         const auto& shared = def->shared_cache;
         RowData temp_row{};
         RowData* row_ptr = nullptr;
@@ -1765,6 +2009,12 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             row_ptr = &shared->data[rowid];
         } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->mutation_snapshot &&
                    !def->row_lookup && raw_rowid >= 0 && rowid < shared->data.size()) {
+            row_ptr = &shared->data[rowid];
+        } else if (!def->use_shared_cache && shared && shared->mutation_snapshot &&
+                   raw_rowid >= 0 && rowid < shared->data.size()) {
+            // Query-scoped positional snapshot: stable across the multi-row
+            // statement, so this rowid still maps to the pre-mutation row (the
+            // per-xUpdate rebuild below would read the already-mutated data).
             row_ptr = &shared->data[rowid];
         } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
             row_ptr = &temp_row;
@@ -1811,6 +2061,13 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         }
         if (!has_writable) return to_sqlite_status(Status::read_only);
 
+        // Snapshot before the before_modify hook (same order as DELETE): a
+        // failed snapshot aborts the statement before any observable side
+        // effect, so the hook never fires for a mutation that cannot happen.
+        if (!detail::ensure_query_scoped_mutation_snapshot(def)) {
+            return return_vtab_error(pVtab);
+        }
+
         if (def->before_modify) {
             def->before_modify("UPDATE " + def->name);
         }
@@ -1823,14 +2080,16 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
 
         // Reconstruct-by-rowid (and thus NOCHANGE-eligible) exactly when the row
         // can be resolved from the rowid alone: a POSITIONAL shared-cache index
-        // (no stable rowid_fn) or a resolving row_lookup -- and never when opted
+        // (no stable rowid_fn), a resolving row_lookup, or a query-scoped mutation
+        // snapshot (positional, stable for the statement) -- and never when opted
         // out. MUST match the cached_vtab_column() NOCHANGE gate. When true,
         // unchanged identity columns arrive as NOCHANGE/0/NULL, so row_from_argv
         // must NOT be used even if rowid resolution later fails (it would write
         // the wrong row); fall through to read_only instead.
         const bool reconstruct_by_rowid =
             !def->update_from_column_values &&
-            (((!def->rowid_fn) && def->use_shared_cache) || static_cast<bool>(def->row_lookup));
+            (((!def->rowid_fn) && def->use_shared_cache) || static_cast<bool>(def->row_lookup)
+             || detail::query_scoped_uses_mutation_snapshot(def));
 
         if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
             raw_rowid >= 0 && old_rowid < shared->data.size()) {
@@ -1856,6 +2115,11 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
                 def->row_from_argv(temp_row, argc, args);
             });
             row_ptr = &temp_row;
+        } else if (!def->use_shared_cache && shared && shared->mutation_snapshot &&
+                   raw_rowid >= 0 && old_rowid < shared->data.size()) {
+            // Query-scoped positional snapshot (see DELETE): a stable pre-mutation
+            // row for a multi-row UPDATE, instead of a rebuild on mutated data.
+            row_ptr = &shared->data[old_rowid];
         } else if (!def->update_from_column_values && !def->rowid_fn &&
                    !def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
             // Position-based rebuild: a full-scan rowid is the row's index in the
@@ -1990,7 +2254,7 @@ template<typename RowData>
 inline bool register_cached_vtable(Database& db,
                                    const char* module_name,
                                    const CachedTableDef<RowData>* def) {
-    return detail::register_cached_vtable_opaque<RowData>(db.native_handle_unsafe(), module_name, def);
+    return detail::register_cached_vtable_sqlite<RowData>(db.sqlite_handle(), module_name, def);
 }
 
 // Cached Table Builder
@@ -2049,90 +2313,73 @@ public:
     CachedTableBuilder& column(const char* name,
                                ColumnType type,
                                std::function<void(FunctionContext&, const RowData&)> getter) {
-        def_.columns.emplace_back(name, type, false, std::move(getter), nullptr);
+        def_.columns.push_back(
+            detail::make_row_column<RowData>(name, type, false, std::move(getter)));
         return *this;
     }
 
     CachedTableBuilder& column_int64(const char* name, std::function<int64_t(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int64(getter(row));
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, false, detail::row_getter_int64<RowData>(std::move(getter))));
         return *this;
     }
 
     CachedTableBuilder& column_int64_rw(const char* name,
                                          std::function<int64_t(const RowData&)> getter,
                                          std::function<bool(RowData&, FunctionArg)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int64(getter(row));
-            },
-            std::move(setter));
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_int64<RowData>(std::move(getter)), std::move(setter)));
         return *this;
     }
 
     CachedTableBuilder& column_int64_rw(const char* name,
                                          std::function<int64_t(const RowData&)> getter,
                                          std::function<bool(RowData&, int64_t)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int64(getter(row));
-            },
-            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
-                return setter(row, val.as_int64());
-            });
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_int64<RowData>(std::move(getter)),
+            detail::row_setter_int64<RowData>(std::move(setter))));
         return *this;
     }
 
     CachedTableBuilder& column_int(const char* name, std::function<int(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int(getter(row));
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, false, detail::row_getter_int<RowData>(std::move(getter))));
         return *this;
     }
 
     CachedTableBuilder& column_int_rw(const char* name,
                                        std::function<int(const RowData&)> getter,
                                        std::function<bool(RowData&, FunctionArg)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int(getter(row));
-            },
-            std::move(setter));
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_int<RowData>(std::move(getter)), std::move(setter)));
         return *this;
     }
 
     CachedTableBuilder& column_int_rw(const char* name,
                                        std::function<int(const RowData&)> getter,
                                        std::function<bool(RowData&, int)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int(getter(row));
-            },
-            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
-                return setter(row, val.as_int());
-            });
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_int<RowData>(std::move(getter)),
+            detail::row_setter_int<RowData>(std::move(setter))));
         return *this;
     }
 
     CachedTableBuilder& column_text(const char* name, std::function<std::string(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Text, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_text(getter(row));
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Text, false, detail::row_getter_text<RowData>(std::move(getter))));
         return *this;
     }
 
     CachedTableBuilder& column_text_rw(const char* name,
                                         std::function<std::string(const RowData&)> getter,
                                         std::function<bool(RowData&, FunctionArg)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Text, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_text(getter(row));
-            },
-            std::move(setter));
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Text, true,
+            detail::row_getter_text<RowData>(std::move(getter)), std::move(setter)));
         return *this;
     }
 
@@ -2140,47 +2387,31 @@ public:
                                         const char* name,
                                         std::function<std::optional<std::string>(const RowData&)> getter,
                                         std::function<bool(RowData&, FunctionArg)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Text, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                auto value = getter(row);
-                if (value.has_value()) {
-                    ctx.result_text(*value);
-                } else {
-                    ctx.result_null();
-                }
-            },
-            std::move(setter));
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Text, true,
+            detail::row_getter_nullable_text<RowData>(std::move(getter)), std::move(setter)));
         return *this;
     }
 
     CachedTableBuilder& column_text_rw(const char* name,
                                         std::function<std::string(const RowData&)> getter,
                                         std::function<bool(RowData&, const char*)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Text, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_text(getter(row));
-            },
-            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
-                const char* text = val.as_c_str();
-                return setter(row, text ? text : "");
-            });
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Text, true,
+            detail::row_getter_text<RowData>(std::move(getter)),
+            detail::row_setter_text<RowData>(std::move(setter))));
         return *this;
     }
 
     CachedTableBuilder& column_double(const char* name, std::function<double(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Real, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_double(getter(row));
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Real, false, detail::row_getter_double<RowData>(std::move(getter))));
         return *this;
     }
 
     CachedTableBuilder& column_blob(const char* name, std::function<std::vector<uint8_t>(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Blob, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                auto val = getter(row);
-                ctx.result_blob(val.data(), val.size());
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Blob, false, detail::row_getter_blob<RowData>(std::move(getter))));
         return *this;
     }
 
@@ -2477,29 +2708,17 @@ struct GeneratorTableDef {
     std::function<void(const std::string&)> after_modify;
 
     std::string schema() const {
-        std::ostringstream ss;
-        ss << "CREATE TABLE " << name << "(";
-        for (size_t i = 0; i < columns.size(); ++i) {
-            if (i > 0) ss << ", ";
-            ss << "\"" << columns[i].name << "\" " << column_type_sql(columns[i].type);
-            if (hidden_columns.count(static_cast<int>(i))) ss << " HIDDEN";
-        }
-        ss << ")";
-        return ss.str();
+        return detail::render_table_schema(name, columns, [this](size_t i) {
+            return hidden_columns.count(static_cast<int>(i)) != 0;
+        });
     }
 
     int find_column(const std::string& col_name) const {
-        for (size_t i = 0; i < columns.size(); ++i) {
-            if (columns[i].name == col_name) return static_cast<int>(i);
-        }
-        return -1;
+        return detail::find_column_index(columns, col_name);
     }
 
     const FilterDef* find_filter(int col_index) const {
-        for (const auto& f : filters) {
-            if (f.column_index == col_index) return &f;
-        }
-        return nullptr;
+        return detail::find_filter_by_column(filters, col_index);
     }
 };
 
@@ -3126,13 +3345,22 @@ template<typename RowData>
 inline bool register_generator_vtable(Database& db,
                                       const char* module_name,
                                       const GeneratorTableDef<RowData>* def) {
-    return detail::register_generator_vtable_opaque<RowData>(db.native_handle_unsafe(), module_name, def);
+    return detail::register_generator_vtable_sqlite<RowData>(db.sqlite_handle(), module_name, def);
 }
 
 // Generator Table Builder
 template<typename RowData>
 class GeneratorTableBuilder {
     GeneratorTableDef<RowData> def_;
+
+    void add_hidden_column(const char* name, ColumnType type) {
+        int idx = static_cast<int>(def_.columns.size());
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, type, false,
+            [](FunctionContext& ctx, const RowData&) { ctx.result_null(); }));
+        def_.hidden_columns.insert(idx);
+    }
+
 public:
     explicit GeneratorTableBuilder(const char* name) {
         def_.name = name;
@@ -3166,7 +3394,8 @@ public:
     GeneratorTableBuilder& column(const char* name,
                                   ColumnType type,
                                   std::function<void(FunctionContext&, const RowData&)> getter) {
-        def_.columns.emplace_back(name, type, false, std::move(getter), nullptr);
+        def_.columns.push_back(
+            detail::make_row_column<RowData>(name, type, false, std::move(getter)));
         return *this;
     }
 
@@ -3174,121 +3403,95 @@ public:
                                      ColumnType type,
                                      std::function<void(FunctionContext&, const RowData&)> getter,
                                      std::function<bool(RowData&, FunctionArg)> setter) {
-        def_.columns.emplace_back(name, type, true, std::move(getter), std::move(setter));
+        def_.columns.push_back(
+            detail::make_row_column<RowData>(name, type, true, std::move(getter), std::move(setter)));
         return *this;
     }
 
     GeneratorTableBuilder& column_int64(const char* name, std::function<int64_t(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int64(getter(row));
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, false, detail::row_getter_int64<RowData>(std::move(getter))));
         return *this;
     }
 
     GeneratorTableBuilder& column_int64_rw(const char* name,
                                            std::function<int64_t(const RowData&)> getter,
                                            std::function<bool(RowData&, FunctionArg)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int64(getter(row));
-            },
-            std::move(setter));
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_int64<RowData>(std::move(getter)), std::move(setter)));
         return *this;
     }
 
     GeneratorTableBuilder& column_int64_rw(const char* name,
                                            std::function<int64_t(const RowData&)> getter,
                                            std::function<bool(RowData&, int64_t)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int64(getter(row));
-            },
-            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
-                return setter(row, val.as_int64());
-            });
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_int64<RowData>(std::move(getter)),
+            detail::row_setter_int64<RowData>(std::move(setter))));
         return *this;
     }
 
     GeneratorTableBuilder& column_int(const char* name, std::function<int(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int(getter(row));
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, false, detail::row_getter_int<RowData>(std::move(getter))));
         return *this;
     }
 
     GeneratorTableBuilder& column_int_rw(const char* name,
                                          std::function<int(const RowData&)> getter,
                                          std::function<bool(RowData&, FunctionArg)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int(getter(row));
-            },
-            std::move(setter));
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_int<RowData>(std::move(getter)), std::move(setter)));
         return *this;
     }
 
     GeneratorTableBuilder& column_int_rw(const char* name,
                                          std::function<int(const RowData&)> getter,
                                          std::function<bool(RowData&, int)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_int(getter(row));
-            },
-            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
-                return setter(row, val.as_int());
-            });
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_int<RowData>(std::move(getter)),
+            detail::row_setter_int<RowData>(std::move(setter))));
         return *this;
     }
 
     GeneratorTableBuilder& column_text(const char* name, std::function<std::string(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Text, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_text(getter(row));
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Text, false, detail::row_getter_text<RowData>(std::move(getter))));
         return *this;
     }
 
     GeneratorTableBuilder& column_text_rw(const char* name,
                                           std::function<std::string(const RowData&)> getter,
                                           std::function<bool(RowData&, FunctionArg)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Text, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_text(getter(row));
-            },
-            std::move(setter));
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Text, true,
+            detail::row_getter_text<RowData>(std::move(getter)), std::move(setter)));
         return *this;
     }
 
     GeneratorTableBuilder& column_text_rw(const char* name,
                                           std::function<std::string(const RowData&)> getter,
                                           std::function<bool(RowData&, const char*)> setter) {
-        def_.columns.emplace_back(name, ColumnType::Text, true,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_text(getter(row));
-            },
-            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
-                const char* text = val.as_c_str();
-                return setter(row, text ? text : "");
-            });
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Text, true,
+            detail::row_getter_text<RowData>(std::move(getter)),
+            detail::row_setter_text<RowData>(std::move(setter))));
         return *this;
     }
 
     GeneratorTableBuilder& column_double(const char* name, std::function<double(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Real, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                ctx.result_double(getter(row));
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Real, false, detail::row_getter_double<RowData>(std::move(getter))));
         return *this;
     }
 
     GeneratorTableBuilder& column_blob(const char* name, std::function<std::vector<uint8_t>(const RowData&)> getter) {
-        def_.columns.emplace_back(name, ColumnType::Blob, false,
-            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
-                auto val = getter(row);
-                ctx.result_blob(val.data(), val.size());
-            }, nullptr);
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Blob, false, detail::row_getter_blob<RowData>(std::move(getter))));
         return *this;
     }
 
@@ -3322,27 +3525,17 @@ public:
     // Hidden columns: input parameters not part of output, constrained via WHERE clause.
     // These appear as HIDDEN in the schema and are typically used with parametric_filter().
     GeneratorTableBuilder& hidden_column_int64(const char* name) {
-        int idx = static_cast<int>(def_.columns.size());
-        // Hidden columns use a no-op getter (value comes from WHERE, not from RowData)
-        def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [](FunctionContext& ctx, const RowData&) { ctx.result_null(); }, nullptr);
-        def_.hidden_columns.insert(idx);
+        add_hidden_column(name, ColumnType::Integer);
         return *this;
     }
 
     GeneratorTableBuilder& hidden_column_text(const char* name) {
-        int idx = static_cast<int>(def_.columns.size());
-        def_.columns.emplace_back(name, ColumnType::Text, false,
-            [](FunctionContext& ctx, const RowData&) { ctx.result_null(); }, nullptr);
-        def_.hidden_columns.insert(idx);
+        add_hidden_column(name, ColumnType::Text);
         return *this;
     }
 
     GeneratorTableBuilder& hidden_column_int(const char* name) {
-        int idx = static_cast<int>(def_.columns.size());
-        def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [](FunctionContext& ctx, const RowData&) { ctx.result_null(); }, nullptr);
-        def_.hidden_columns.insert(idx);
+        add_hidden_column(name, ColumnType::Integer);
         return *this;
     }
 

@@ -1,5 +1,10 @@
 # libxsql
 
+> **License Notice:** This is source-available software, not open-source software.
+> By using, building, distributing, or contributing to this repository, you are relying on the [Human-Origin Source License v1.0](LICENSE).
+> Unmodified dependency use is allowed, including commercial use.
+> Forks, ports, rebrands, derivative implementations, and AI-assisted implementation mining require prior written permission.
+
 **libxsql** is a modern C++17 header-only library that exposes C++ data structures as SQLite virtual tables.
 
 SQL is the universal query language. By exposing your application's data as SQL tables, you make it instantly accessible to scripts, CLI pipelines, and AI coding agents. No proprietary API to learn. No SDK to integrate. Just SQL.
@@ -8,6 +13,16 @@ Build a CLI tool with libxsql, and any agent (Claude Code, Codex, Copilot) can q
 
 > **Rust port:** [libxsql-rs](https://github.com/0xeb/libxsql-rs) — the same fluent virtual-table API, idiomatic Rust.
 
+## License and Terms of Use
+
+In short: you may read, build, evaluate, benchmark, package, and use unmodified libxsql as a dependency, including commercially, if you preserve notices and follow the license terms. You may fork or patch it to prepare bug fixes, optimizations, features, tests, or documentation improvements for contribution back within the license's contribution-purpose rules.
+
+You may not maintain a divergent private fork, port, rebrand, clone, API-compatible replacement, competing implementation, or use libxsql as AI input to recreate or improve a derivative implementation without prior written permission from Elias Bachaalany. Independent implementations that are not copied from, materially derived from, or substantially informed by libxsql in the license's defined sense are not prohibited.
+
+Permission requests: open a GitHub issue at [0xeb/libxsql/issues](https://github.com/0xeb/libxsql/issues).
+
+If libxsql materially informs a distributed project, preserve the human origin: credit libxsql and Elias Bachaalany visibly in your README/docs and in About/credits UI when applicable. The license includes an examples/FAQ section for common allowed and permission-required uses. Vendored dependencies under `external/` remain under their own licenses; see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
 ## Features
 
 - **Fluent builder API** - Define tables in 20-50 lines instead of 250-400
@@ -15,7 +30,7 @@ Build a CLI tool with libxsql, and any agent (Claude Code, Codex, Copilot) can q
 - **Writable tables** - UPDATE and DELETE support via column setters
 - **Constraint pushdown** - O(1) lookups with `filter_eq()`
 - **Socket protocol** - TCP server/client for remote queries
-- **Zero dependencies** - Header-only, uses vendored SQLite
+- **Zero dependencies** - Vendored SQLite, no external libraries
 
 ## Installation
 
@@ -30,9 +45,12 @@ add_subdirectory(external/libxsql)
 target_link_libraries(myapp PRIVATE xsql::xsql)
 ```
 
-### Header-Only
+### Vendored Copy
 
-Copy `include/xsql/` and `external/sqlite/` to your project.
+Copy `include/xsql/`, `src/`, and `external/sqlite/` to your project and add
+the `src/*.cpp` files (plus the SQLite amalgamation) to your build. The
+virtual-table framework and thinclient are header-only, but the `Database`,
+`Statement`, and function-registration layers are compiled sources.
 
 ## Quick Start
 
@@ -72,7 +90,7 @@ For data with direct index access. Row count is computed on each query.
 ```cpp
 auto def = xsql::table("funcs")
     .count([&]() { return get_func_qty(); })
-    .column_int64("ea", [&](size_t i) { return get_func(i)->start_ea; })
+    .column_int64("addr", [&](size_t i) { return get_func(i)->start_ea; })
     .column_text("name", [&](size_t i) { return get_func_name(i); })
     .build();
 ```
@@ -92,8 +110,8 @@ auto def = xsql::cached_table<XrefInfo>("xrefs")
         for (auto& xref : all_xrefs())
             cache.push_back({xref.from, xref.to});
     })
-    .column_int64("from_ea", [](const XrefInfo& r) { return r.from; })
-    .column_int64("to_ea", [](const XrefInfo& r) { return r.to; })
+    .column_int64("from_addr", [](const XrefInfo& r) { return r.from; })
+    .column_int64("to_addr", [](const XrefInfo& r) { return r.to; })
     .build();
 ```
 
@@ -102,7 +120,7 @@ auto def = xsql::cached_table<XrefInfo>("xrefs")
 For expensive data sources where LIMIT should stop work early.
 
 ```cpp
-struct DecompRow { uint64_t func_ea; std::string pseudocode; };
+struct DecompRow { uint64_t func_addr; std::string pseudocode; };
 
 class DecompGenerator : public xsql::Generator<DecompRow> {
     size_t idx_ = 0;
@@ -110,7 +128,7 @@ class DecompGenerator : public xsql::Generator<DecompRow> {
 public:
     bool next() override {
         if (idx_ >= get_func_qty()) return false;
-        current_.func_ea = get_func(idx_)->start_ea;
+        current_.func_addr = get_func(idx_)->start_ea;
         current_.pseudocode = decompile(idx_);  // Expensive!
         idx_++;
         return true;
@@ -122,7 +140,7 @@ public:
 auto def = xsql::generator_table<DecompRow>("decompiled")
     .estimate_rows([]() { return get_func_qty(); })
     .generator([]() { return std::make_unique<DecompGenerator>(); })
-    .column_int64("func_ea", [](const DecompRow& r) { return r.func_ea; })
+    .column_int64("func_addr", [](const DecompRow& r) { return r.func_addr; })
     .column_text("pseudocode", [](const DecompRow& r) { return r.pseudocode; })
     .build();
 ```
@@ -142,7 +160,7 @@ auto def = xsql::table("names")
         // Called before any modification
         create_undo_point();
     })
-    .column_int64("ea", [&](size_t i) { return names[i].ea; })
+    .column_int64("addr", [&](size_t i) { return names[i].addr; })
     .column_text_rw("name",
         [&](size_t i) { return names[i].name; },           // getter
         [&](size_t i, const char* v) {                     // setter
@@ -157,8 +175,8 @@ auto def = xsql::table("names")
 ```
 
 ```sql
-UPDATE names SET name = 'new_name' WHERE ea = 0x401000;
-DELETE FROM names WHERE ea = 0x402000;
+UPDATE names SET name = 'new_name' WHERE addr = 0x401000;
+DELETE FROM names WHERE addr = 0x402000;
 ```
 
 ## Constraint Pushdown
@@ -191,15 +209,15 @@ public:
 
 auto def = xsql::cached_table<XrefInfo>("xrefs")
     .cache_builder([](std::vector<XrefInfo>& c) { /* ... */ })
-    .column_int64("from_ea", [](const XrefInfo& r) { return r.from; })
-    .column_int64("to_ea", [](const XrefInfo& r) { return r.to; })
-    .filter_eq("to_ea", [](int64_t target) {
+    .column_int64("from_addr", [](const XrefInfo& r) { return r.from; })
+    .column_int64("to_addr", [](const XrefInfo& r) { return r.to; })
+    .filter_eq("to_addr", [](int64_t target) {
         return std::make_unique<XrefsToIterator>(target);
     }, 10.0, 5.0)  // cost=10, estimated_rows=5
     .build();
 ```
 
-With this filter, `SELECT * FROM xrefs WHERE to_ea = 0x401000` uses the native xref API instead of scanning all rows.
+With this filter, `SELECT * FROM xrefs WHERE to_addr = 0x401000` uses the native xref API instead of scanning all rows.
 
 ## HTTP Thinclient
 
@@ -310,7 +328,7 @@ libxsql is designed for building CLI tools that AI coding agents can query direc
 auto funcs = xsql::table("funcs")
     .count([&]() { return functions.size(); })
     .column_text("name", [&](size_t i) { return functions[i].name; })
-    .column_int64("address", [&](size_t i) { return functions[i].addr; })
+    .column_int64("addr", [&](size_t i) { return functions[i].addr; })
     .column_int("size", [&](size_t i) { return functions[i].size; })
     .build();
 
@@ -345,4 +363,14 @@ The agent writes SQL. Your tool executes it. No glue code required.
 
 ## License
 
-This project is licensed under the [Mozilla Public License 2.0](LICENSE).
+First-party libxsql material is source-available under the [Human-Origin Source License v1.0](LICENSE). This custom license is derived in structure from MPL-2.0, but it adds binding human-origin attribution, provenance, contribution-back, no-divergent-fork, and no-AI-cloning terms. It is not MPL-only and is not plain OSI-open-source.
+
+For additional permissions, including commercial modification, redistribution beyond the public grant, derivative licensing, private/internal modification rights, long-term maintenance forks, ports, derivative implementations, API-compatible replacements, rebrands, competing implementations, AI-assisted implementation mining, or other uses not granted by the public license, contact Elias Bachaalany for separate written permission.
+
+Permission requests: open a GitHub issue at [0xeb/libxsql/issues](https://github.com/0xeb/libxsql/issues).
+
+Contributors do not receive authority to grant license exceptions, private licenses, or derivative-use rights merely by submitting contributions unless Elias Bachaalany separately authorizes them in writing.
+
+See the `LICENSE` examples/FAQ section for common allowed uses, including package-manager distribution, benchmarking, AI-generated tests and AI-assisted patch preparation for contribution-back work, and independent development.
+
+Third-party vendored dependencies remain under their own licenses; see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

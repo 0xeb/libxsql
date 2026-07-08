@@ -1,9 +1,17 @@
+#
+# Copyright (c) 2024-2026 Elias Bachaalany
+# SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+#
+# This file is licensed under the Human-Origin Source License v1.0.
+# See LICENSE.
+#
+
 cmake_minimum_required(VERSION 3.20)
 
 # Enable CMAKE_MSVC_RUNTIME_LIBRARY support (required for IDA SDK compatibility)
 cmake_policy(SET CMP0091 NEW)
 
-project(libxsql VERSION 1.0.10 LANGUAGES C CXX)
+project(libxsql VERSION 1.0.11 LANGUAGES C CXX)
 
 # Detect if we're being built standalone or as part of a larger project
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -48,6 +56,10 @@ target_include_directories(xsql PUBLIC
 target_link_libraries(xsql PUBLIC sqlite3 nlohmann_json::nlohmann_json)
 
 target_compile_features(xsql PUBLIC cxx_std_17)
+
+# Expose the project version to headers (e.g. thinclient/cli.hpp --version) so the
+# printed version stays in sync with project(... VERSION ...) automatically.
+target_compile_definitions(xsql PUBLIC XSQL_VERSION_STRING="${PROJECT_VERSION}")
 
 # Enable PIC so the static library can be linked into shared objects (e.g. IDA plugins)
 set_target_properties(xsql PROPERTIES POSITION_INDEPENDENT_CODE ON)
