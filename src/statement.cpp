@@ -211,6 +211,23 @@ int Statement::bytes(int col) const {
 
 namespace detail {
 
+static std::string& authorizer_denial_slot() {
+    thread_local std::string message;
+    return message;
+}
+
+void set_authorizer_denial(std::string message) {
+    authorizer_denial_slot() = std::move(message);
+}
+
+void clear_authorizer_denial() {
+    authorizer_denial_slot().clear();
+}
+
+const std::string& authorizer_denial_message() {
+    return authorizer_denial_slot();
+}
+
 Statement prepare_statement(void* db_handle, const char* sql, std::string* error) {
     auto* db = reinterpret_cast<sqlite3*>(db_handle);
     if (!db) {
@@ -220,11 +237,21 @@ Statement prepare_statement(void* db_handle, const char* sql, std::string* error
         return Statement();
     }
 
+    // Clear any prior denial so the message reflects only THIS prepare; the
+    // write-surface authorizer (if installed) sets it during prepare_v2.
+    clear_authorizer_denial();
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
     if (!is_ok(rc)) {
         if (error) {
-            *error = sqlite3_errmsg(db);
+            // On an authorizer denial SQLite reports a fixed "not authorized";
+            // substitute the capability-scoped message the authorizer stashed so
+            // the caller sees WHY the write was refused (unsupported-write-surface handling).
+            if (rc == SQLITE_AUTH && !authorizer_denial_message().empty()) {
+                *error = authorizer_denial_message();
+            } else {
+                *error = sqlite3_errmsg(db);
+            }
         }
         if (stmt) {
             sqlite3_finalize(stmt);

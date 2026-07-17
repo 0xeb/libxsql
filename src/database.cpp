@@ -11,12 +11,26 @@
 #include <sqlite3.h>
 
 #include <chrono>
+#include <string>
+#include <unordered_map>
 
 namespace xsql {
+
+// Write capabilities of a registered table module, consulted by the prepare-time
+// write-surface authorizer (unsupported-write-surface handling).
+struct WriteCaps {
+    bool insertable = false;
+    bool deletable = false;
+    bool updatable = false;   // has at least one writable column
+};
 
 struct Database::Impl {
     sqlite3* db = nullptr;
     std::string last_error;
+    // module name -> caps (recorded at register time); SQL table name -> caps
+    // (mapped at create_table time, what the authorizer sees).
+    std::unordered_map<std::string, WriteCaps> module_caps;
+    std::unordered_map<std::string, WriteCaps> table_caps;
 };
 
 namespace {
@@ -79,6 +93,51 @@ void destroy_aggregate_fn_wrapper(void* ptr) {
     delete static_cast<AggregateFnWrapper*>(ptr);
 }
 
+// Prepare-time write-surface authorizer (unsupported-write-surface handling). Fires once per
+// DML action at prepare time, INDEPENDENT of how many rows match — so a 0-row
+// DELETE/UPDATE on an unwritable surface is denied consistently instead of
+// silently "succeeding" (xUpdate is never called when nothing matches). The
+// composed message is byte-identical to detail::unsupported_* so the matched-row
+// path and this 0-row path report the same actionable, capability-scoped error.
+int write_surface_authorizer(void* pArg, int action, const char* a1,
+                             const char* /*a2*/, const char* /*db_name*/,
+                             const char* /*trigger*/) {
+    const auto* table_caps =
+        static_cast<const std::unordered_map<std::string, WriteCaps>*>(pArg);
+    if (!table_caps || !a1) return SQLITE_OK;
+    if (action != SQLITE_INSERT && action != SQLITE_DELETE && action != SQLITE_UPDATE) {
+        return SQLITE_OK;
+    }
+    auto it = table_caps->find(a1);
+    if (it == table_caps->end()) return SQLITE_OK;   // not one of our vtables
+    const WriteCaps& caps = it->second;
+    const std::string table(a1);
+    std::string phrase;
+    const char* leaf = nullptr;
+    switch (action) {
+        case SQLITE_INSERT:
+            if (caps.insertable) return SQLITE_OK;
+            phrase = "INSERT INTO " + table + " is not supported";
+            leaf = "insert";
+            break;
+        case SQLITE_DELETE:
+            if (caps.deletable) return SQLITE_OK;
+            phrase = "DELETE FROM " + table + " is not supported";
+            leaf = "delete";
+            break;
+        case SQLITE_UPDATE:
+            if (caps.updatable) return SQLITE_OK;
+            phrase = "UPDATE " + table + " is not supported";
+            leaf = "*";
+            break;
+        default:
+            return SQLITE_OK;
+    }
+    detail::set_authorizer_denial(
+        phrase + " (capability mutation." + table + "." + leaf + " is unavailable)");
+    return SQLITE_DENY;
+}
+
 } // namespace
 
 void** AggregateContext::state_ptr() {
@@ -138,6 +197,12 @@ bool Database::open(const char* path) {
         return false;
     }
     impl_->last_error.clear();
+    impl_->module_caps.clear();
+    impl_->table_caps.clear();
+    // Install the write-surface authorizer. It reads impl_->table_caps live at
+    // prepare time (populated as tables are registered/created below), so a write
+    // to an unsupported surface is denied at prepare — including the 0-row case.
+    sqlite3_set_authorizer(impl_->db, write_surface_authorizer, &impl_->table_caps);
     register_builtin_aggregates(*this);
     return true;
 }
@@ -174,7 +239,24 @@ bool Database::create_table(const char* table_name, const char* module_name) {
         impl_->last_error = "Database not open";
         return false;
     }
-    return xsql::create_vtable(*this, table_name, module_name);
+    if (!xsql::create_vtable(*this, table_name, module_name)) {
+        return false;
+    }
+    // Map the SQL table name onto its module's write caps so the authorizer can
+    // gate DML against the name it actually sees.
+    if (table_name && module_name) {
+        auto it = impl_->module_caps.find(module_name);
+        if (it != impl_->module_caps.end()) {
+            impl_->table_caps[table_name] = it->second;
+        }
+    }
+    return true;
+}
+
+void Database::record_write_surface(const char* module_name, bool insertable,
+                                    bool deletable, bool updatable) {
+    if (!impl_ || !module_name) return;
+    impl_->module_caps[module_name] = WriteCaps{insertable, deletable, updatable};
 }
 
 bool Database::register_and_create_table(const VTableDef& def) {
@@ -433,9 +515,16 @@ Status Database::exec(const char* sql) {
         return Status::error;
     }
 
+    // sqlite3_exec runs its own prepare internally, so clear the denial slot
+    // first and, on an authorizer denial, surface the capability-scoped message
+    // rather than SQLite's fixed "not authorized" (unsupported-write-surface handling).
+    detail::clear_authorizer_denial();
     char* err = nullptr;
     int rc = sqlite3_exec(impl_->db, sql, nullptr, nullptr, &err);
-    if (err) {
+    if (rc == SQLITE_AUTH && !detail::authorizer_denial_message().empty()) {
+        impl_->last_error = detail::authorizer_denial_message();
+        if (err) sqlite3_free(err);
+    } else if (err) {
         impl_->last_error = err;
         sqlite3_free(err);
     } else if (!is_ok(rc)) {
@@ -456,9 +545,13 @@ int Database::exec(const char* sql, int (*callback)(void*, int, char**, char**),
         return to_sqlite_status(Status::error);
     }
 
+    detail::clear_authorizer_denial();
     char* err = nullptr;
     int rc = sqlite3_exec(impl_->db, sql, callback, data, &err);
-    if (err) {
+    if (rc == SQLITE_AUTH && !detail::authorizer_denial_message().empty()) {
+        impl_->last_error = detail::authorizer_denial_message();
+        if (err) sqlite3_free(err);
+    } else if (err) {
         impl_->last_error = err;
         sqlite3_free(err);
     } else if (!is_ok(rc)) {

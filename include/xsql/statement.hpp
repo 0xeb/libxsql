@@ -19,6 +19,15 @@ class Statement;
 
 namespace detail {
 Statement prepare_statement(void* db_handle, const char* sql, std::string* error);
+
+// Prepare-time authorizer denial message (thread-local). A sqlite3 authorizer
+// that denies an unsupported write stashes an actionable, capability-scoped
+// message here; prepare_statement substitutes it for SQLite's generic
+// "not authorized" text on an SQLITE_AUTH failure. See Database's write-surface
+// authorizer (unsupported-write-surface handling).
+void set_authorizer_denial(std::string message);
+void clear_authorizer_denial();
+const std::string& authorizer_denial_message();
 }
 
 enum class StepResult {

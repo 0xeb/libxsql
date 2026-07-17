@@ -62,6 +62,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <algorithm>
+#include <utility>
 
 namespace xsql {
 
@@ -226,8 +228,27 @@ constexpr int COUNT_ONLY_SCAN = -2;
 // Internal generator mode for required constraints that are missing.
 constexpr int MISSING_REQUIRED_CONSTRAINT = -3;
 
-// Index IDs start at INDEX_BASE (indexes are auto-generated filters)
+// Index IDs start at INDEX_BASE (indexes are auto-generated filters). An
+// equality index lookup uses idxNum = INDEX_BASE + index_pos.
 constexpr int INDEX_BASE = 1000;
+
+// Range (>=, >, <=, <, BETWEEN) pushdown on an indexed column. Encoded as
+//   idxNum = RANGE_BASE + index_pos * RANGE_STRIDE + range_flags
+// where range_flags is a 4-bit mask (RANGE_HAS_LOW/LOW_STRICT/HAS_HIGH/
+// HIGH_STRICT). RANGE_BASE sits ABOVE the equality index space so the two never
+// collide; index_pos * RANGE_STRIDE reserves 16 flag values per index. A range
+// plan always sets idxNum >= RANGE_BASE > 0, so "VIRTUAL TABLE INDEX 0 = full
+// scan" stays a valid discriminator and the EQ encoding (INDEX_BASE + pos) is
+// unchanged. argv order for a range plan is [low?, high?] (low first when both
+// bounds are present, matching how xBestIndex assigns argvIndex).
+constexpr int RANGE_BASE = 2000;
+constexpr int RANGE_STRIDE = 16;         // 4 flag bits per index slot
+constexpr int RANGE_HAS_LOW = 0x1;       // a lower bound (>= or >) is present
+constexpr int RANGE_LOW_STRICT = 0x2;    // lower bound is strict (>, not >=)
+constexpr int RANGE_HAS_HIGH = 0x4;      // an upper bound (<= or <) is present
+constexpr int RANGE_HIGH_STRICT = 0x8;   // upper bound is strict (<, not <=)
+constexpr int RANGE_FLAG_MASK = RANGE_HAS_LOW | RANGE_LOW_STRICT |
+                                RANGE_HAS_HIGH | RANGE_HIGH_STRICT;
 
 /**
  * Defines a filter for a specific column constraint.
@@ -565,6 +586,114 @@ inline int vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
     return to_sqlite_status(Status::ok);
 }
 
+namespace detail {
+
+// Apply an UPDATE's column setters, shared by all three vtab modules. A write to a
+// read-only column is rejected ("column X is read-only") rather than silently
+// dropped -- SQLite marks unchanged columns NOCHANGE, so a non-NOCHANGE value on a
+// non-writable column is a real write. The rejection is atomic (nothing applies if
+// any target is read-only). `nochange_eligible` MUST be false on reconstruct-by-argv
+// paths (update_from_column_values / no rowid resolution), where unchanged read-only
+// identity columns carry their real value in argv and are skipped, not rejected.
+// Setters apply in order and mutate live state that can't be cleanly rolled back, so
+// a later failure names the columns already applied.
+//
+// col_writable(i): column i is writable (has a usable setter)
+// col_name(i):     column i's name (const std::string&)
+// apply_col(i):    invoke column i's setter with argv[i+2]; return its bool result
+template <typename WritableFn, typename NameFn, typename ApplyFn>
+inline Status apply_update_columns(sqlite3_vtab* pVtab, int argc,
+                                   sqlite3_value** argv, size_t ncols,
+                                   bool nochange_eligible, WritableFn&& col_writable,
+                                   NameFn&& col_name, ApplyFn&& apply_col) {
+    // A fully read-only table keeps its historical per-module behavior (the simple
+    // VTableDef module no-ops such an UPDATE; the cached / row_lookup modules already
+    // returned read_only before here), so gate the pre-pass on the table having at
+    // least one writable column.
+    bool has_writable = false;
+    for (size_t c = 0; c < ncols; ++c) {
+        if (col_writable(c)) { has_writable = true; break; }
+    }
+
+    // Reject read-only writes before mutating anything (atomic).
+    if (nochange_eligible && has_writable) {
+        for (int i = 2; i < argc && static_cast<size_t>(i - 2) < ncols; ++i) {
+            if (sqlite3_value_nochange(argv[i])) continue;
+            const size_t c = static_cast<size_t>(i - 2);
+            if (!col_writable(c)) {
+                pVtab->zErrMsg = sqlite3_mprintf("column \"%s\" is read-only",
+                                                 col_name(c).c_str());
+                return Status::error;
+            }
+        }
+    }
+
+    // Apply writable setters in order, tracking which applied for a partial-failure
+    // message (the earlier ones can't be rolled back).
+    std::string applied;
+    for (int i = 2; i < argc && static_cast<size_t>(i - 2) < ncols; ++i) {
+        if (sqlite3_value_nochange(argv[i])) continue;
+        const size_t c = static_cast<size_t>(i - 2);
+        if (!col_writable(c)) continue;  // read-only on a non-eligible path: skip
+        clear_vtab_error();
+        if (!apply_col(c)) {
+            std::string err = get_vtab_error();
+            if (err.empty())
+                err = "UPDATE setter failed for column \"" + col_name(c) + "\"";
+            if (!applied.empty())
+                err += " (partial UPDATE: column(s) [" + applied +
+                       "] were already applied and cannot be rolled back)";
+            pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+            clear_vtab_error();
+            return Status::error;
+        }
+        if (!applied.empty()) applied += ", ";
+        applied += col_name(c);
+    }
+    return Status::ok;
+}
+
+// --- Capability-scoped errors for unsupported write surfaces -----------------
+//
+// A write to a surface/column that has no mutation support must NOT surface as
+// SQLite's generic "attempt to write a readonly database" — that implies the
+// whole database is read-only when in fact it is writable and only THIS surface
+// is not. Compose an actionable message naming the surface and the missing
+// capability (mutation.<table>.<leaf>, the convention every tool uses in its
+// `capabilities` table), and return SQLITE_ERROR (not SQLITE_READONLY) with it.
+// This is the matched-row half of the fix; the prepare-time authorizer produces
+// the identical message for the 0-row case so both report consistently.
+inline int unsupported_write_error(sqlite3_vtab* pVtab, std::string phrase,
+                                   const std::string& table, const char* leaf) {
+    phrase += " (capability mutation." + table + "." + leaf + " is unavailable)";
+    if (pVtab) pVtab->zErrMsg = sqlite3_mprintf("%s", phrase.c_str());
+    return to_sqlite_status(Status::error);
+}
+inline int unsupported_insert(sqlite3_vtab* pVtab, const std::string& table) {
+    return unsupported_write_error(pVtab, "INSERT INTO " + table + " is not supported",
+                                   table, "insert");
+}
+inline int unsupported_delete(sqlite3_vtab* pVtab, const std::string& table) {
+    return unsupported_write_error(pVtab, "DELETE FROM " + table + " is not supported",
+                                   table, "delete");
+}
+inline int unsupported_update(sqlite3_vtab* pVtab, const std::string& table) {
+    return unsupported_write_error(pVtab, "UPDATE " + table + " is not supported",
+                                   table, "*");
+}
+
+// True if any column has a usable setter (the table can service an UPDATE). Used
+// to record a table's write caps for the prepare-time authorizer.
+template <typename Def>
+inline bool def_has_writable_column(const Def* def) {
+    for (const auto& c : def->columns) {
+        if (c.writable && static_cast<bool>(c.set)) return true;
+    }
+    return false;
+}
+
+}  // namespace detail
+
 // xUpdate - handles INSERT, UPDATE, DELETE
 inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqlite3_int64*) {
     auto* vtab = reinterpret_cast<Vtab*>(pVtab);
@@ -573,7 +702,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
     // argc == 1: DELETE
     if (argc == 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
         if (!def->supports_delete || !def->delete_row) {
-            return to_sqlite_status(Status::read_only);
+            return detail::unsupported_delete(pVtab, def->name);
         }
 
         // A negative rowid cannot map to a valid 0-based row index; reject it
@@ -608,29 +737,20 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
             def->before_modify("UPDATE " + def->name);
         }
 
-        for (size_t i = 2; i < static_cast<size_t>(argc) && (i - 2) < def->columns.size(); ++i) {
-            if (sqlite3_value_nochange(argv[i])) continue;
-            size_t col_idx = i - 2;
-            const auto& col = def->columns[col_idx];
-            if (col.writable && col.set) {
-                clear_vtab_error();
-                if (!col.set(old_rowid, FunctionArg(argv[i]))) {
-                    const std::string& err = get_vtab_error();
-                    if (!err.empty()) {
-                        pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
-                    }
-                    clear_vtab_error();
-                    return to_sqlite_status(Status::error);
-                }
-            }
-        }
-        return to_sqlite_status(Status::ok);
+        // This module's xColumn always honors NOCHANGE, so a non-NOCHANGE value on a
+        // read-only column is a genuine write. See detail::apply_update_columns.
+        const Status st = detail::apply_update_columns(
+            pVtab, argc, argv, def->columns.size(), /*nochange_eligible=*/true,
+            [&](size_t c) { return def->columns[c].writable && static_cast<bool>(def->columns[c].set); },
+            [&](size_t c) -> const std::string& { return def->columns[c].name; },
+            [&](size_t c) { return def->columns[c].set(old_rowid, FunctionArg(argv[c + 2])); });
+        return to_sqlite_status(st);
     }
 
     // argc > 1, argv[0] == NULL: INSERT
     if (argc > 1 && sqlite3_value_type(argv[0]) == SQLITE_NULL) {
         if (!def->supports_insert || !def->insert_row) {
-            return to_sqlite_status(Status::read_only);
+            return detail::unsupported_insert(pVtab, def->name);
         }
 
         if (def->before_modify) {
@@ -724,7 +844,12 @@ inline bool create_vtable_sqlite(sqlite3* db, const char* table_name, const char
 } // namespace detail
 
 inline bool register_vtable(Database& db, const char* module_name, const VTableDef* def) {
-    return detail::register_vtable_sqlite(db.sqlite_handle(), module_name, def);
+    if (!detail::register_vtable_sqlite(db.sqlite_handle(), module_name, def)) return false;
+    db.record_write_surface(module_name,
+                            def->supports_insert && static_cast<bool>(def->insert_row),
+                            def->supports_delete && static_cast<bool>(def->delete_row),
+                            detail::def_has_writable_column(def));
+    return true;
 }
 
 inline bool create_vtable(Database& db, const char* table_name, const char* module_name) {
@@ -1055,6 +1180,19 @@ inline std::function<void(FunctionContext&, const RowData&)> row_getter_nullable
 }
 
 template<typename RowData>
+inline std::function<void(FunctionContext&, const RowData&)> row_getter_nullable_int(
+        std::function<std::optional<int>(const RowData&)> getter) {
+    return [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+        auto value = getter(row);
+        if (value.has_value()) {
+            ctx.result_int(*value);
+        } else {
+            ctx.result_null();
+        }
+    };
+}
+
+template<typename RowData>
 inline std::function<void(FunctionContext&, const RowData&)> row_getter_double(
         std::function<double(const RowData&)> getter) {
     return [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
@@ -1103,12 +1241,27 @@ struct CachedIndexDef {
     std::function<int64_t(const void*)> key_extractor;       // Extract key from row (type-erased)
 };
 
+// A per-index sorted view used ONLY for range (>=, >, <=, <, BETWEEN) pushdown.
+// The hash `indexes` above stays the sole structure for the hot equality path;
+// this parallel structure is built LAZILY on the first range query for an index
+// and then cached alongside the hash index (invalidated on the same rebuilds).
+// It is a sorted vector of (key, row-position) pairs so lower_bound/upper_bound
+// can carve out the matching window; duplicate keys sort together, so a
+// multi-match key is a contiguous run. `built` gates a one-time construction.
+struct SortedIndex {
+    std::vector<std::pair<int64_t, size_t>> entries;  // sorted by key ascending
+    bool built = false;
+};
+
 // Shared cache with indexes - lazily built, shared across all cursors
 template<typename RowData>
 struct SharedCache {
     std::vector<RowData> data;
     // Map from column value -> list of row indices in data
     std::vector<std::unordered_map<int64_t, std::vector<size_t>>> indexes;
+    // Parallel sorted views for range pushdown, one slot per hash index. Built on
+    // demand (first range query) under `mutex`, cleared whenever `indexes` is.
+    std::vector<SortedIndex> sorted_indexes;
     bool built = false;
     // Preserves row data while SQLite applies a scan-driven UPDATE/DELETE.
     bool mutation_snapshot = false;
@@ -1156,6 +1309,21 @@ struct CachedTableDef {
     // UPDATE/DELETE reconstruct via row_lookup(that id): without it a full-scan
     // rowid (cache position) and an iterator rowid (the key) would disagree.
     std::function<int64_t(const RowData&)> rowid_fn;
+
+    // Opt-IN: extend the query-scoped pre-mutation snapshot (see
+    // query_scoped_uses_mutation_snapshot) to a table that resolves its rowid via
+    // rowid_fn (and possibly row_lookup / a filter_eq iterator) rather than by
+    // cache position. Set this for a no_shared_cache table whose rowid encodes a
+    // SHIFTING identity -- e.g. types_members' packed (ordinal, member_index):
+    // once an earlier row in a multi-row UPDATE/DELETE moves/erases a member, the
+    // remaining scan rowids no longer map to their original members via LIVE
+    // row_lookup. With this flag the framework snapshots the full pre-mutation row
+    // set once per statement and resolves each rowid by matching rowid_fn over that
+    // stable snapshot; the delete/update handler then re-resolves the live object
+    // from the snapshot row's stable key (name/offset), so a member renamed within
+    // the same statement fails honestly instead of hitting the wrong member.
+    // Requires rowid_fn. No effect on shared-cache or read-only tables.
+    bool snapshot_mutations = false;
 
     // Opt-OUT of rowid-based UPDATE reconstruction + the SQLITE_NOCHANGE
     // optimization. Set this when the table's rowid is NOT a reliable lookup key
@@ -1218,6 +1386,7 @@ struct CachedTableDef {
 
         shared_cache->data.clear();
         shared_cache->indexes.clear();
+        shared_cache->sorted_indexes.clear();
         shared_cache->mutation_snapshot = false;
 
         // Build the cache
@@ -1226,14 +1395,19 @@ struct CachedTableDef {
             if (!get_vtab_error().empty()) {
                 shared_cache->data.clear();
                 shared_cache->indexes.clear();
+                shared_cache->sorted_indexes.clear();
                 shared_cache->built = false;
                 shared_cache->mutation_snapshot = false;
                 return;
             }
         }
 
-        // Build indexes
+        // Build the hash (equality) indexes eagerly -- the hot point-lookup path.
+        // The parallel sorted (range) views are built lazily on the first range query
+        // for each index, inline in xFilter's RANGE_BASE branch under this same cache
+        // mutex; here we only size the slot vector so those slots exist.
         shared_cache->indexes.resize(index_defs.size());
+        shared_cache->sorted_indexes.assign(index_defs.size(), SortedIndex{});
         for (size_t idx = 0; idx < index_defs.size(); ++idx) {
             auto& index_map = shared_cache->indexes[idx];
             const auto& key_fn = index_defs[idx].second;
@@ -1252,6 +1426,7 @@ struct CachedTableDef {
             std::lock_guard<std::mutex> lock(shared_cache->mutex);
             shared_cache->data.clear();
             shared_cache->indexes.clear();
+            shared_cache->sorted_indexes.clear();
             shared_cache->built = false;
             shared_cache->mutation_snapshot = false;
         }
@@ -1280,6 +1455,7 @@ inline void cached_table_invalidate_after_mutation(const CachedTableDef<RowData>
     if (!def || !def->shared_cache) return;
     std::lock_guard<std::mutex> lock(def->shared_cache->mutex);
     def->shared_cache->indexes.clear();
+    def->shared_cache->sorted_indexes.clear();
     def->shared_cache->built = false;
     def->shared_cache->mutation_snapshot = !def->shared_cache->data.empty();
 }
@@ -1298,12 +1474,23 @@ inline void cached_table_invalidate_after_mutation(const CachedTableDef<RowData>
 // read-only tables, and tables that reconstruct via row_lookup/rowid_fn.
 template<typename RowData>
 inline bool query_scoped_uses_mutation_snapshot(const CachedTableDef<RowData>* def) {
-    // Only full-scan tables: with a filter_eq iterator, a scan/update rowid can be
-    // iterator-local, not a global cache position, so a positional snapshot would
-    // resolve the wrong row. Such tables keep the per-xUpdate rebuild path.
-    return def && !def->use_shared_cache && !def->row_lookup && !def->rowid_fn &&
-           def->filters.empty() && def->cache_builder_fn &&
-           cached_table_has_scan_driven_mutation(def);
+    if (!def || def->use_shared_cache || !def->cache_builder_fn ||
+        !cached_table_has_scan_driven_mutation(def)) {
+        return false;
+    }
+    // Opt-in path: a table that resolves its rowid via rowid_fn matches the
+    // snapshot by KEY (rowid_fn over the pre-mutation rows), not by position, so
+    // it works even with a filter_eq iterator / row_lookup whose rowid is not a
+    // cache position. This is the fix for shifting-identity rowids (e.g.
+    // types_members' packed (ordinal, member_index)).
+    if (def->snapshot_mutations && def->rowid_fn) {
+        return true;
+    }
+    // Default positional path: full-scan rowid == cache position. A filter_eq
+    // iterator or a rowid_fn would make that rowid non-positional, so a positional
+    // snapshot would resolve the wrong row -- those tables keep the per-xUpdate
+    // rebuild path unless they opt in above.
+    return !def->row_lookup && !def->rowid_fn && def->filters.empty();
 }
 
 template<typename RowData>
@@ -1357,6 +1544,63 @@ inline bool like_constraint_has_usable_prefix(sqlite3_index_info* pInfo, int i) 
     const char c0 = static_cast<char>(text[0]);
     return c0 != '\0' && c0 != '%' && c0 != '_' && c0 != '\\';
 }
+
+// Build (once) the sorted (key,row) view for range pushdown from a data vector +
+// its key extractor. Entries are sorted ascending by key; a stable sort keeps a
+// deterministic per-key order (matching the data order for equal keys), so the
+// window a range carves is reproducible. Caller holds the cache/cursor lock.
+template<typename RowData>
+inline void build_sorted_index(SortedIndex& sorted,
+                               const std::vector<RowData>& data,
+                               const std::function<int64_t(const RowData&)>& key_fn) {
+    sorted.entries.clear();
+    sorted.entries.reserve(data.size());
+    for (size_t row = 0; row < data.size(); ++row) {
+        sorted.entries.emplace_back(key_fn(data[row]), row);
+    }
+    std::stable_sort(sorted.entries.begin(), sorted.entries.end(),
+                     [](const std::pair<int64_t, size_t>& a,
+                        const std::pair<int64_t, size_t>& b) {
+                         return a.first < b.first;
+                     });
+    sorted.built = true;
+}
+
+// Carve the [begin,end) window from a built sorted index honoring the range
+// flags + bounds and append the matching row positions to `out`. `low`/`high`
+// are only read when the corresponding RANGE_HAS_* flag is set.
+inline void collect_range_matches(const SortedIndex& sorted, int range_flags,
+                                  int64_t low, int64_t high,
+                                  std::vector<size_t>& out) {
+    const auto key_less = [](const std::pair<int64_t, size_t>& e, int64_t k) {
+        return e.first < k;
+    };
+    const auto key_greater = [](int64_t k, const std::pair<int64_t, size_t>& e) {
+        return k < e.first;
+    };
+    auto it_begin = sorted.entries.begin();
+    auto it_end = sorted.entries.end();
+    if (range_flags & RANGE_HAS_LOW) {
+        // >= low : first key not < low.  > low : first key not <= low (i.e. > low).
+        it_begin = std::lower_bound(sorted.entries.begin(), sorted.entries.end(),
+                                    low, key_less);
+        if (range_flags & RANGE_LOW_STRICT) {
+            // Skip the run equal to `low` (strict >): advance to first key > low.
+            it_begin = std::upper_bound(it_begin, sorted.entries.end(), low,
+                                        key_greater);
+        }
+    }
+    if (range_flags & RANGE_HAS_HIGH) {
+        // <= high : one past the last key not > high (upper_bound of high).
+        // < high  : first key not < high (lower_bound of high).
+        it_end = (range_flags & RANGE_HIGH_STRICT)
+                     ? std::lower_bound(it_begin, sorted.entries.end(), high, key_less)
+                     : std::upper_bound(it_begin, sorted.entries.end(), high, key_greater);
+    }
+    for (auto it = it_begin; it != it_end; ++it) {
+        out.push_back(it->second);
+    }
+}
 } // namespace detail
 
 template<typename RowData>
@@ -1380,6 +1624,11 @@ struct CachedCursor {
     bool using_index = false;
     const std::vector<size_t>* index_matches = nullptr;  // Points into *_indexes below
     size_t index_pos = 0;
+
+    // Range (>=, >, <=, <, BETWEEN) window: a cursor-owned list of row positions
+    // carved from the sorted index. When a range plan runs, index_matches points
+    // at this vector so xNext/xColumn/xRowid reuse the existing index machinery.
+    std::vector<size_t> range_matches;
     // Row data the index positions point into: shared_cache->data (shared tables)
     // or index_cache (query-scoped tables). Set per xFilter.
     const std::vector<RowData>* index_data_source = nullptr;
@@ -1393,6 +1642,17 @@ struct CachedCursor {
     std::vector<RowData> index_cache;
     std::vector<std::unordered_map<int64_t, std::vector<size_t>>> cursor_indexes;
     bool cursor_index_built = false;
+
+    // Cursor-owned copy of a shared-cache EQ lookup's matched rows. The old code
+    // stored pointers into the shared index map + data and read them across the
+    // statement without the cache mutex, so a concurrent invalidate/rebuild freed
+    // them (use-after-free). Copying under the lock keeps no shared pointer alive
+    // past xFilter; EQ matched-sets are small, so the copy is cheap.
+    std::vector<RowData> index_row_copy;
+    // Parallel sorted views for range pushdown on a query-scoped table, one slot
+    // per index, built lazily on the first range query against this cursor and
+    // reused thereafter (like cursor_indexes). Dropped with the cursor.
+    std::vector<SortedIndex> cursor_sorted_indexes;
 
     // Exact count-only/no-column full scan
     bool using_count_only = false;
@@ -1647,6 +1907,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
     cursor->using_index = false;
     cursor->index_matches = nullptr;
     cursor->index_pos = 0;
+    cursor->range_matches.clear();
     cursor->using_count_only = false;
     cursor->count_only_total = 0;
     cursor->cache.clear();
@@ -1723,6 +1984,121 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
             return to_sqlite_status(Status::ok);
         }
 
+        // Check for a range (>=, >, <=, <, BETWEEN) plan on an indexed column.
+        // RANGE_BASE sits above INDEX_BASE, so this must be tested BEFORE the
+        // equality-index branch below. The sorted view is built lazily here and
+        // cached (shared cache for shared tables, per-cursor for query-scoped).
+        if (idxNum >= RANGE_BASE) {
+            const int encoded = idxNum - RANGE_BASE;
+            const int index_pos = encoded / RANGE_STRIDE;
+            const int range_flags = encoded & RANGE_FLAG_MASK;
+            const auto& index_defs = cursor->def->index_defs;
+            if (index_pos >= 0 && static_cast<size_t>(index_pos) < index_defs.size()) {
+                // Decode bounds from argv in the order xBestIndex assigned argvIndex:
+                // low first (if present), then high. Track the next slot to consume so
+                // a high-only range still reads argv[0].
+                int slot = 0;
+                int64_t low = 0, high = 0;
+                if (range_flags & RANGE_HAS_LOW) {
+                    if (slot < argc) low = FunctionArg(argv[slot]).as_int64();
+                    ++slot;
+                }
+                if (range_flags & RANGE_HAS_HIGH) {
+                    if (slot < argc) high = FunctionArg(argv[slot]).as_int64();
+                }
+                clear_vtab_error();
+                if (cursor->def->use_shared_cache) {
+                    cursor->def->ensure_cache_built();
+                    if (!get_vtab_error().empty()) {
+                        return return_vtab_error(pCursor->pVtab);
+                    }
+                    const auto& shared = cursor->def->shared_cache;
+                    if (shared) {
+                        // The shared cache is engine-lifetime and shared across
+                        // connections, so the lazy sorted-view build (writer) and the
+                        // window collect (reader) MUST run under the cache mutex --
+                        // otherwise two connections range-querying the same index race
+                        // on the same std::vector. Take the lock BEFORE reading
+                        // `built`/`sorted_indexes` so a concurrent invalidate (which
+                        // clears them under the same mutex) cannot land between the
+                        // check and the indexed access (TOCTOU -> OOB). The matched
+                        // rows are then COPIED into cursor-owned storage under this
+                        // lock (see below), so no pointer into shared->data survives
+                        // past the lock.
+                        std::lock_guard<std::mutex> lock(shared->mutex);
+                        if (shared->built &&
+                            static_cast<size_t>(index_pos) < shared->sorted_indexes.size()) {
+                            auto& sorted = shared->sorted_indexes[index_pos];
+                            if (!sorted.built) {
+                                detail::build_sorted_index(sorted, shared->data,
+                                                           index_defs[index_pos].second);
+                            }
+                            cursor->range_matches.clear();
+                            detail::collect_range_matches(sorted, range_flags, low, high,
+                                                          cursor->range_matches);
+                            // Copy the matched rows into cursor-owned storage under the
+                            // cache mutex, then remap range_matches to local indices, so
+                            // index_data_source never points into shared->data past this
+                            // lock. The old code set index_data_source = &shared->data and
+                            // dereferenced it UNLOCKED during xColumn/xRowid iteration; a
+                            // concurrent invalidate/rebuild clears+reallocates shared->data
+                            // under this same mutex, so that read was a use-after-free /
+                            // data race (mirrors the EQ branch's fix below).
+                            // collect_range_matches only emits positions valid for the
+                            // current shared->data (built under this lock).
+                            cursor->index_row_copy.clear();
+                            cursor->index_row_copy.reserve(cursor->range_matches.size());
+                            for (size_t& slot : cursor->range_matches) {
+                                cursor->index_row_copy.push_back(shared->data[slot]);
+                                slot = cursor->index_row_copy.size() - 1;
+                            }
+                            cursor->using_index = true;
+                            cursor->index_matches = &cursor->range_matches;
+                            cursor->index_data_source = &cursor->index_row_copy;
+                            cursor->index_pos = 0;
+                            return to_sqlite_status(Status::ok);
+                        }
+                    }
+                } else if (cursor->def->cache_builder_fn) {
+                    // Query-scoped: build the per-cursor cache once (reused across
+                    // this cursor's xFilter calls), then the sorted view on demand.
+                    if (!cursor->cursor_index_built) {
+                        cursor->index_cache.clear();
+                        cursor->def->cache_builder_fn(cursor->index_cache);
+                        if (!get_vtab_error().empty()) {
+                            cursor->index_cache.clear();
+                            return return_vtab_error(pCursor->pVtab);
+                        }
+                        cursor->cursor_indexes.assign(index_defs.size(), {});
+                        for (size_t ix = 0; ix < index_defs.size(); ++ix) {
+                            auto& index_map = cursor->cursor_indexes[ix];
+                            const auto& key_fn = index_defs[ix].second;
+                            for (size_t row = 0; row < cursor->index_cache.size(); ++row) {
+                                index_map[key_fn(cursor->index_cache[row])].push_back(row);
+                            }
+                        }
+                        cursor->cursor_index_built = true;
+                    }
+                    if (cursor->cursor_sorted_indexes.size() != index_defs.size()) {
+                        cursor->cursor_sorted_indexes.assign(index_defs.size(), SortedIndex{});
+                    }
+                    auto& sorted = cursor->cursor_sorted_indexes[index_pos];
+                    if (!sorted.built) {
+                        detail::build_sorted_index(sorted, cursor->index_cache,
+                                                   index_defs[index_pos].second);
+                    }
+                    cursor->range_matches.clear();
+                    detail::collect_range_matches(sorted, range_flags, low, high,
+                                                  cursor->range_matches);
+                    cursor->using_index = true;
+                    cursor->index_matches = &cursor->range_matches;
+                    cursor->index_data_source = &cursor->index_cache;
+                    cursor->index_pos = 0;
+                    return to_sqlite_status(Status::ok);
+                }
+            }
+        }
+
         // Check for index-based lookup (idxNum >= INDEX_BASE)
         if (idxNum >= INDEX_BASE) {
             int index_pos = idxNum - INDEX_BASE;
@@ -1736,15 +2112,35 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                         return return_vtab_error(pCursor->pVtab);
                     }
                     const auto& shared = cursor->def->shared_cache;
-                    if (shared && shared->built && static_cast<size_t>(index_pos) < shared->indexes.size()) {
-                        int64_t key = FunctionArg(argv[0]).as_int64();
-                        auto it = shared->indexes[index_pos].find(key);
-                        cursor->using_index = true;
-                        cursor->index_matches =
-                            (it != shared->indexes[index_pos].end()) ? &it->second : nullptr;
-                        cursor->index_data_source = &shared->data;
-                        cursor->index_pos = 0;
-                        return to_sqlite_status(Status::ok);
+                    if (shared) {
+                        // Take the cache mutex and copy the matched rows into
+                        // cursor-owned storage. The old code stored pointers into the
+                        // shared index map + data and read them across the statement
+                        // without this lock, so a concurrent invalidate/rebuild freed
+                        // them (use-after-free). Re-check `built` under the lock.
+                        std::lock_guard<std::mutex> lock(shared->mutex);
+                        if (shared->built &&
+                            static_cast<size_t>(index_pos) < shared->indexes.size()) {
+                            int64_t key = FunctionArg(argv[0]).as_int64();
+                            auto it = shared->indexes[index_pos].find(key);
+                            cursor->index_row_copy.clear();
+                            cursor->range_matches.clear();
+                            if (it != shared->indexes[index_pos].end()) {
+                                cursor->index_row_copy.reserve(it->second.size());
+                                for (size_t pos : it->second) {
+                                    if (pos < shared->data.size()) {
+                                        cursor->range_matches.push_back(
+                                            cursor->index_row_copy.size());
+                                        cursor->index_row_copy.push_back(shared->data[pos]);
+                                    }
+                                }
+                            }
+                            cursor->using_index = true;
+                            cursor->index_matches = &cursor->range_matches;
+                            cursor->index_data_source = &cursor->index_row_copy;
+                            cursor->index_pos = 0;
+                            return to_sqlite_status(Status::ok);
+                        }
                     }
                 } else if (cursor->def->cache_builder_fn) {
                     // Query-scoped table: build the per-cursor cache + hash indexes
@@ -1857,6 +2253,17 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
     int best_rowid_constraint_idx = -1;
     double best_cost = 1e9;
 
+    // Range-pushdown candidate: the lower/upper bound constraints that target a
+    // single indexed column. SQLite delivers `x BETWEEN a AND b` as a GE + an LE
+    // constraint on the same column, so a lower and an upper bound on the SAME
+    // indexed column are consumed together (two argv slots). A range plan is only
+    // chosen when NO equality index/filter won (equality is strictly cheaper).
+    int range_index_pos = -1;         // indexed column carrying the range
+    int range_low_constraint_idx = -1;
+    int range_high_constraint_idx = -1;
+    bool range_low_strict = false;    // GT (>) vs GE (>=)
+    bool range_high_strict = false;   // LT (<) vs LE (<=)
+
     auto estimate_full_scan_rows = [&]() -> size_t {
         size_t estimated_rows = 1000;
         if (def->estimate_rows_fn) {
@@ -1864,6 +2271,10 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         }
         return estimated_rows;
     };
+
+    // A range is only served off a sorted view, which needs the cache: shared
+    // tables (engine-lifetime) or query-scoped tables with a cache_builder.
+    const bool range_eligible = def->use_shared_cache || def->cache_builder_fn;
 
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
@@ -1873,6 +2284,29 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         const bool is_eq = (op == SQLITE_INDEX_CONSTRAINT_EQ);
         const bool is_like = (op == SQLITE_INDEX_CONSTRAINT_LIKE ||
                               op == SQLITE_INDEX_CONSTRAINT_GLOB);
+        const bool is_low = (op == SQLITE_INDEX_CONSTRAINT_GE ||
+                             op == SQLITE_INDEX_CONSTRAINT_GT);
+        const bool is_high = (op == SQLITE_INDEX_CONSTRAINT_LE ||
+                              op == SQLITE_INDEX_CONSTRAINT_LT);
+
+        // Range (>=, >, <=, <) on an indexed column: record the tightest bound(s)
+        // for a single indexed column. Only pursued if no equality lookup wins.
+        if ((is_low || is_high) && range_eligible && constraint.iColumn >= 0) {
+            const int idx_pos = def->find_index(constraint.iColumn);
+            if (idx_pos >= 0 &&
+                (range_index_pos < 0 || range_index_pos == idx_pos)) {
+                range_index_pos = idx_pos;
+                if (is_low && range_low_constraint_idx < 0) {
+                    range_low_constraint_idx = i;
+                    range_low_strict = (op == SQLITE_INDEX_CONSTRAINT_GT);
+                } else if (is_high && range_high_constraint_idx < 0) {
+                    range_high_constraint_idx = i;
+                    range_high_strict = (op == SQLITE_INDEX_CONSTRAINT_LT);
+                }
+            }
+            continue;
+        }
+
         if (!is_eq && !is_like) continue;
 
         if (constraint.iColumn < 0) {
@@ -1960,6 +2394,44 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         pInfo->idxNum = best_filter->filter_id;
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
+    } else if (range_index_pos >= 0 &&
+               (range_low_constraint_idx >= 0 || range_high_constraint_idx >= 0)) {
+        // Range plan on an indexed column: cheaper than a full scan (a sorted-view
+        // window), pricier than an EQ point lookup. A two-bound (BETWEEN) window
+        // is tighter than a one-bound half-scan, so it costs less. The bounds are
+        // handled EXACTLY by the sorted-view carve (strict/inclusive honored), so
+        // the consumed constraints are omitted (SQLite need not re-check them).
+        int range_flags = 0;
+        int argv_slot = 1;
+        if (range_low_constraint_idx >= 0) {
+            range_flags |= RANGE_HAS_LOW;
+            if (range_low_strict) range_flags |= RANGE_LOW_STRICT;
+            pInfo->aConstraintUsage[range_low_constraint_idx].argvIndex = argv_slot++;
+            pInfo->aConstraintUsage[range_low_constraint_idx].omit = 1;
+        }
+        if (range_high_constraint_idx >= 0) {
+            range_flags |= RANGE_HAS_HIGH;
+            if (range_high_strict) range_flags |= RANGE_HIGH_STRICT;
+            pInfo->aConstraintUsage[range_high_constraint_idx].argvIndex = argv_slot++;
+            pInfo->aConstraintUsage[range_high_constraint_idx].omit = 1;
+        }
+        const size_t estimated_rows = estimate_full_scan_rows();
+        const bool two_bound =
+            (range_low_constraint_idx >= 0 && range_high_constraint_idx >= 0);
+        // Fraction-of-scan heuristic: a two-sided window is assumed to select ~1/4
+        // of rows, a one-sided ~1/2. Always strictly below the full-scan cost so a
+        // pushed range beats the scan, and above the EQ cost of 1.0.
+        const double frac = two_bound ? 0.25 : 0.5;
+        const double full_cost = static_cast<double>(estimated_rows);
+        double range_cost = 2.0 + full_cost * frac;
+        // Keep the range strictly cheaper than a full scan even on tiny tables so
+        // the planner prefers the pushed window (and the plan reports a virtual
+        // index, not INDEX 0). Never dip to/below the EQ point-lookup cost (1.0).
+        if (range_cost >= full_cost) range_cost = std::max(1.5, full_cost * 0.75);
+        pInfo->idxNum = RANGE_BASE + range_index_pos * RANGE_STRIDE + range_flags;
+        pInfo->estimatedCost = range_cost;
+        pInfo->estimatedRows = static_cast<sqlite3_int64>(
+            estimated_rows > 0 ? static_cast<size_t>(estimated_rows * frac) + 1 : 1);
     } else {
         // No filter or index - full scan
         size_t estimated_rows = estimate_full_scan_rows();
@@ -1978,7 +2450,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
     // argc == 1: DELETE
     if (argc == 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
         if (!def->supports_delete || !def->delete_row) {
-            return to_sqlite_status(Status::read_only);
+            return detail::unsupported_delete(pVtab, def->name);
         }
 
         const int64_t raw_rowid = sqlite3_value_int64(argv[0]);
@@ -2004,7 +2476,17 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             !def->update_from_column_values &&
             (((!def->rowid_fn) && def->use_shared_cache) || static_cast<bool>(def->row_lookup));
 
-        if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
+        if (def->snapshot_mutations && def->rowid_fn && shared && shared->mutation_snapshot) {
+            // Opt-in snapshot (shifting-identity rowid): resolve by matching
+            // rowid_fn over the STABLE pre-mutation snapshot, so a multi-row DELETE
+            // targets the row identified at scan time even after earlier rows
+            // shifted live positions. Terminal: if no snapshot row matches (the
+            // identity changed within this statement) fail honestly rather than
+            // resolving live (which would hit the wrong row).
+            for (auto& snap_row : shared->data) {
+                if (def->rowid_fn(snap_row) == raw_rowid) { row_ptr = &snap_row; break; }
+            }
+        } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
             raw_rowid >= 0 && rowid < shared->data.size()) {
             row_ptr = &shared->data[rowid];
         } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->mutation_snapshot &&
@@ -2059,7 +2541,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         for (const auto& col : def->columns) {
             if (col.writable && col.set) { has_writable = true; break; }
         }
-        if (!has_writable) return to_sqlite_status(Status::read_only);
+        if (!has_writable) return detail::unsupported_update(pVtab, def->name);
 
         // Snapshot before the before_modify hook (same order as DELETE): a
         // failed snapshot aborts the statement before any observable side
@@ -2091,7 +2573,17 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             (((!def->rowid_fn) && def->use_shared_cache) || static_cast<bool>(def->row_lookup)
              || detail::query_scoped_uses_mutation_snapshot(def));
 
-        if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
+        if (def->snapshot_mutations && def->rowid_fn && shared && shared->mutation_snapshot) {
+            // Opt-in snapshot (shifting-identity rowid, see DELETE): resolve by
+            // matching rowid_fn over the STABLE pre-mutation snapshot so a multi-row
+            // UPDATE targets the scan-time row even after earlier rows shifted live
+            // indices. NOCHANGE stays enabled (reconstruct_by_rowid is true), so the
+            // snapshot row supplies unchanged columns. Terminal: no match => the
+            // identity changed within this statement; fail honestly.
+            for (auto& snap_row : shared->data) {
+                if (def->rowid_fn(snap_row) == raw_rowid) { row_ptr = &snap_row; break; }
+            }
+        } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
             raw_rowid >= 0 && old_rowid < shared->data.size()) {
             // Positional shared-cache reconstruction -- valid only when the rowid
             // is a cache position: not opted out (reconstruct_by_rowid) and no
@@ -2152,22 +2644,15 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             return to_sqlite_status(Status::read_only);
         }
 
-        for (size_t i = 2; i < static_cast<size_t>(argc) && (i - 2) < def->columns.size(); ++i) {
-            if (sqlite3_value_nochange(argv[i])) continue;
-            size_t col_idx = i - 2;
-            const auto& col = def->columns[col_idx];
-            if (col.writable && col.set) {
-                clear_vtab_error();
-                if (!col.set(*row_ptr, FunctionArg(argv[i]))) {
-                    const std::string& err = get_vtab_error();
-                    if (!err.empty()) {
-                        pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
-                    }
-                    clear_vtab_error();
-                    return to_sqlite_status(Status::error);
-                }
-            }
-        }
+        // reconstruct_by_rowid is exactly the xColumn NOCHANGE gate: on reconstruct-
+        // by-argv paths read-only identity columns carry real values, so they are
+        // skipped (historical behavior), not rejected as read-only writes.
+        const Status st = detail::apply_update_columns(
+            pVtab, argc, argv, def->columns.size(), reconstruct_by_rowid,
+            [&](size_t c) { return def->columns[c].writable && static_cast<bool>(def->columns[c].set); },
+            [&](size_t c) -> const std::string& { return def->columns[c].name; },
+            [&](size_t c) { return def->columns[c].set(*row_ptr, FunctionArg(argv[c + 2])); });
+        if (st != Status::ok) return to_sqlite_status(st);
         detail::cached_table_invalidate_after_mutation(def);
         if (def->after_modify) def->after_modify("UPDATE " + def->name);
         return to_sqlite_status(Status::ok);
@@ -2176,7 +2661,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
     // argc > 1, argv[0] == NULL: INSERT
     if (argc > 1 && sqlite3_value_type(argv[0]) == SQLITE_NULL) {
         if (!def->supports_insert || !def->insert_row) {
-            return to_sqlite_status(Status::read_only);
+            return detail::unsupported_insert(pVtab, def->name);
         }
 
         if (def->before_modify) {
@@ -2254,7 +2739,13 @@ template<typename RowData>
 inline bool register_cached_vtable(Database& db,
                                    const char* module_name,
                                    const CachedTableDef<RowData>* def) {
-    return detail::register_cached_vtable_sqlite<RowData>(db.sqlite_handle(), module_name, def);
+    if (!detail::register_cached_vtable_sqlite<RowData>(db.sqlite_handle(), module_name, def))
+        return false;
+    db.record_write_surface(module_name,
+                            def->supports_insert && static_cast<bool>(def->insert_row),
+                            def->supports_delete && static_cast<bool>(def->delete_row),
+                            detail::def_has_writable_column(def));
+    return true;
 }
 
 // Cached Table Builder
@@ -2393,6 +2884,41 @@ public:
         return *this;
     }
 
+    // Writable integer column whose getter may report SQL NULL (returns
+    // std::nullopt). Mirrors column_text_nullable_rw for the integer type — used
+    // where a mapped-but-unknown value must read back as NULL rather than 0.
+    CachedTableBuilder& column_int_nullable_rw(
+                                        const char* name,
+                                        std::function<std::optional<int>(const RowData&)> getter,
+                                        std::function<bool(RowData&, FunctionArg)> setter) {
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, true,
+            detail::row_getter_nullable_int<RowData>(std::move(getter)), std::move(setter)));
+        return *this;
+    }
+
+    // Read-only integer column whose getter may report SQL NULL (std::nullopt).
+    // Read-only sibling of column_int_nullable_rw.
+    CachedTableBuilder& column_int_nullable(
+                                        const char* name,
+                                        std::function<std::optional<int>(const RowData&)> getter) {
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Integer, false,
+            detail::row_getter_nullable_int<RowData>(std::move(getter))));
+        return *this;
+    }
+
+    // Read-only text column whose getter may report SQL NULL (std::nullopt).
+    // Read-only sibling of column_text_nullable_rw.
+    CachedTableBuilder& column_text_nullable(
+                                        const char* name,
+                                        std::function<std::optional<std::string>(const RowData&)> getter) {
+        def_.columns.push_back(detail::make_row_column<RowData>(
+            name, ColumnType::Text, false,
+            detail::row_getter_nullable_text<RowData>(std::move(getter))));
+        return *this;
+    }
+
     CachedTableBuilder& column_text_rw(const char* name,
                                         std::function<std::string(const RowData&)> getter,
                                         std::function<bool(RowData&, const char*)> setter) {
@@ -2487,6 +3013,15 @@ public:
         return *this;
     }
 
+    // Opt in to the pre-mutation snapshot for a rowid_fn table whose rowid encodes
+    // a shifting identity (see CachedTableDef::snapshot_mutations). Requires a
+    // rowid_fn -- a multi-row UPDATE/DELETE then resolves each rowid against the
+    // stable pre-mutation snapshot instead of live (already-shifted) state.
+    CachedTableBuilder& snapshot_mutations(bool value = true) {
+        def_.snapshot_mutations = value;
+        return *this;
+    }
+
     /**
      * Opt OUT of rowid-based UPDATE reconstruction + the SQLITE_NOCHANGE
      * optimization. Set this when the table's rowid is NOT a reliable lookup key
@@ -2527,6 +3062,14 @@ public:
      * @param column_name Name of the column to index (must be int64)
      * @param key_extractor Function to extract the key from a row
      * @return Reference to builder for chaining
+     *
+     * INVARIANT: the extractor MUST return the RAW value of the named column --
+     * the same int64 SQLite sees for that column, with no transformation (no
+     * scaling, masking, remapping, or derived value). Both equality (WHERE col =
+     * ?) and range (WHERE col >= ? / BETWEEN) constraints on this column are
+     * OMITTED from SQLite's re-check on this basis (see xBestIndex: omit=1), so a
+     * non-raw extractor would make the pushed window disagree with the WHERE
+     * predicate and return wrong rows. All current consumers satisfy this.
      *
      * Example:
      *   .index_on("to_ea", [](const XrefInfo& r) { return r.to_ea; })
@@ -3170,7 +3713,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
     // argc == 1: DELETE
     if (argc == 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
         if (!def->supports_delete || !def->delete_row || !def->row_lookup) {
-            return to_sqlite_status(Status::read_only);
+            return detail::unsupported_delete(pVtab, def->name);
         }
 
         RowData row{};
@@ -3212,7 +3755,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
             }
         }
         if (!has_writable || !def->row_lookup) {
-            return to_sqlite_status(Status::read_only);
+            return detail::unsupported_update(pVtab, def->name);
         }
 
         RowData row{};
@@ -3231,21 +3774,15 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
             def->before_modify("UPDATE " + def->name);
         }
 
-        for (size_t i = 2; i < static_cast<size_t>(argc) && (i - 2) < def->columns.size(); ++i) {
-            if (sqlite3_value_nochange(argv[i])) continue;
-            const auto& col = def->columns[i - 2];
-            if (col.writable && col.set) {
-                clear_vtab_error();
-                if (!col.set(row, FunctionArg(argv[i]))) {
-                    const std::string& err = get_vtab_error();
-                    if (!err.empty()) {
-                        pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
-                    }
-                    clear_vtab_error();
-                    return to_sqlite_status(Status::error);
-                }
-            }
-        }
+        // This module's xColumn always honors NOCHANGE (the row is resolved via
+        // row_lookup, not argv), so a non-NOCHANGE value on a read-only column is a
+        // genuine write.
+        const Status st = detail::apply_update_columns(
+            pVtab, argc, argv, def->columns.size(), /*nochange_eligible=*/true,
+            [&](size_t c) { return def->columns[c].writable && static_cast<bool>(def->columns[c].set); },
+            [&](size_t c) -> const std::string& { return def->columns[c].name; },
+            [&](size_t c) { return def->columns[c].set(row, FunctionArg(argv[c + 2])); });
+        if (st != Status::ok) return to_sqlite_status(st);
 
         if (def->after_modify) def->after_modify("UPDATE " + def->name);
         return to_sqlite_status(Status::ok);
@@ -3254,7 +3791,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
     // argc > 1, argv[0] == NULL: INSERT
     if (argc > 1 && sqlite3_value_type(argv[0]) == SQLITE_NULL) {
         if (!def->supports_insert || !def->insert_row) {
-            return to_sqlite_status(Status::read_only);
+            return detail::unsupported_insert(pVtab, def->name);
         }
 
         if (def->before_modify) {
@@ -3283,8 +3820,17 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
     return to_sqlite_status(Status::read_only);
 }
 
-inline int generator_vtab_read_only_update(sqlite3_vtab*, int, sqlite3_value**, sqlite3_int64*) {
-    return to_sqlite_status(Status::read_only);
+inline int generator_vtab_read_only_update(sqlite3_vtab* pVtab, int, sqlite3_value**, sqlite3_int64*) {
+    // A fully read-only generator table has no write capability at all. Report
+    // the surface as read-only rather than SQLite's generic "attempt to write a
+    // readonly database" (which misleadingly implies the whole DB is read-only).
+    // (This module is shared across row types, so the table name is not reachable
+    // here; the message names the surface generically.)
+    if (pVtab) {
+        pVtab->zErrMsg = sqlite3_mprintf(
+            "%s", "this table is read-only (no write capability)");
+    }
+    return to_sqlite_status(Status::error);
 }
 
 template<typename RowData>
@@ -3345,7 +3891,16 @@ template<typename RowData>
 inline bool register_generator_vtable(Database& db,
                                       const char* module_name,
                                       const GeneratorTableDef<RowData>* def) {
-    return detail::register_generator_vtable_sqlite<RowData>(db.sqlite_handle(), module_name, def);
+    if (!detail::register_generator_vtable_sqlite<RowData>(db.sqlite_handle(), module_name, def))
+        return false;
+    // A generator DELETE/UPDATE additionally requires a row_lookup to resolve the
+    // target row (see generator_vtab_update), so those caps are gated on it.
+    const bool has_lookup = static_cast<bool>(def->row_lookup);
+    db.record_write_surface(module_name,
+                            def->supports_insert && static_cast<bool>(def->insert_row),
+                            def->supports_delete && static_cast<bool>(def->delete_row) && has_lookup,
+                            detail::def_has_writable_column(def) && has_lookup);
+    return true;
 }
 
 // Generator Table Builder

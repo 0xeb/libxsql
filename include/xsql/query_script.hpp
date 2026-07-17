@@ -56,6 +56,15 @@ struct ScriptStatementResult {
     std::string error;   // empty when success
     std::string sql;     // populated only when ScriptOptions::include_sql
 
+    // Timeout / partial-result signalling. A statement that hit the query deadline
+    // may still `success` with a truncated row set; without these an agent reading
+    // the envelope cannot tell a partial answer from a complete one. `warnings`
+    // carries any non-fatal notices. Executors that don't populate them leave the
+    // defaults, so the emitted JSON simply omits the fields (back-compatible).
+    bool timed_out = false;
+    bool partial = false;
+    std::vector<std::string> warnings;
+
     bool is_null_cell(std::size_t row_index, std::size_t col_index) const {
         if (row_index >= rows.size()) return false;
         if (col_index >= rows[row_index].size()) return false;
@@ -166,25 +175,116 @@ inline ScriptResult run_script(const std::string& script,
 
 namespace detail {
 
+inline bool json_is_utf8_continuation(unsigned char ch) {
+    return (ch & 0xC0U) == 0x80U;
+}
+
+// Validate the UTF-8 sequence starting at `pos`. On success sets `seq_len` to the
+// byte length (1..4) and returns true; on any malformed/overlong/surrogate/
+// truncated sequence returns false. Rejects overlong forms and UTF-16 surrogates
+// (0xED 0xA0..0xBF) so the emitted JSON is always well-formed UTF-8.
+inline bool json_is_valid_utf8_sequence(const std::string& input, size_t pos, size_t& seq_len) {
+    seq_len = 0;
+    if (pos >= input.size()) return false;
+    const unsigned char c0 = static_cast<unsigned char>(input[pos]);
+    if (c0 < 0x80U) { seq_len = 1; return true; }
+
+    if (c0 >= 0xC2U && c0 <= 0xDFU) {
+        if (pos + 1 >= input.size()) return false;
+        if (!json_is_utf8_continuation(static_cast<unsigned char>(input[pos + 1]))) return false;
+        seq_len = 2;
+        return true;
+    }
+    if (c0 == 0xE0U) {
+        if (pos + 2 >= input.size()) return false;
+        const unsigned char c1 = static_cast<unsigned char>(input[pos + 1]);
+        const unsigned char c2 = static_cast<unsigned char>(input[pos + 2]);
+        if (c1 < 0xA0U || c1 > 0xBFU || !json_is_utf8_continuation(c2)) return false;
+        seq_len = 3;
+        return true;
+    }
+    if ((c0 >= 0xE1U && c0 <= 0xECU) || (c0 >= 0xEEU && c0 <= 0xEFU)) {
+        if (pos + 2 >= input.size()) return false;
+        if (!json_is_utf8_continuation(static_cast<unsigned char>(input[pos + 1]))
+            || !json_is_utf8_continuation(static_cast<unsigned char>(input[pos + 2]))) return false;
+        seq_len = 3;
+        return true;
+    }
+    if (c0 == 0xEDU) {
+        if (pos + 2 >= input.size()) return false;
+        const unsigned char c1 = static_cast<unsigned char>(input[pos + 1]);
+        const unsigned char c2 = static_cast<unsigned char>(input[pos + 2]);
+        if (c1 < 0x80U || c1 > 0x9FU || !json_is_utf8_continuation(c2)) return false;
+        seq_len = 3;
+        return true;
+    }
+    if (c0 == 0xF0U) {
+        if (pos + 3 >= input.size()) return false;
+        const unsigned char c1 = static_cast<unsigned char>(input[pos + 1]);
+        const unsigned char c2 = static_cast<unsigned char>(input[pos + 2]);
+        const unsigned char c3 = static_cast<unsigned char>(input[pos + 3]);
+        if (c1 < 0x90U || c1 > 0xBFU || !json_is_utf8_continuation(c2)
+            || !json_is_utf8_continuation(c3)) return false;
+        seq_len = 4;
+        return true;
+    }
+    if (c0 >= 0xF1U && c0 <= 0xF3U) {
+        if (pos + 3 >= input.size()) return false;
+        if (!json_is_utf8_continuation(static_cast<unsigned char>(input[pos + 1]))
+            || !json_is_utf8_continuation(static_cast<unsigned char>(input[pos + 2]))
+            || !json_is_utf8_continuation(static_cast<unsigned char>(input[pos + 3]))) return false;
+        seq_len = 4;
+        return true;
+    }
+    if (c0 == 0xF4U) {
+        if (pos + 3 >= input.size()) return false;
+        const unsigned char c1 = static_cast<unsigned char>(input[pos + 1]);
+        const unsigned char c2 = static_cast<unsigned char>(input[pos + 2]);
+        const unsigned char c3 = static_cast<unsigned char>(input[pos + 3]);
+        if (c1 < 0x80U || c1 > 0x8FU || !json_is_utf8_continuation(c2)
+            || !json_is_utf8_continuation(c3)) return false;
+        seq_len = 4;
+        return true;
+    }
+    return false;
+}
+
+// Emit a JSON string. Control chars are \u-escaped; valid multi-byte UTF-8 is
+// passed through verbatim; any invalid/non-UTF-8 byte is escaped as \u00XX so the
+// result is always well-formed JSON (a non-UTF-8 cell -- binary strings, Latin-1
+// comments, netnode blobs -- can no longer produce unparseable output).
 inline void append_json_string(std::string& out, const std::string& s) {
     out.push_back('"');
-    for (char c : s) {
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
         switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
+            case '"':  out += "\\\""; ++i; break;
+            case '\\': out += "\\\\"; ++i; break;
+            case '\b': out += "\\b";  ++i; break;
+            case '\f': out += "\\f";  ++i; break;
+            case '\n': out += "\\n";  ++i; break;
+            case '\r': out += "\\r";  ++i; break;
+            case '\t': out += "\\t";  ++i; break;
             default:
-                if (static_cast<unsigned char>(c) < 0x20) {
+                if (c < 0x20U) {
                     char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x",
-                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
                     out += buf;
+                    ++i;
+                } else if (c < 0x80U) {
+                    out.push_back(static_cast<char>(c));
+                    ++i;
                 } else {
-                    out.push_back(c);
+                    size_t seq_len = 0;
+                    if (json_is_valid_utf8_sequence(s, i, seq_len)) {
+                        out.append(s.data() + i, seq_len);
+                        i += seq_len;
+                    } else {
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
+                        out += buf;
+                        ++i;
+                    }
                 }
         }
     }
@@ -256,6 +356,23 @@ inline void append_statement_json(std::string& out,
         out += "null";
     } else {
         append_json_string(out, r.error);
+    }
+
+    // Only emit the timeout/partial/warning fields when set, so executors that
+    // never populate them keep the exact prior envelope shape.
+    if (r.timed_out) {
+        out += ",\"timed_out\":true";
+    }
+    if (r.partial) {
+        out += ",\"partial\":true";
+    }
+    if (!r.warnings.empty()) {
+        out += ",\"warnings\":[";
+        for (std::size_t i = 0; i < r.warnings.size(); ++i) {
+            if (i) out.push_back(',');
+            append_json_string(out, r.warnings[i]);
+        }
+        out.push_back(']');
     }
 
     out.push_back('}');
@@ -370,6 +487,17 @@ inline ScriptResult json_to_script_result(const std::string& json_str) {
             }
             if (js.contains("sql") && js["sql"].is_string()) {
                 s.sql = js["sql"].get<std::string>();
+            }
+            // Round-trip the timeout/partial/warning signalling emitted by
+            // append_statement_json; without these the ?format=text|csv|tsv path
+            // (which reparses via this function) would silently drop them and a
+            // consumer could not tell a partial answer from a complete one.
+            s.timed_out = js.value("timed_out", false);
+            s.partial   = js.value("partial", false);
+            if (js.contains("warnings") && js["warnings"].is_array()) {
+                for (const auto& w : js["warnings"]) {
+                    s.warnings.push_back(w.is_string() ? w.get<std::string>() : w.dump());
+                }
             }
             if (js.contains("columns") && js["columns"].is_array()) {
                 for (const auto& c : js["columns"]) {

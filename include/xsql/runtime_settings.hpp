@@ -32,6 +32,16 @@ struct RuntimeSettingsCoreOptions {
     std::size_t max_timeout_stack_depth = 64;
 };
 
+// One enumerated runtime setting, as surfaced by the read-only `runtime_settings`
+// SQL table (a live discovery view over the PRAGMA <prefix>.* surface). Products
+// append their own tool-specific entries after enumerate_common().
+struct RuntimeSettingEntry {
+    std::string key;
+    std::string value;   // live value rendered as text (int -> decimal, bool -> "1"/"0")
+    std::string type;    // "int" | "bool"
+    std::string scope;   // "common" | "action" (a dispatch-only verb) | "<tool>"
+};
+
 class RuntimeSettingsCore {
 public:
     explicit RuntimeSettingsCore(RuntimeSettingsCoreOptions options = {})
@@ -66,6 +76,41 @@ public:
     bool hints_enabled() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return hints_enabled_;
+    }
+
+    // The configured timeout_push stack cap (0 == unbounded). Exposed so the
+    // common PRAGMA parser can report the actual cap instead of a hardcoded
+    // constant when a product overrides RuntimeSettingsCoreOptions.
+    std::size_t max_timeout_stack_depth() const {
+        return max_timeout_stack_depth_;
+    }
+
+    // Enumerate the COMMON runtime keys with their LIVE values, for the read-only
+    // `runtime_settings` SQL table. Products append their own extra entries (e.g.
+    // idasql: enable_idapython, idapython_output_max) after these. The two
+    // action verbs (timeout_push/timeout_pop) are dispatch-only PRAGMAs, listed so
+    // an agent can discover them; their "value" is the current effective timeout.
+    std::vector<RuntimeSettingEntry> enumerate_common() const {
+        const RuntimeSettingsSnapshot snap = snapshot();
+        std::vector<RuntimeSettingEntry> out;
+        out.reserve(8);
+        out.push_back({"query_timeout_ms",
+                       std::to_string(snap.query_timeout_ms), "int", "common"});
+        out.push_back({"queue_admission_timeout_ms",
+                       std::to_string(snap.queue_admission_timeout_ms), "int", "common"});
+        out.push_back({"max_queue",
+                       std::to_string(snap.max_queue), "int", "common"});
+        out.push_back({"hints_enabled",
+                       snap.hints_enabled ? "1" : "0", "bool", "common"});
+        out.push_back({"timeout_stack_depth",
+                       std::to_string(snap.timeout_stack_depth), "int", "common"});
+        out.push_back({"max_timeout_stack_depth",
+                       std::to_string(max_timeout_stack_depth_), "int", "common"});
+        out.push_back({"timeout_push",
+                       std::to_string(snap.query_timeout_ms), "int", "action"});
+        out.push_back({"timeout_pop",
+                       std::to_string(snap.query_timeout_ms), "int", "action"});
+        return out;
     }
 
     bool set_query_timeout_ms(int value) {
@@ -365,7 +410,15 @@ inline RuntimePragmaReply handle_common_runtime_pragma(const RuntimePragmaReques
         }
         int effective_timeout = 0;
         if (!settings.timeout_push(timeout_ms, &effective_timeout)) {
-            return pragma_error("Invalid " + product_prefix + ".timeout_push value");
+            // timeout_push fails for two distinct reasons: the value is out of
+            // range, or the value is valid but the bounded stack is already full.
+            // Report each accurately rather than blaming the (valid) value.
+            if (!RuntimeSettingsCore::is_valid_timeout(timeout_ms)) {
+                return pragma_error("Invalid " + product_prefix + ".timeout_push value");
+            }
+            return pragma_error(product_prefix + ".timeout_push stack full (max " +
+                                std::to_string(settings.max_timeout_stack_depth()) +
+                                " entries)");
         }
         return pragma_result("query_timeout_ms", std::to_string(effective_timeout));
     }

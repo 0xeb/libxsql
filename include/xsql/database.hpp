@@ -201,6 +201,15 @@ private:
     void* native_handle_unsafe() const;
     sqlite3* sqlite_handle() const;
 
+    // Record a table module's write capabilities for the prepare-time
+    // write-surface authorizer (unsupported-write-surface handling). Called by the register_*
+    // friends after a successful module registration; create_table then maps the
+    // SQL table name onto the module's caps so the authorizer can deny an
+    // unsupported INSERT/UPDATE/DELETE consistently — including the 0-row case
+    // that never reaches xUpdate.
+    void record_write_surface(const char* module_name, bool insertable,
+                              bool deletable, bool updatable);
+
     template<typename RowData>
     friend bool register_cached_vtable(Database& db,
                                        const char* module_name,
