@@ -17,14 +17,23 @@
 
 #include <xsql/cli/table_printer.hpp>
 #include <xsql/database.hpp>
+#include <xsql/interruption.hpp>
 #include <xsql/json.hpp>
 #include <xsql/script.hpp>
 
+#include <sqlite3.h>
+
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <exception>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -35,6 +44,28 @@ namespace xsql {
 struct ScriptOptions {
     bool continue_on_error = false;
     bool include_sql       = false;
+    // Per-statement wall-clock timeout in milliseconds (0 = no limit). Threaded
+    // into each statement's execution: the buffered path passes it as
+    // QueryOptions::timeout_ms to Database::query (reusing its progress-handler +
+    // interrupt-checker + partial-result machinery); the streaming path enforces
+    // the same deadline between emitted rows. A read-only, result-bearing
+    // statement that hits the deadline comes back success=true with partial=true,
+    // timed_out=true, and a warning — but only when at least one row was already
+    // gathered (an empty "partial" would read as a valid truncation, so a zero-row
+    // deadline is an error). An interrupted mutation (including DML with
+    // RETURNING) is aborted through sqlite3_interrupt so SQLite rolls the
+    // statement back, and is an error; a mutation that completes before the abort
+    // lands has committed and reports its honest result.
+    int timeout_ms = 0;
+    // Optional cooperative cancellation predicate. When set and it returns true, an
+    // in-flight statement stops ASAP. Read-only result statements return partial
+    // rows with a "query cancelled" warning (same shape as a timeout); mutations
+    // return an error (see timeout_ms above for the rollback and zero-row
+    // semantics, which apply identically here). Threaded into the
+    // buffered path (Database::query's interrupt checker) and polled between rows in
+    // the streaming path, so an HTTP server can abort a runaway query (POST /cancel
+    // or client disconnect) even under timeout_ms==0. Null => never cancelled.
+    std::function<bool()> should_cancel;
 };
 
 // ----- Per-statement record --------------------------------------------------
@@ -117,6 +148,129 @@ auto invoke_executor(Executor& exec, const std::string& sql,
     out = exec(sql);
 }
 
+struct CooperativeInterruptState {
+    std::chrono::steady_clock::time_point started_at{};
+    int timeout_ms = 0;
+    const std::function<bool()>* cancel = nullptr;
+    bool timed_out = false;
+    bool cancelled = false;
+    std::string cancel_error;
+
+    bool enabled() const {
+        return timeout_ms > 0 || (cancel && *cancel);
+    }
+
+    bool poll() noexcept {
+        if (!cancel_error.empty() || cancelled || timed_out) {
+            return true;
+        }
+        if (cancel && *cancel) {
+            try {
+                cancelled = (*cancel)();
+            } catch (const std::exception& e) {
+                cancel_error =
+                    std::string("cancellation predicate threw: ") + e.what();
+                return true;
+            } catch (...) {
+                cancel_error =
+                    "cancellation predicate threw a non-standard exception";
+                return true;
+            }
+            if (cancelled) {
+                return true;
+            }
+        }
+        if (timeout_ms > 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started_at)
+                    .count() >= timeout_ms) {
+            timed_out = true;
+            return true;
+        }
+        return false;
+    }
+};
+
+// Wrap a cancellation predicate so a single `true` observed by ANY copy is
+// permanent for ALL copies (they share one latch). Database::query consumes the
+// predicate mid-statement through its own polling; without the shared latch a
+// one-shot predicate would be "used up" inside the executor and run_script's
+// between-statement poll would miss the cancellation and keep executing the rest
+// of the script. Null stays null (never cancelled). Predicate exceptions
+// propagate — CooperativeInterruptState::poll() converts them to a sticky error.
+inline std::function<bool()> make_sticky_cancel(
+    const std::function<bool()>& inner) {
+    if (!inner) {
+        return {};
+    }
+    auto latched = std::make_shared<std::atomic<bool>>(false);
+    return [latched, inner]() {
+        if (latched->load(std::memory_order_relaxed)) {
+            return true;
+        }
+        if (!inner()) {
+            return false;
+        }
+        latched->store(true, std::memory_order_relaxed);
+        return true;
+    };
+}
+
+class StreamingInterruptGuard {
+public:
+    StreamingInterruptGuard(sqlite3* db, CooperativeInterruptState& state)
+        : db_(db), state_(&state), active_(db && state.enabled()) {
+        if (!active_) {
+            return;
+        }
+        try {
+            progress_.emplace(db_, 1000, &StreamingInterruptGuard::callback,
+                              state_);
+            checker_.emplace(
+                [state = state_]() { return state->poll(); });
+        } catch (...) {
+            checker_.reset();
+            progress_.reset();
+            active_ = false;
+            throw;
+        }
+    }
+
+    StreamingInterruptGuard(const StreamingInterruptGuard&) = delete;
+    StreamingInterruptGuard& operator=(const StreamingInterruptGuard&) = delete;
+
+    ~StreamingInterruptGuard() = default;
+
+private:
+    static int callback(void* user_data) noexcept {
+        auto* state = static_cast<CooperativeInterruptState*>(user_data);
+        return state && state->poll() ? 1 : 0;
+    }
+
+    sqlite3* db_ = nullptr;
+    CooperativeInterruptState* state_ = nullptr;
+    bool active_ = false;
+    std::optional<ScopedProgressHandler> progress_;
+    std::optional<ScopedInterruptChecker> checker_;
+};
+
+inline std::vector<std::string> unique_json_object_keys(
+    const std::vector<std::string>& columns) {
+    std::unordered_set<std::string> used;
+    std::vector<std::string> keys;
+    keys.reserve(columns.size());
+    for (const auto& column : columns) {
+        std::string candidate = column;
+        std::size_t suffix = 2;
+        while (used.find(candidate) != used.end()) {
+            candidate = column + "#" + std::to_string(suffix++);
+        }
+        used.insert(candidate);
+        keys.push_back(std::move(candidate));
+    }
+    return keys;
+}
+
 } // namespace detail
 
 template <class Executor>
@@ -138,9 +292,32 @@ inline ScriptResult run_script(const std::string& script,
     agg.statement_count = statements.size();
     agg.results.reserve(statements.size());
 
+    detail::CooperativeInterruptState cancellation;
+    cancellation.cancel =
+        options.should_cancel ? &options.should_cancel : nullptr;
+
     bool stop = false;
     for (std::size_t i = 0; i < statements.size(); ++i) {
         if (stop) break;
+        // Cooperative cancellation between statements (e.g. an HTTP POST /cancel):
+        // don't start a new statement once cancel is requested. Mid-statement
+        // cancellation is the executor's job (Database::query honors should_cancel).
+        if (cancellation.poll()) {
+            ScriptStatementResult out;
+            out.statement_index = i;
+            out.success = false;
+            out.error = cancellation.cancel_error.empty()
+                ? std::string("query cancelled")
+                : cancellation.cancel_error;
+            if (options.include_sql) {
+                out.sql = statements[i];
+            }
+            if (!agg.first_error_index.has_value()) {
+                agg.first_error_index = i;
+            }
+            agg.results.push_back(std::move(out));
+            break;
+        }
 
         ScriptStatementResult out;
         out.statement_index = i;
@@ -572,6 +749,18 @@ inline std::string script_result_to_text(const ScriptResult& r) {
         } else {
             out << "ERROR: " << s.error << "\n";
         }
+        // Surface the timeout / partial-result signalling that the data model
+        // carries — emitted ONLY when set, so a normal (no-timeout) result is
+        // byte-identical to before. `--`-prefixed to match the `-- statement`
+        // convention above so it never collides with a data row.
+        for (const auto& w : s.warnings) {
+            out << "-- warning: " << w << "\n";
+        }
+        if (s.timed_out) {
+            out << "-- query timed out; results are partial\n";
+        } else if (s.partial) {
+            out << "-- results are partial\n";
+        }
         if (i + 1 < r.results.size()) {
             out << '\n';
         }
@@ -685,6 +874,66 @@ inline std::string script_result_to_tsv(const ScriptResult& r) {
     return detail::script_result_to_delimited(r, '\t', /*csv=*/false);
 }
 
+// JSON Lines / NDJSON: one self-describing JSON object per row, one per line —
+// keyed by column name (the "records" shape a bulk consumer wants, e.g. a symbol
+// cache). Cell values are emitted as JSON strings (SQL NULL => null), matching the
+// canonical envelope's cell treatment (script_result_to_json) so a numeric column
+// like `rva` is "4096" exactly as it is there. A failed/parse-error statement emits
+// one `{"statement_index":I,"error":"…"}` line instead of rows; a column-less
+// statement (a successful write) emits nothing. No enclosing array/envelope, so the
+// output streams and appends cleanly.
+inline std::string script_result_to_jsonl(const ScriptResult& r) {
+    std::string out;
+    if (!r.parse_error.empty()) {
+        out += "{\"error\":";
+        detail::append_json_string(out, r.parse_error);
+        out += "}\n";
+        return out;
+    }
+    for (const auto& s : r.results) {
+        if (!s.success) {
+            out += "{\"statement_index\":";
+            out += std::to_string(s.statement_index);
+            out += ",\"error\":";
+            detail::append_json_string(out, s.error);
+            out += "}\n";
+            continue;
+        }
+        const auto keys = detail::unique_json_object_keys(s.columns);
+        for (std::size_t ri = 0; ri < s.rows.size(); ++ri) {
+            const auto& row = s.rows[ri];
+            out.push_back('{');
+            for (std::size_t c = 0; c < s.columns.size(); ++c) {
+                if (c) out.push_back(',');
+                detail::append_json_string(out, keys[c]);
+                out.push_back(':');
+                if (c < row.size() && !s.is_null_cell(ri, c)) {
+                    detail::append_json_string(out, row[c]);
+                } else {
+                    out += "null";
+                }
+            }
+            out += "}\n";
+        }
+        if (s.timed_out || s.partial || !s.warnings.empty()) {
+            out += "{\"statement_index\":";
+            out += std::to_string(s.statement_index);
+            if (s.timed_out) out += ",\"timed_out\":true";
+            if (s.partial) out += ",\"partial\":true";
+            if (!s.warnings.empty()) {
+                out += ",\"warnings\":[";
+                for (std::size_t i = 0; i < s.warnings.size(); ++i) {
+                    if (i) out.push_back(',');
+                    detail::append_json_string(out, s.warnings[i]);
+                }
+                out.push_back(']');
+            }
+            out += "}\n";
+        }
+    }
+    return out;
+}
+
 // ----- Convenience: drive run_script directly against an xsql::Database ------
 //
 // Default executor adapter for products that use xsql::Database. Wraps each
@@ -695,9 +944,18 @@ inline ScriptResult run_database_script(Database& db,
                                         const std::string& script,
                                         const ScriptOptions& options)
 {
-    return run_script(script, options,
-        [&db](const std::string& sql, ScriptStatementResult& out) {
-            Result r = db.query(sql);
+    // Latch cancellation across statements: Database::query consumes the
+    // predicate mid-statement, so a one-shot `true` must remain visible to
+    // run_script's between-statement poll (mirrors the streaming serializers'
+    // script-level latch). Both the poll and the executor share one latch.
+    ScriptOptions effective = options;
+    effective.should_cancel = detail::make_sticky_cancel(options.should_cancel);
+    return run_script(script, effective,
+        [&db, &effective](const std::string& sql, ScriptStatementResult& out) {
+            QueryOptions qopts;
+            qopts.timeout_ms = effective.timeout_ms;  // reuse Database::query's timeout
+            qopts.should_cancel = effective.should_cancel;  // ...and its cancellation
+            Result r = db.query(sql, qopts);
             out.columns = std::move(r.columns);
             out.rows.reserve(r.rows.size());
             out.cell_null.reserve(r.rows.size());
@@ -710,7 +968,548 @@ inline ScriptResult run_database_script(Database& db,
             out.elapsed_ms = static_cast<double>(r.elapsed_ms);
             out.success = r.error.empty();   // before moving r.error
             out.error = std::move(r.error);
+            // Round-trip the timeout / partial-result signalling so the envelope
+            // can tell a truncated answer from a complete one.
+            out.timed_out = r.timed_out;
+            out.partial = r.partial;
+            out.warnings = std::move(r.warnings);
         });
+}
+
+// ----- Streaming JSON serializer (bounded memory) ----------------------------
+//
+// Emits the script-envelope JSON incrementally via `sink`, stepping each
+// statement row-by-row and never accumulating a read-only result set. Peak
+// memory is O(one row) for reads. Mutation RETURNING rows are the deliberate
+// exception: they remain provisional until SQLITE_DONE, so they are buffered
+// until the statement succeeds and discarded if it is interrupted or fails.
+// Pair the read path with a chunked HTTP response so the wire is incremental.
+//
+// This is ADDITIVE and opt-in: run_database_script + script_result_to_json stay
+// the default buffered path, byte-for-byte unchanged. The streamed envelope
+// carries the SAME key set and values as the buffered form, but the aggregate
+// fields that are unknowable until every row is emitted — each statement's
+// success/error/row_count/elapsed_ms, and the top-level row_count_total/
+// elapsed_ms_total/first_error_index/success — are emitted AFTER the rows they
+// summarize. JSON is order-independent for parsers, so a structural compare
+// against the buffered output matches (see the round-trip test).
+inline void stream_database_script_json(
+    Database& db, const std::string& script, const ScriptOptions& options,
+    const std::function<bool(const char*, std::size_t)>& sink)
+{
+    // `sink` returns false once the client has gone away (httplib's DataSink::write
+    // reports a disconnected connection this way). We latch that in `aborted` and
+    // unwind — the streaming cancel-on-disconnect path. An explicit POST /cancel is
+    // handled by options.should_cancel, polled between rows below.
+    bool aborted = false;
+    auto emit = [&sink, &aborted](const std::string& s) {
+        if (aborted || s.empty()) return;
+        if (!sink(s.data(), s.size())) aborted = true;
+    };
+
+    std::vector<std::string> statements;
+    std::string split_error;
+    if (!collect_statements(script, statements, split_error)) {
+        std::string out =
+            "{\"success\":false,\"statement_count\":0,\"results\":[]"
+            ",\"row_count_total\":0,\"elapsed_ms_total\":0"
+            ",\"first_error_index\":null,\"parse_error\":";
+        detail::append_json_string(out, split_error.empty()
+            ? std::string("Failed to parse SQL script") : split_error);
+        out.push_back('}');
+        emit(out);
+        return;
+    }
+
+    std::string header = "{\"statement_count\":";
+    header += std::to_string(statements.size());
+    header += ",\"results\":[";
+    emit(header);
+
+    std::size_t row_count_total = 0;
+    double elapsed_ms_total = 0.0;
+    std::optional<std::size_t> first_error_index;
+    detail::CooperativeInterruptState script_cancellation;
+    script_cancellation.cancel =
+        options.should_cancel ? &options.should_cancel : nullptr;
+
+    for (std::size_t i = 0; i < statements.size(); ++i) {
+        if (i) emit(",");
+        const std::string& sql = statements[i];
+
+        std::string head = "{\"statement_index\":";
+        head += std::to_string(i);
+        if (options.include_sql) {
+            head += ",\"sql\":";
+            detail::append_json_string(head, sql);
+        }
+
+        // Cancellation is request-terminal. Keep one sticky script-level state
+        // so a mid-statement partial cancellation prevents every later
+        // statement, even if the user predicate only returned true once.
+        if (script_cancellation.poll()) {
+            head += ",\"columns\":[],\"rows\":[],\"row_count\":0"
+                    ",\"elapsed_ms\":0,\"success\":false,\"error\":";
+            detail::append_json_string(
+                head, script_cancellation.cancel_error.empty()
+                    ? std::string("query cancelled")
+                    : script_cancellation.cancel_error);
+            head.push_back('}');
+            emit(head);
+            if (!first_error_index.has_value()) first_error_index = i;
+            break;
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        detail::CooperativeInterruptState interrupt;
+        interrupt.started_at = t0;
+        interrupt.timeout_ms = options.timeout_ms;
+        interrupt.cancel =
+            options.should_cancel ? &options.should_cancel : nullptr;
+        // Arm before prepare so xBestIndex and other prepare-time callbacks are
+        // covered by the same deadline/cancellation contract as sqlite3_step().
+        detail::StreamingInterruptGuard interrupt_guard(db.sqlite_handle(),
+                                                         interrupt);
+        Statement st = db.prepare_statement(sql);
+        auto elapsed_ms = [&t0]() {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0).count();
+        };
+
+        if (!st) {
+            if (interrupt.cancelled) {
+                script_cancellation.cancelled = true;
+            }
+            if (!interrupt.cancel_error.empty()) {
+                script_cancellation.cancel_error = interrupt.cancel_error;
+            }
+            std::string prepare_error = st.error();
+            if (!interrupt.cancel_error.empty()) {
+                prepare_error = interrupt.cancel_error;
+            } else if (interrupt.cancelled) {
+                prepare_error = "Query cancelled";
+            } else if (interrupt.timed_out) {
+                prepare_error = "Query timed out";
+            }
+            head += ",\"columns\":[],\"rows\":[],\"row_count\":0,\"elapsed_ms\":";
+            const double el = elapsed_ms();
+            detail::append_json_number(head, el);
+            head += ",\"success\":false,\"error\":";
+            detail::append_json_string(head, prepare_error);
+            if (interrupt.timed_out) {
+                head += ",\"timed_out\":true";
+            }
+            head.push_back('}');
+            emit(head);
+            elapsed_ms_total += el;
+            if (!first_error_index.has_value()) first_error_index = i;
+            if (!options.continue_on_error) break;
+            continue;
+        }
+
+        head += ",\"columns\":[";
+        const int ncol = st.column_count();
+        const bool readonly = st.is_readonly();
+        const bool partial_capable = ncol > 0 && readonly;
+        const bool defer_rows = ncol > 0 && !readonly;
+        std::vector<std::string> deferred_rows;
+        for (int c = 0; c < ncol; ++c) {
+            if (c) head.push_back(',');
+            detail::append_json_string(head, st.column_name(c));
+        }
+        head += "],\"rows\":[";
+        emit(head);
+
+        std::size_t rows = 0;
+        std::string err;
+        bool ok = true;
+        bool completed = false;
+        bool interrupt_sent = false;
+        // A mutation whose provisional RETURNING rows are already in flight must
+        // NOT be abandoned with a bare break: finalizing a non-errored statement
+        // COMPLETES it, and SQLite commits the DML. Ask SQLite to abort instead —
+        // that path rolls the statement back — and keep stepping until the abort
+        // surfaces as a step error.
+        auto request_mutation_abort = [&]() {
+            if (!interrupt_sent) {
+                sqlite3_interrupt(db.sqlite_handle());
+                interrupt_sent = true;
+            }
+        };
+        for (;;) {
+            if (interrupt.poll()) {
+                if (defer_rows && rows > 0) {
+                    request_mutation_abort();
+                } else {
+                    break;
+                }
+            }
+            const StepResult sr = st.step();
+            if (sr == StepResult::row) {
+                std::string rowbuf;
+                rowbuf.reserve(static_cast<std::size_t>(ncol) * 16 + 2);
+                if (rows) rowbuf.push_back(',');  // comma between rows
+                rowbuf.push_back('[');
+                for (int c = 0; c < ncol; ++c) {
+                    if (c) rowbuf.push_back(',');
+                    if (st.column_is_null(c)) rowbuf += "null";
+                    else detail::append_json_string(rowbuf, st.text(c));
+                }
+                rowbuf.push_back(']');
+                if (defer_rows) {
+                    deferred_rows.push_back(rowbuf);
+                } else {
+                    emit(rowbuf);
+                }
+                ++rows;
+                if (aborted) break;  // client disconnected mid-stream
+                if (interrupt.poll()) {
+                    if (defer_rows) {
+                        request_mutation_abort();
+                    } else {
+                        break;
+                    }
+                }
+            } else if (sr == StepResult::done) {
+                completed = true;
+                break;
+            } else {
+                // A progress callback or cooperative vtable poll latches the
+                // cause before sqlite3_step() returns error. Do not invoke a
+                // fresh predicate after the step has already completed.
+                if (!interrupt.cancel_error.empty() || interrupt.cancelled ||
+                    interrupt.timed_out) {
+                    break;
+                }
+                ok = false;
+                err = st.error();
+                break;
+            }
+        }
+        if (aborted) break;  // stop the statement loop; the footer emit no-ops
+
+        const bool timed_out = interrupt.timed_out;
+        const bool cancelled = interrupt.cancelled;
+        if (cancelled) script_cancellation.cancelled = true;
+        if (!interrupt.cancel_error.empty()) {
+            script_cancellation.cancel_error = interrupt.cancel_error;
+        }
+        // A mutation that reached SQLITE_DONE completed — it has COMMITTED — so a
+        // cancel/timeout latched during its final step must not relabel the
+        // honest result as a failure (the script-level latch above still stops
+        // the NEXT statement). A read-only statement can reach DONE with latched
+        // state when a cooperative vtable truncated its scan, so reads still
+        // classify: rows gathered are a partial answer; with none it is an error
+        // (an empty "partial" would read as a valid truncation of the real one).
+        const bool mutation_completed = completed && !readonly;
+        if (mutation_completed) {
+            // fallthrough: report the committed statement as-is
+        } else if (!interrupt.cancel_error.empty()) {
+            ok = false;
+            err = interrupt.cancel_error;
+        } else if (timed_out && !(partial_capable && rows > 0)) {
+            ok = false;
+            err = "Query timed out";
+        } else if (cancelled && !(partial_capable && rows > 0)) {
+            ok = false;
+            err = "Query cancelled";
+        }
+        if (defer_rows) {
+            if (ok) {
+                for (const auto& row : deferred_rows) {
+                    emit(row);
+                    if (aborted) break;
+                }
+                if (aborted) break;
+            } else {
+                rows = 0;
+            }
+        }
+
+        const double el = elapsed_ms();
+        std::string tail = "],\"row_count\":";
+        tail += std::to_string(rows);
+        tail += ",\"elapsed_ms\":";
+        detail::append_json_number(tail, el);
+        tail += ",\"success\":";
+        tail += ok ? "true" : "false";
+        tail += ",\"error\":";
+        if (err.empty()) tail += "null";
+        else detail::append_json_string(tail, err);
+        // A timed-out statement with rows already delivered is a partial success,
+        // matching Database::query's timed_out/partial/warnings semantics. With
+        // zero rows there is no prefix to keep — the error branch above already
+        // reported it — and a committed mutation is not partial at all.
+        if (timed_out && !mutation_completed) {
+            tail += ",\"timed_out\":true";
+            if (ok && partial_capable && rows > 0) {
+                tail += ",\"partial\":true,\"warnings\":[";
+                detail::append_json_string(
+                    tail, "query timed out; returning partial rows");
+                tail.push_back(']');
+            }
+        }
+        // An explicit cancel is a partial success too (rows so far are valid), but
+        // it is not a timeout, so no timed_out flag — mirrors the buffered path.
+        if (cancelled && !mutation_completed && ok && partial_capable && rows > 0) {
+            tail += ",\"partial\":true,\"warnings\":[";
+            detail::append_json_string(tail, "query cancelled; returning partial rows");
+            tail.push_back(']');
+        }
+        if (!ok && rows > 0 && partial_capable && !timed_out &&
+            !cancelled) {
+            tail += ",\"partial\":true,\"warnings\":[";
+            detail::append_json_string(
+                tail, "query failed; returning partial rows");
+            tail.push_back(']');
+        }
+        tail.push_back('}');
+        emit(tail);
+
+        row_count_total += rows;
+        elapsed_ms_total += el;
+        if (!ok) {
+            if (!first_error_index.has_value()) first_error_index = i;
+            if (!options.continue_on_error) break;
+        }
+    }
+
+    std::string footer = "],\"row_count_total\":";
+    footer += std::to_string(row_count_total);
+    footer += ",\"elapsed_ms_total\":";
+    detail::append_json_number(footer, elapsed_ms_total);
+    footer += ",\"first_error_index\":";
+    footer += first_error_index.has_value() ? std::to_string(*first_error_index) : "null";
+    footer += ",\"success\":";
+    footer += first_error_index.has_value() ? "false" : "true";
+    footer.push_back('}');
+    emit(footer);
+}
+
+// Streaming NDJSON twin of stream_database_script_json: emits ONE keyed JSON object
+// per row, one per line (the script_result_to_jsonl "records" shape), with no
+// enclosing envelope — ideal for a client that consumes rows as a stream and
+// appends them to a file. Read-only results use O(one row) memory; mutation
+// RETURNING rows are buffered until successful completion so rolled-back rows
+// never reach the sink. Honors options.timeout_ms and options.should_cancel
+// between rows, and stops if `sink` reports a disconnect (returns false). A
+// failed statement emits one {"statement_index":I,"error":"…"} line; a
+// truncated statement (timeout / cancel) emits a trailing
+// metadata line carrying `partial`, optional `timed_out`, and `warnings`, so the
+// consumer can tell a short answer from a complete one.
+inline void stream_database_script_ndjson(
+    Database& db, const std::string& script, const ScriptOptions& options,
+    const std::function<bool(const char*, std::size_t)>& sink)
+{
+    bool aborted = false;
+    auto emit = [&sink, &aborted](const std::string& s) {
+        if (aborted || s.empty()) return;
+        if (!sink(s.data(), s.size())) aborted = true;
+    };
+
+    std::vector<std::string> statements;
+    std::string split_error;
+    if (!collect_statements(script, statements, split_error)) {
+        std::string out = "{\"error\":";
+        detail::append_json_string(out, split_error.empty()
+            ? std::string("Failed to parse SQL script") : split_error);
+        out += "}\n";
+        emit(out);
+        return;
+    }
+
+    detail::CooperativeInterruptState script_cancellation;
+    script_cancellation.cancel =
+        options.should_cancel ? &options.should_cancel : nullptr;
+
+    for (std::size_t i = 0; i < statements.size(); ++i) {
+        const std::string& sql = statements[i];
+        if (script_cancellation.poll()) {
+            std::string out = "{\"statement_index\":";
+            out += std::to_string(i);
+            out += ",\"error\":";
+            detail::append_json_string(
+                out, script_cancellation.cancel_error.empty()
+                    ? std::string("query cancelled")
+                    : script_cancellation.cancel_error);
+            out += "}\n";
+            emit(out);
+            break;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        detail::CooperativeInterruptState interrupt;
+        interrupt.started_at = t0;
+        interrupt.timeout_ms = options.timeout_ms;
+        interrupt.cancel =
+            options.should_cancel ? &options.should_cancel : nullptr;
+        detail::StreamingInterruptGuard interrupt_guard(db.sqlite_handle(),
+                                                         interrupt);
+        Statement st = db.prepare_statement(sql);
+        if (!st) {
+            if (interrupt.cancelled) {
+                script_cancellation.cancelled = true;
+            }
+            if (!interrupt.cancel_error.empty()) {
+                script_cancellation.cancel_error = interrupt.cancel_error;
+            }
+            std::string prepare_error = st.error();
+            if (!interrupt.cancel_error.empty()) {
+                prepare_error = interrupt.cancel_error;
+            } else if (interrupt.cancelled) {
+                prepare_error = "Query cancelled";
+            } else if (interrupt.timed_out) {
+                prepare_error = "Query timed out";
+            }
+            std::string out = "{\"statement_index\":";
+            out += std::to_string(i);
+            out += ",\"error\":";
+            detail::append_json_string(out, prepare_error);
+            if (interrupt.timed_out) out += ",\"timed_out\":true";
+            out += "}\n";
+            emit(out);
+            if (!options.continue_on_error) break;
+            continue;
+        }
+
+        const int ncol = st.column_count();
+        const bool readonly = st.is_readonly();
+        const bool partial_capable = ncol > 0 && readonly;
+        const bool defer_rows = ncol > 0 && !readonly;
+        std::vector<std::string> deferred_rows;
+        std::vector<std::string> colnames;
+        colnames.reserve(static_cast<std::size_t>(ncol));
+        for (int c = 0; c < ncol; ++c) colnames.push_back(st.column_name(c));
+        const auto json_keys = detail::unique_json_object_keys(colnames);
+
+        bool failed = false;
+        std::size_t rows = 0;
+        std::string err;
+        bool completed = false;
+        bool interrupt_sent = false;
+        // Same contract as the JSON serializer above: an in-flight mutation with
+        // provisional RETURNING rows is aborted through SQLite (which rolls the
+        // statement back), never abandoned with a bare break (which would commit).
+        auto request_mutation_abort = [&]() {
+            if (!interrupt_sent) {
+                sqlite3_interrupt(db.sqlite_handle());
+                interrupt_sent = true;
+            }
+        };
+        for (;;) {
+            if (interrupt.poll()) {
+                if (defer_rows && rows > 0) {
+                    request_mutation_abort();
+                } else {
+                    break;
+                }
+            }
+            const StepResult sr = st.step();
+            if (sr == StepResult::row) {
+                std::string rowbuf;
+                rowbuf.reserve(static_cast<std::size_t>(ncol) * 24 + 2);
+                rowbuf.push_back('{');
+                for (int c = 0; c < ncol; ++c) {
+                    if (c) rowbuf.push_back(',');
+                    detail::append_json_string(rowbuf, json_keys[c]);
+                    rowbuf.push_back(':');
+                    if (st.column_is_null(c)) rowbuf += "null";
+                    else detail::append_json_string(rowbuf, st.text(c));
+                }
+                rowbuf += "}\n";
+                if (defer_rows) {
+                    deferred_rows.push_back(rowbuf);
+                } else {
+                    emit(rowbuf);
+                }
+                ++rows;
+                if (aborted) break;
+                if (interrupt.poll()) {
+                    if (defer_rows) {
+                        request_mutation_abort();
+                    } else {
+                        break;
+                    }
+                }
+            } else if (sr == StepResult::done) {
+                completed = true;
+                break;
+            } else {
+                if (!interrupt.cancel_error.empty() || interrupt.cancelled ||
+                    interrupt.timed_out) {
+                    break;
+                }
+                failed = true;
+                err = st.error();
+                break;
+            }
+        }
+        if (aborted) break;
+
+        const bool timed_out = interrupt.timed_out;
+        const bool cancelled = interrupt.cancelled;
+        if (cancelled) script_cancellation.cancelled = true;
+        if (!interrupt.cancel_error.empty()) {
+            script_cancellation.cancel_error = interrupt.cancel_error;
+        }
+        // See the JSON serializer: a mutation at DONE has COMMITTED (report it
+        // honestly; the script-level latch still stops the next statement), a
+        // read at DONE may have been cooperatively truncated (classify), and a
+        // cancel/timeout with zero rows is an error, not an empty "partial".
+        const bool mutation_completed = completed && !readonly;
+        if (mutation_completed) {
+            // fallthrough: report the committed statement as-is
+        } else if (!interrupt.cancel_error.empty()) {
+            failed = true;
+            err = interrupt.cancel_error;
+        } else if (timed_out && !(partial_capable && rows > 0)) {
+            failed = true;
+            err = "Query timed out";
+        } else if (cancelled && !(partial_capable && rows > 0)) {
+            failed = true;
+            err = "Query cancelled";
+        }
+        if (defer_rows) {
+            if (!failed) {
+                for (const auto& row : deferred_rows) {
+                    emit(row);
+                    if (aborted) break;
+                }
+                if (aborted) break;
+            } else {
+                rows = 0;
+            }
+        }
+
+        if (failed) {
+            std::string out = "{\"statement_index\":";
+            out += std::to_string(i);
+            out += ",\"error\":";
+            detail::append_json_string(out, err);
+            if (timed_out) out += ",\"timed_out\":true";
+            if (rows > 0 && partial_capable) {
+                out += ",\"partial\":true,\"warnings\":[";
+                detail::append_json_string(
+                    out, "query failed; returning partial rows");
+                out.push_back(']');
+            }
+            out += "}\n";
+            emit(out);
+            if (!options.continue_on_error) break;
+        } else if ((timed_out || cancelled) && !mutation_completed &&
+                   partial_capable && rows > 0) {
+            std::string out = "{\"statement_index\":";
+            out += std::to_string(i);
+            if (timed_out) out += ",\"timed_out\":true";
+            out += ",\"partial\":true,\"warnings\":[";
+            detail::append_json_string(
+                out, timed_out
+                    ? std::string("query timed out; returning partial rows")
+                    : std::string("query cancelled; returning partial rows"));
+            out.push_back(']');
+            out += "}\n";
+            emit(out);
+        }
+    }
 }
 
 } // namespace xsql

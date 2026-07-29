@@ -5,7 +5,13 @@
 > Unmodified dependency use is allowed, including commercial use.
 > Forks, ports, rebrands, derivative implementations, and AI-assisted implementation mining require prior written permission.
 
-**libxsql** is a modern C++17 header-only library that exposes C++ data structures as SQLite virtual tables.
+**libxsql** is a modern C++17 library that exposes C++ data structures as
+SQLite virtual tables. The virtual-table framework, HTTP thinclient, runtime
+settings, and graph utilities are header-based; the database, statement,
+function, aggregate, and script layers are compiled sources. Note that the
+virtual-table headers call into the compiled layer (the prepare-time
+write-surface authorizer), so every consumer links the `xsql` library — the
+headers are not usable stand-alone.
 
 SQL is the universal query language. By exposing your application's data as SQL tables, you make it instantly accessible to scripts, CLI pipelines, and AI coding agents. No proprietary API to learn. No SDK to integrate. Just SQL.
 
@@ -29,8 +35,13 @@ If libxsql materially informs a distributed project, preserve the human origin: 
 - **Three table patterns** - Index-based, cached, and generator (streaming)
 - **Writable tables** - UPDATE and DELETE support via column setters
 - **Constraint pushdown** - O(1) lookups with `filter_eq()`
-- **Socket protocol** - TCP server/client for remote queries
-- **Zero dependencies** - Vendored SQLite, no external libraries
+- **HTTP thinclient** - HTTP server/client for remote queries (JSON, JSONL,
+  text, CSV, TSV output; cooperative cancellation via `POST /cancel`)
+- **Transactional runtime settings** - a writable `runtime_settings` table
+- **Capabilities table** - a self-describing `sql_capabilities` surface
+- **Graph utilities** - dominators, natural loops, SCC, topological order
+- **No external dependencies** - SQLite, cpp-httplib, and nlohmann-json are
+  vendored under `external/`
 
 ## Installation
 
@@ -47,10 +58,13 @@ target_link_libraries(myapp PRIVATE xsql::xsql)
 
 ### Vendored Copy
 
-Copy `include/xsql/`, `src/`, and `external/sqlite/` to your project and add
-the `src/*.cpp` files (plus the SQLite amalgamation) to your build. The
-virtual-table framework and thinclient are header-only, but the `Database`,
-`Statement`, and function-registration layers are compiled sources.
+Copy `include/xsql/`, `src/`, `external/sqlite/`, and `external/nlohmann/` to
+your project and add the `src/*.cpp` files (plus the SQLite amalgamation) to
+your build; the script/serializer layer includes the vendored nlohmann-json
+headers. Add `external/httplib/` as well if you use the HTTP thinclient. The
+virtual-table framework and thinclient are header-based, but they call into
+the compiled `Database`/`Statement`/function-registration layer, so the
+`src/*.cpp` files are always required.
 
 ## Quick Start
 
@@ -65,7 +79,7 @@ std::vector<std::pair<int, std::string>> items = {
 
 // Define table
 auto def = xsql::table("items")
-    .count([&]() { return items.size(); })
+    .row_count([&]() { return items.size(); })
     .column_int("id", [&](size_t i) { return items[i].first; })
     .column_text("name", [&](size_t i) { return items[i].second; })
     .build();
@@ -89,7 +103,7 @@ For data with direct index access. Row count is computed on each query.
 
 ```cpp
 auto def = xsql::table("funcs")
-    .count([&]() { return get_func_qty(); })
+    .row_count([&]() { return get_func_qty(); })
     .column_int64("addr", [&](size_t i) { return get_func(i)->start_ea; })
     .column_text("name", [&](size_t i) { return get_func_name(i); })
     .build();
@@ -104,7 +118,7 @@ struct XrefInfo { uint64_t from; uint64_t to; };
 
 auto def = xsql::cached_table<XrefInfo>("xrefs")
     .estimate_rows([]() { return 10000; })
-    .count([]() { return exact_xref_count(); })  // Optional: optimizes COUNT(*)
+    .row_count([]() { return exact_xref_count(); })  // Optional: optimizes COUNT(*)
     .cache_builder([](std::vector<XrefInfo>& cache) {
         // Enumerate and populate cache
         for (auto& xref : all_xrefs())
@@ -155,7 +169,7 @@ Support UPDATE and DELETE with column setters and `deletable()`.
 
 ```cpp
 auto def = xsql::table("names")
-    .count([&]() { return names.size(); })
+    .row_count([&]() { return names.size(); })
     .on_modify([](const std::string& op) {
         // Called before any modification
         create_undo_point();
@@ -219,6 +233,102 @@ auto def = xsql::cached_table<XrefInfo>("xrefs")
 
 With this filter, `SELECT * FROM xrefs WHERE to_addr = 0x401000` uses the native xref API instead of scanning all rows.
 
+## Runtime Settings
+
+Runtime configuration is exposed through the writable `runtime_settings` virtual
+table (`key`, `value`, `type`, `scope`). Read a setting with
+`SELECT value FROM runtime_settings WHERE key = ?` and change it with
+`UPDATE runtime_settings SET value = ? WHERE key = ?`. Multiple
+updates in one SQL transaction commit atomically and roll back together.
+Only the `value` column is writable; `INSERT` and `DELETE` are rejected
+(the key set is fixed by registration), as are `NULL` and empty values.
+
+Common keys shipped by `RuntimeSettingsCore` (products register their own on
+the same core with `register_bool_setting` / `register_integer_setting` /
+`register_string_setting`; string values are capped at 4 KiB):
+
+| Key | Type | Default | Range | Writable |
+|-----|------|---------|-------|----------|
+| `query_timeout_ms` | int | 60000 | 0 – 3600000 | yes |
+| `queue_admission_timeout_ms` | int | 120000 | 0 – 3600000 | yes |
+| `max_queue` | int | 64 | 0 – 10000 | yes |
+| `hints_enabled` | bool | 1 | – | yes |
+| `timeout_stack_depth` | int | live stack depth | – | no (read-only) |
+| `max_timeout_stack_depth` | int | 64 | – | no (read-only) |
+
+`scope` is `common` for the shared keys, the product prefix (e.g. `idasql`)
+for product keys, and `action` for the two imperative verbs below.
+
+Older value-bearing `PRAGMA` commands are retired; reads and writes go through
+`runtime_settings`, and native SQLite PRAGMAs are reserved for SQLite itself.
+The single sanctioned exception is the imperative timeout stack —
+`PRAGMA <prefix>.timeout_push = <ms>` / `PRAGMA <prefix>.timeout_pop` — which
+is a verb, not a value, and therefore stays a PRAGMA. A staged
+`query_timeout_ms` write and an active timeout stack are mutually exclusive
+(the error message names the conflict and how to clear it).
+
+## Scripts, Streaming, Timeouts, and Cancellation
+
+`run_database_script(db, script, options)` executes a multi-statement SQL
+script and returns one aggregate `ScriptResult` (per-statement rows, errors,
+timing). `ScriptOptions` carries:
+
+- `timeout_ms` — per-statement wall-clock deadline (0 = none).
+- `should_cancel` — a cooperative cancellation predicate polled between rows
+  and via SQLite's progress handler; once it fires, the rest of the script is
+  cancelled too.
+- `continue_on_error`, `include_sql` — aggregation controls.
+
+Semantics on cancel/timeout: a read-only statement keeps rows already gathered
+(`partial=true` plus a warning) — but only when at least one row landed; with
+zero rows it is an error (`partial` is never set on an empty result, so an
+empty successful result is always complete). A mutation — including
+`DML ... RETURNING` — is aborted through `sqlite3_interrupt`, so SQLite rolls
+the statement back, and reports an error; if it completes before the abort
+lands, it has committed and reports its honest result.
+
+Serializers over a `ScriptResult`: `script_result_to_json` (canonical
+envelope), `script_result_to_jsonl` (one keyed JSON object per row — NDJSON
+"records"), `script_result_to_text`, `_to_csv`, `_to_tsv`.
+
+Streaming twins with O(one row) memory for reads:
+`stream_database_script_json` and `stream_database_script_ndjson` emit through
+a sink callback (pair them with a chunked HTTP response); mutation RETURNING
+rows stay buffered until the statement succeeds so rolled-back rows never
+reach the sink.
+
+The HTTP server exposes cancellation as `POST /cancel` (whole-script executor
+configurations only): it cooperatively cancels the queries whose execution
+started before the request arrived — queued-but-unstarted work is not
+affected.
+
+## Capabilities Table
+
+`capabilities.hpp` provides the one canonical capability surface used across
+the family: `define_sql_capabilities(rows)` builds a read-only
+`sql_capabilities(name TEXT, is_supported INTEGER, notes TEXT)` table a tool
+registers so agents can discover what the surface supports (by convention the
+`mutation.<table>.<leaf>` names that write-denial errors also cite) with
+`SELECT * FROM sql_capabilities`. Rows are sorted for deterministic output;
+duplicate or empty names fail at definition time.
+
+## Graph Utilities
+
+`#include <xsql/graph.hpp>` (also part of the `xsql.hpp` umbrella) is a stock
+directed-graph algorithm library over opaque integer node ids in
+`[0, node_count)` — no reverse-engineering concepts; map your own objects onto
+ids. `DirectedGraph` stores the edges (`add_edge` validates ids and permits
+parallel edges and self-loops); the algorithms are free functions:
+
+| Function | Result |
+|----------|--------|
+| `immediate_dominators(g, entry)` | idom per node (`kNoNode` if unreachable) |
+| `dominator_sets(g, entry)` | full sorted dominator sets — O(n²) output; prefer `immediate_dominators` at scale |
+| `immediate_post_dominators(g)` | ipdom relative to the graph's sinks via a virtual exit |
+| `natural_loops(g, entry)` | back-edge natural loops (header, latch, sorted body); parallel back edges deduped |
+| `strongly_connected_components(g)` | Tarjan SCC component ids |
+| `topological_order(g)` | Kahn order (smallest-id-first), `std::nullopt` on a cycle |
+
 ## HTTP Thinclient
 
 Serve tables over HTTP with `xsql::thinclient::server` and query them with standard HTTP clients.
@@ -249,7 +359,11 @@ server.run();
 ```cpp
 #include <xsql/thinclient/client.hpp>
 
-xsql::thinclient::client client({.host = "127.0.0.1", .port = 8081});
+xsql::thinclient::client_config cfg;
+cfg.host = "127.0.0.1";
+cfg.port = 8081;
+cfg.auth_token = "secret";
+xsql::thinclient::client client(cfg);
 std::string result = client.query("SELECT * FROM items LIMIT 10");
 printf("%s\n", result.c_str());
 ```
@@ -270,7 +384,7 @@ printf("%s\n", result.c_str());
 
 | Method | Description |
 |--------|-------------|
-| `count(fn)` | Row count function (required for index-based, optional exact `COUNT(*)` fast path for cached tables) |
+| `row_count(fn)` | Exact row count (required for index-based; optional `COUNT(*)` fast path for cached/generator tables) |
 | `estimate_rows(fn)` | Cheap row estimate for query planner |
 | `cache_builder(fn)` | Populate cache (cached_table only) |
 | `generator(fn)` | Generator factory (generator_table only) |
@@ -326,7 +440,7 @@ libxsql is designed for building CLI tools that AI coding agents can query direc
 ```cpp
 // Expose IDA-like data structures
 auto funcs = xsql::table("funcs")
-    .count([&]() { return functions.size(); })
+    .row_count([&]() { return functions.size(); })
     .column_text("name", [&](size_t i) { return functions[i].name; })
     .column_int64("addr", [&](size_t i) { return functions[i].addr; })
     .column_int("size", [&](size_t i) { return functions[i].size; })

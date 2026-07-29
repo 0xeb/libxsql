@@ -32,7 +32,7 @@ int main() {
 
     // Define writable virtual table
     auto def = xsql::table("tasks")
-        .count([&]() { return tasks.size(); })
+        .row_count([&]() { return tasks.size(); })
         .on_modify([](const std::string& op) {
             printf("[Hook] %s\n", op.c_str());
         })

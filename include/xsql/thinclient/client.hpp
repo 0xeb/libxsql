@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <stdexcept>
+#include <string>
+
 /**
  * @file client.hpp
  * @brief HTTP client wrapper for *sql tools
@@ -32,9 +35,6 @@
 #undef _XSQL_RESTORE_STRTOULL
 #endif
 
-#include <string>
-#include <stdexcept>
-
 namespace xsql::thinclient {
 
 // ============================================================================
@@ -45,6 +45,7 @@ struct client_config {
     std::string host = "127.0.0.1";
     int port = 5555;
     int timeout_sec = 30;
+    std::string auth_token;
 };
 
 // ============================================================================
@@ -60,6 +61,9 @@ public:
         cli_.set_connection_timeout(config.timeout_sec);
         cli_.set_read_timeout(config.timeout_sec);
         cli_.set_write_timeout(config.timeout_sec);
+        if (!config.auth_token.empty()) {
+            cli_.set_default_headers({{"X-XSQL-Token", config.auth_token}});
+        }
     }
 
     /**
@@ -82,11 +86,30 @@ public:
     /**
      * Get server status.
      * @return JSON status string
+     * @throws std::runtime_error on connection error or a non-200 response —
+     * a 401 Unauthorized body must never be handed back as if it were a
+     * status document.
      */
     std::string status() {
         auto res = cli_.Get("/status");
         check_response(res, "status");
+        if (res->status != 200) {
+            throw std::runtime_error("Status error: " + res->body);
+        }
         return res->body;
+    }
+
+    /**
+     * Request cooperative cancellation of queries already in flight.
+     * @throws std::runtime_error on connection error or when the configured
+     * server executor does not support cancellation.
+     */
+    void cancel() {
+        auto res = cli_.Post("/cancel", "", "text/plain");
+        check_response(res, "cancel");
+        if (res->status != 200) {
+            throw std::runtime_error("Cancel error: " + res->body);
+        }
     }
 
     /**
@@ -129,6 +152,7 @@ struct client_config {
     std::string host = "127.0.0.1";
     int port = 5555;
     int timeout_sec = 30;
+    std::string auth_token;
 };
 
 class client {
@@ -138,6 +162,7 @@ public:
     }
     std::string query(const std::string&) { return {}; }
     std::string status() { return {}; }
+    void cancel() {}
     void shutdown() {}
     bool ping() { return false; }
 };

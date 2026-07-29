@@ -15,6 +15,8 @@
 #include "statement.hpp"
 #include "status.hpp"
 
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -31,6 +33,30 @@ template<typename RowData>
 struct GeneratorTableDef;
 
 class Database;
+struct ScriptOptions;
+
+namespace detail {
+
+// Concrete table associations follow successful SQLite module lifecycle
+// callbacks. Keeping the implementation in the compiled layer avoids exposing
+// the authorizer registry in this public header.
+void write_surface_connected(sqlite3* db, const char* module_name,
+                             const char* schema_name, const char* table_name);
+void write_surface_destroyed(sqlite3* db, const char* schema_name,
+                             const char* table_name);
+
+} // namespace detail
+
+inline void stream_database_script_json(
+    Database& db,
+    const std::string& script,
+    const ScriptOptions& options,
+    const std::function<bool(const char*, std::size_t)>& sink);
+inline void stream_database_script_ndjson(
+    Database& db,
+    const std::string& script,
+    const ScriptOptions& options,
+    const std::function<bool(const char*, std::size_t)>& sink);
 
 bool register_vtable(Database& db, const char* module_name, const VTableDef* def);
 bool create_vtable(Database& db, const char* table_name, const char* module_name);
@@ -64,6 +90,16 @@ struct Row {
 struct QueryOptions {
     int timeout_ms = 0;
     int progress_steps = 1000;
+    // Optional cooperative cancellation predicate (see ScriptOptions::should_cancel).
+    // When set and it returns true, the query stops ASAP. A read-only,
+    // result-bearing statement keeps rows already gathered (partial=true + a
+    // "query cancelled" warning); with zero rows gathered it is an error instead
+    // (an empty "partial" would read as a valid truncation). A mutation, including
+    // DML with RETURNING, is aborted through sqlite3_interrupt so SQLite rolls the
+    // statement back, and reports an error; if it reaches completion before the
+    // abort lands it has committed, and the honest committed result is returned.
+    // Works even when timeout_ms==0.
+    std::function<bool()> should_cancel;
 };
 
 struct Result {
@@ -72,6 +108,10 @@ struct Result {
     std::string error;
     std::vector<std::string> warnings;
     bool timed_out = false;
+    // Set only when `rows` is a valid non-empty prefix of the full result set
+    // (cancel / timeout / mid-scan failure on a read-only statement with at least
+    // one row gathered). Never set on an empty result: partial && rows.empty()
+    // does not occur, so an empty successful result is always complete.
     bool partial = false;
     int elapsed_ms = 0;
 
@@ -201,14 +241,11 @@ private:
     void* native_handle_unsafe() const;
     sqlite3* sqlite_handle() const;
 
-    // Record a table module's write capabilities for the prepare-time
-    // write-surface authorizer (unsupported-write-surface handling). Called by the register_*
-    // friends after a successful module registration; create_table then maps the
-    // SQL table name onto the module's caps so the authorizer can deny an
-    // unsupported INSERT/UPDATE/DELETE consistently — including the 0-row case
-    // that never reaches xUpdate.
+    // Record a module's write capabilities. Its xCreate/xConnect callbacks map
+    // concrete schema/table names, including raw SQL and reopened databases.
     void record_write_surface(const char* module_name, bool insertable,
-                              bool deletable, bool updatable);
+                              bool deletable,
+                              std::vector<std::string> writable_columns);
 
     template<typename RowData>
     friend bool register_cached_vtable(Database& db,
@@ -226,6 +263,16 @@ private:
     friend bool create_vtable(Database& db,
                               const char* table_name,
                               const char* module_name);
+    friend void stream_database_script_json(
+        Database& db,
+        const std::string& script,
+        const ScriptOptions& options,
+        const std::function<bool(const char*, std::size_t)>& sink);
+    friend void stream_database_script_ndjson(
+        Database& db,
+        const std::string& script,
+        const ScriptOptions& options,
+        const std::function<bool(const char*, std::size_t)>& sink);
 };
 
 } // namespace xsql

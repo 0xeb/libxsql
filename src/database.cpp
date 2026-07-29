@@ -11,8 +11,12 @@
 #include <sqlite3.h>
 
 #include <chrono>
+#include <cctype>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace xsql {
 
@@ -21,16 +25,20 @@ namespace xsql {
 struct WriteCaps {
     bool insertable = false;
     bool deletable = false;
-    bool updatable = false;   // has at least one writable column
+    std::unordered_set<std::string> writable_columns;
+};
+
+struct WriteSurfaceRegistry {
+    std::mutex mutex;
+    std::unordered_map<std::string, WriteCaps> module_caps;
+    std::unordered_map<std::string, WriteCaps> table_caps;
+    std::string preparing_drop;
 };
 
 struct Database::Impl {
     sqlite3* db = nullptr;
     std::string last_error;
-    // module name -> caps (recorded at register time); SQL table name -> caps
-    // (mapped at create_table time, what the authorizer sees).
-    std::unordered_map<std::string, WriteCaps> module_caps;
-    std::unordered_map<std::string, WriteCaps> table_caps;
+    WriteSurfaceRegistry write_surfaces;
 };
 
 namespace {
@@ -38,6 +46,46 @@ namespace {
 const std::string& empty_error() {
     static const std::string kEmpty;
     return kEmpty;
+}
+
+std::string write_surface_key(const char* db_name, const char* table_name) {
+    std::string key = db_name && *db_name ? db_name : "main";
+    for (char& ch : key) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    key.push_back('\x1f');
+    if (table_name) {
+        for (const char* p = table_name; *p; ++p) {
+            key.push_back(static_cast<char>(
+                std::tolower(static_cast<unsigned char>(*p))));
+        }
+    }
+    return key;
+}
+
+std::string normalized_identifier(const char* value) {
+    std::string out;
+    if (!value) return out;
+    for (const char* p = value; *p; ++p) {
+        out.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(*p))));
+    }
+    return out;
+}
+
+// Intentionally leaked, function-local statics: an engine-lifetime Database
+// (a process-global singleton in several consumer tools) can be destroyed
+// during static teardown, after ordinary namespace-scope statics in this TU
+// would already be gone — destruction-order UB. Magic statics make first use
+// thread-safe; leaking makes last use always safe.
+std::mutex& registry_index_mutex() {
+    static auto* m = new std::mutex();
+    return *m;
+}
+
+std::unordered_map<sqlite3*, WriteSurfaceRegistry*>& registry_by_connection() {
+    static auto* map = new std::unordered_map<sqlite3*, WriteSurfaceRegistry*>();
+    return *map;
 }
 
 struct ScalarFnWrapper {
@@ -97,19 +145,37 @@ void destroy_aggregate_fn_wrapper(void* ptr) {
 // DML action at prepare time, INDEPENDENT of how many rows match — so a 0-row
 // DELETE/UPDATE on an unwritable surface is denied consistently instead of
 // silently "succeeding" (xUpdate is never called when nothing matches). The
-// composed message is byte-identical to detail::unsupported_* so the matched-row
-// path and this 0-row path report the same actionable, capability-scoped error.
+// INSERT/DELETE and table-level UPDATE messages match detail::unsupported_* so
+// the matched-row path and this 0-row path report the same actionable,
+// capability-scoped error; the column-scoped UPDATE denial additionally names
+// the offending column (which only prepare time knows).
 int write_surface_authorizer(void* pArg, int action, const char* a1,
-                             const char* /*a2*/, const char* /*db_name*/,
+                             const char* a2, const char* db_name,
                              const char* /*trigger*/) {
-    const auto* table_caps =
-        static_cast<const std::unordered_map<std::string, WriteCaps>*>(pArg);
-    if (!table_caps || !a1) return SQLITE_OK;
+    auto* surfaces = static_cast<WriteSurfaceRegistry*>(pArg);
+    if (!surfaces || !a1) return SQLITE_OK;
+
+    std::lock_guard<std::mutex> lock(surfaces->mutex);
+    const std::string target = write_surface_key(db_name, a1);
+    if (action == SQLITE_DROP_VTABLE || action == SQLITE_DROP_TABLE) {
+        surfaces->preparing_drop =
+            surfaces->table_caps.count(target) != 0 ? target : std::string{};
+        return SQLITE_OK;
+    }
+    // SQLite authorizes an internal DELETE from the virtual table while
+    // compiling DROP TABLE. Permit that one companion action without retiring
+    // the capability; xDestroy performs retirement only when DROP executes.
+    if (action == SQLITE_DELETE && surfaces->preparing_drop == target) {
+        surfaces->preparing_drop.clear();
+        return SQLITE_OK;
+    }
+    surfaces->preparing_drop.clear();
+
     if (action != SQLITE_INSERT && action != SQLITE_DELETE && action != SQLITE_UPDATE) {
         return SQLITE_OK;
     }
-    auto it = table_caps->find(a1);
-    if (it == table_caps->end()) return SQLITE_OK;   // not one of our vtables
+    auto it = surfaces->table_caps.find(target);
+    if (it == surfaces->table_caps.end()) return SQLITE_OK;   // not one of our vtables
     const WriteCaps& caps = it->second;
     const std::string table(a1);
     std::string phrase;
@@ -126,9 +192,17 @@ int write_surface_authorizer(void* pArg, int action, const char* a1,
             leaf = "delete";
             break;
         case SQLITE_UPDATE:
-            if (caps.updatable) return SQLITE_OK;
-            phrase = "UPDATE " + table + " is not supported";
-            leaf = "*";
+            if (a2 && caps.writable_columns.count(normalized_identifier(a2)) != 0) {
+                return SQLITE_OK;
+            }
+            // A table with NO writable columns at all (e.g. a generator without
+            // row_lookup) is a table-level capability gap: "column X is
+            // read-only" would misattribute it to a per-column flag when no
+            // UPDATE of any column can work.
+            phrase = (a2 && !caps.writable_columns.empty())
+                ? "column \"" + std::string(a2) + "\" is read-only"
+                : "UPDATE " + table + " is not supported";
+            leaf = (a2 && !caps.writable_columns.empty()) ? a2 : "*";
             break;
         default:
             return SQLITE_OK;
@@ -139,6 +213,36 @@ int write_surface_authorizer(void* pArg, int action, const char* a1,
 }
 
 } // namespace
+
+namespace detail {
+
+void write_surface_connected(sqlite3* db, const char* module_name,
+                             const char* schema_name, const char* table_name) {
+    if (!db || !module_name || !table_name || !*table_name) return;
+    std::lock_guard<std::mutex> index_lock(registry_index_mutex());
+    auto registry_it = registry_by_connection().find(db);
+    if (registry_it == registry_by_connection().end()) return;
+    auto* registry = registry_it->second;
+    std::lock_guard<std::mutex> registry_lock(registry->mutex);
+    auto caps_it =
+        registry->module_caps.find(normalized_identifier(module_name));
+    if (caps_it == registry->module_caps.end()) return;
+    registry->table_caps[write_surface_key(schema_name, table_name)] =
+        caps_it->second;
+}
+
+void write_surface_destroyed(sqlite3* db, const char* schema_name,
+                             const char* table_name) {
+    if (!db || !table_name || !*table_name) return;
+    std::lock_guard<std::mutex> index_lock(registry_index_mutex());
+    auto registry_it = registry_by_connection().find(db);
+    if (registry_it == registry_by_connection().end()) return;
+    auto* registry = registry_it->second;
+    std::lock_guard<std::mutex> registry_lock(registry->mutex);
+    registry->table_caps.erase(write_surface_key(schema_name, table_name));
+}
+
+} // namespace detail
 
 void** AggregateContext::state_ptr() {
     if (!ctx_) return nullptr;
@@ -182,8 +286,22 @@ Database::~Database() {
     close();
 }
 
+// Moving only transfers the Impl pointer. The Impl itself stays put on the heap,
+// so the authorizer's pArg and the write-surface registry entry (both of which
+// hold &impl_->write_surfaces) remain valid without re-registration.
 Database::Database(Database&& other) noexcept = default;
-Database& Database::operator=(Database&& other) noexcept = default;
+
+// Move-assignment must close the connection it is about to drop. A defaulted
+// operator would just delete the old Impl, leaking its sqlite3 handle and
+// stranding that handle's entry in the process-wide write-surface registry --
+// which is keyed by sqlite3* and only ever erased by close().
+Database& Database::operator=(Database&& other) noexcept {
+    if (this != &other) {
+        close();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
 
 bool Database::open(const char* path) {
     close();
@@ -197,19 +315,38 @@ bool Database::open(const char* path) {
         return false;
     }
     impl_->last_error.clear();
-    impl_->module_caps.clear();
-    impl_->table_caps.clear();
-    // Install the write-surface authorizer. It reads impl_->table_caps live at
+    {
+        std::lock_guard<std::mutex> lock(impl_->write_surfaces.mutex);
+        impl_->write_surfaces.module_caps.clear();
+        impl_->write_surfaces.table_caps.clear();
+        impl_->write_surfaces.preparing_drop.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(registry_index_mutex());
+        registry_by_connection()[impl_->db] = &impl_->write_surfaces;
+    }
+    // Install the write-surface authorizer. It reads the registry live at
     // prepare time (populated as tables are registered/created below), so a write
     // to an unsupported surface is denied at prepare — including the 0-row case.
-    sqlite3_set_authorizer(impl_->db, write_surface_authorizer, &impl_->table_caps);
+    sqlite3_set_authorizer(impl_->db, write_surface_authorizer,
+                           &impl_->write_surfaces);
     register_builtin_aggregates(*this);
     return true;
 }
 
 void Database::close() {
     if (impl_ && impl_->db) {
-        sqlite3_close(impl_->db);
+        {
+            std::lock_guard<std::mutex> lock(registry_index_mutex());
+            registry_by_connection().erase(impl_->db);
+        }
+        // close_v2, not close: with an unfinalized statement or unfinished
+        // backup, sqlite3_close returns SQLITE_BUSY and leaves the connection
+        // open — nulling the handle then leaked it permanently, with the live
+        // authorizer still pointing at an Impl about to be freed (a
+        // use-after-free on the next prepare). close_v2 marks the connection
+        // zombie and finishes the close when the last statement is finalized.
+        sqlite3_close_v2(impl_->db);
         impl_->db = nullptr;
     }
 }
@@ -242,21 +379,22 @@ bool Database::create_table(const char* table_name, const char* module_name) {
     if (!xsql::create_vtable(*this, table_name, module_name)) {
         return false;
     }
-    // Map the SQL table name onto its module's write caps so the authorizer can
-    // gate DML against the name it actually sees.
-    if (table_name && module_name) {
-        auto it = impl_->module_caps.find(module_name);
-        if (it != impl_->module_caps.end()) {
-            impl_->table_caps[table_name] = it->second;
-        }
-    }
     return true;
 }
 
 void Database::record_write_surface(const char* module_name, bool insertable,
-                                    bool deletable, bool updatable) {
+                                    bool deletable,
+                                    std::vector<std::string> writable_columns) {
     if (!impl_ || !module_name) return;
-    impl_->module_caps[module_name] = WriteCaps{insertable, deletable, updatable};
+    WriteCaps caps;
+    caps.insertable = insertable;
+    caps.deletable = deletable;
+    for (const auto& column : writable_columns) {
+        caps.writable_columns.insert(normalized_identifier(column.c_str()));
+    }
+    std::lock_guard<std::mutex> lock(impl_->write_surfaces.mutex);
+    impl_->write_surfaces.module_caps[normalized_identifier(module_name)] =
+        std::move(caps);
 }
 
 bool Database::register_and_create_table(const VTableDef& def) {
@@ -329,6 +467,14 @@ Status Database::register_aggregate(const char* name, int argc,
 }
 
 Statement Database::prepare_statement(const char* sql) {
+    // A DROP prepare abandoned before its companion internal DELETE arrives
+    // leaves the one-slot authorizer latch armed, and the next unrelated
+    // DELETE on the same table would be waved through without a capability
+    // check. Every new prepare starts with a clean latch.
+    if (impl_) {
+        std::lock_guard<std::mutex> lock(impl_->write_surfaces.mutex);
+        impl_->write_surfaces.preparing_drop.clear();
+    }
     std::string error;
     auto stmt = detail::prepare_statement(native_handle_unsafe(), sql, &error);
     impl_->last_error = error;
@@ -358,69 +504,185 @@ Result Database::query(const char* sql, const QueryOptions& options) {
         result.error = "Database not open";
         return result;
     }
-
-    auto stmt = prepare_statement(sql);
-    if (!stmt.valid()) {
-        result.error = stmt.error().empty() ? impl_->last_error : stmt.error();
-        return result;
-    }
+    const auto query_started_at = std::chrono::steady_clock::now();
 
     struct TimeoutState {
         std::chrono::steady_clock::time_point started_at{};
         int timeout_ms = 0;
         bool timed_out = false;
+        const std::function<bool()>* cancel = nullptr;  // optional cooperative-cancel predicate
+        bool cancelled = false;
+
+        std::string cancel_error;
+
+        bool poll_cancel() noexcept {
+            if (!cancel_error.empty() || cancelled) {
+                return true;
+            }
+            if (!cancel || !*cancel) {
+                return false;
+            }
+            try {
+                cancelled = (*cancel)();
+            } catch (const std::exception& e) {
+                cancel_error = std::string("cancellation predicate threw: ") + e.what();
+                return true;
+            } catch (...) {
+                cancel_error = "cancellation predicate threw a non-standard exception";
+                return true;
+            }
+            return cancelled;
+        }
+
+        bool poll_interrupt() noexcept {
+            if (poll_cancel()) {
+                return true;
+            }
+            if (timeout_ms <= 0) {
+                return false;
+            }
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started_at)
+                    .count();
+            if (elapsed_ms >= timeout_ms) {
+                timed_out = true;
+                return true;
+            }
+            return false;
+        }
     };
 
     struct ProgressHandler {
         static int callback(void* user_data) {
             auto* state = static_cast<TimeoutState*>(user_data);
-            if (!state || state->timeout_ms <= 0) {
+            if (!state) {
                 return 0;
             }
-            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - state->started_at).count();
-            if (elapsed_ms >= state->timeout_ms) {
-                state->timed_out = true;
-                return 1;
-            }
-            return 0;
+            return state->poll_interrupt() ? 1 : 0;
         }
     };
 
     TimeoutState timeout_state;
+    timeout_state.started_at = query_started_at;
+    timeout_state.timeout_ms = options.timeout_ms;
+    timeout_state.cancel = options.should_cancel ? &options.should_cancel : nullptr;
     const bool timeout_enabled = options.timeout_ms > 0;
+    const bool cancel_enabled = static_cast<bool>(options.should_cancel);
+    // The progress-handler + interrupt-checker machinery is needed whenever EITHER a
+    // deadline OR a cancel predicate is in play (cancel must work under timeout_ms==0).
+    const bool guard_enabled = timeout_enabled || cancel_enabled;
 
-    // RAII guard for the thread-local cooperative-cancellation checker. The
-    // progress handler only fires between VDBE opcodes, so it cannot interrupt a
-    // long C++ virtual-table cache-build; the checker lets such loops poll the
-    // same deadline via xsql::vtab_interrupted() and bail out cleanly.
-    struct InterruptCheckerGuard {
-        bool active = false;
-        ~InterruptCheckerGuard() { if (active) clear_interrupt_checker(); }
-    } interrupt_guard;
-
-    if (timeout_enabled) {
-        timeout_state.started_at = std::chrono::steady_clock::now();
-        timeout_state.timeout_ms = options.timeout_ms;
+    // Arm before prepare so xBestIndex and other prepare-time callbacks consume
+    // the same per-statement deadline as sqlite3_step(). Both guards restore an
+    // outer libxsql scope rather than clearing it.
+    std::optional<ScopedProgressHandler> progress_guard;
+    std::optional<ScopedInterruptChecker> checker_guard;
+    if (guard_enabled) {
         const int progress_steps = options.progress_steps > 0 ? options.progress_steps : 1000;
-        sqlite3_progress_handler(impl_->db, progress_steps, &ProgressHandler::callback, &timeout_state);
+        progress_guard.emplace(
+            impl_->db, progress_steps, &ProgressHandler::callback,
+            &timeout_state);
 
-        const auto deadline =
-            timeout_state.started_at + std::chrono::milliseconds(options.timeout_ms);
-        set_interrupt_checker([deadline]() {
-            return std::chrono::steady_clock::now() >= deadline;
+        // Interrupt checker for long C++ virtual-table loops: fire on the deadline
+        // (when one is set) OR when the cancel predicate says so.
+        checker_guard.emplace([&timeout_state]() {
+            return timeout_state.poll_interrupt();
         });
-        interrupt_guard.active = true;
     }
 
-    const auto query_started_at = std::chrono::steady_clock::now();
+    auto stmt = prepare_statement(sql);
+    if (!stmt.valid()) {
+        result.elapsed_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - query_started_at)
+                .count());
+        if (!timeout_state.cancel_error.empty()) {
+            result.error = timeout_state.cancel_error;
+        } else if (timeout_state.cancelled) {
+            result.error = "Query cancelled";
+        } else if (timeout_enabled && timeout_state.timed_out) {
+            result.timed_out = true;
+            result.error = "Query timed out";
+        } else {
+            result.error =
+                stmt.error().empty() ? impl_->last_error : stmt.error();
+        }
+        return result;
+    }
+
     const int col_count = stmt.column_count();
+    const bool partial_capable = col_count > 0 && stmt.is_readonly();
     result.columns.reserve(static_cast<size_t>(col_count));
     for (int i = 0; i < col_count; ++i) {
         result.columns.push_back(stmt.column_name(i));
     }
 
+    auto classify_interrupt = [&]() {
+        if (!timeout_state.cancel_error.empty()) {
+            result.rows.clear();
+            result.partial = false;
+            result.timed_out = false;
+            result.warnings.clear();
+            result.error = timeout_state.cancel_error;
+            return true;
+        }
+        // With NO rows gathered there is no prefix to keep: an empty "partial"
+        // result would read as a valid truncation of the real one, so a zero-row
+        // cancel/timeout is an error (same rule as the step-failure branch below).
+        if (timeout_state.cancelled) {
+            if (partial_capable && !result.rows.empty()) {
+                result.partial = true;
+                result.warnings.push_back(
+                    "query cancelled; returning partial rows");
+            } else {
+                result.rows.clear();
+                result.error = "Query cancelled";
+            }
+            return true;
+        }
+        if (timeout_enabled && timeout_state.timed_out) {
+            result.timed_out = true;
+            if (partial_capable && !result.rows.empty()) {
+                result.partial = true;
+                result.warnings.push_back(
+                    "query timed out; returning partial rows");
+            } else {
+                result.rows.clear();
+                result.error = "Query timed out";
+            }
+            return true;
+        }
+        return false;
+    };
+
+    const bool mutating = !stmt.is_readonly();
+    bool interrupt_sent = false;
     while (true) {
+        // Poll before the first step (and every later step). An already-cancelled
+        // short mutation must never execute and commit before SQLite's progress
+        // callback gets a chance to run.
+        if (guard_enabled && timeout_state.poll_interrupt()) {
+            // A mutation whose provisional RETURNING rows are already in flight
+            // must NOT be abandoned here: finalizing a non-errored statement
+            // COMPLETES it, and SQLite commits the DML. Ask SQLite to abort
+            // instead — that path rolls the statement back — and keep stepping
+            // until the abort surfaces as a step error.
+            if (mutating && !result.rows.empty()) {
+                if (!interrupt_sent) {
+                    sqlite3_interrupt(impl_->db);
+                    interrupt_sent = true;
+                }
+            } else {
+                result.elapsed_ms = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - query_started_at)
+                        .count());
+                classify_interrupt();
+                break;
+            }
+        }
+
         StepResult step = stmt.step();
         if (step == StepResult::row) {
             Row row;
@@ -440,49 +702,35 @@ Result Database::query(const char* sql, const QueryOptions& options) {
         result.elapsed_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - query_started_at).count());
 
-        if (timeout_enabled) {
-            sqlite3_progress_handler(impl_->db, 0, nullptr, nullptr);
-        }
-
-        const bool timed_out = timeout_enabled && timeout_state.timed_out;
-        if (timed_out) {
-            result.timed_out = true;
-            if (col_count > 0) {
-                result.partial = true;
-                result.warnings.push_back("query timed out; returning partial rows");
-            } else {
-                result.error = "Query timed out";
-            }
+        // SQLITE_DONE for a mutation means it completed and COMMITTED — a
+        // cancel/timeout latched during its final step must not relabel the
+        // honest result as a failure. A read-only statement can reach DONE with
+        // latched state when a cooperative vtable truncated its scan (e.g. a
+        // cache_builder bailing on vtab_interrupted), so reads still classify:
+        // rows gathered are a partial answer, none is an error.
+        if (step == StepResult::done && mutating) {
             break;
         }
+
+        if (classify_interrupt()) break;
 
         if (step == StepResult::done) {
             break;
         }
 
-        // A cooperative-cancellation bail-out (a vtable builder/iterator that
-        // polled vtab_interrupted() and stopped) surfaces as a statement error,
-        // not via the progress handler. If the deadline has passed, classify it
-        // as a timeout so callers treat it consistently. The connection remains
-        // reusable either way.
-        if (timeout_enabled &&
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - timeout_state.started_at).count()
-                >= timeout_state.timeout_ms) {
-            result.timed_out = true;
-            // Mirror the progress-handler timeout path above: a result-bearing
-            // statement (col_count > 0) keeps the rows gathered so far and flags
-            // them partial; a non-result statement reports a hard timeout error.
-            if (col_count > 0) {
-                result.partial = true;
-                result.warnings.push_back("query timed out; returning partial rows");
-            } else {
-                result.error = "Query timed out";
-            }
-            break;
-        }
-
         result.error = stmt.error().empty() ? sqlite3_errmsg(impl_->db) : stmt.error();
+        // Rows already delivered by a read-only statement stay valid, so a
+        // mid-scan failure is a partial answer. With NO rows gathered there is
+        // no prefix to keep: reporting partial would tell the caller an empty
+        // result set is a valid truncation of the real one. Mirrors the
+        // `rows > 0` gate in stream_database_script_json/_ndjson.
+        if (partial_capable && !result.rows.empty()) {
+            result.partial = true;
+            result.warnings.push_back(
+                "query failed; returning partial rows");
+        } else if (!partial_capable) {
+            result.rows.clear();
+        }
         break;
     }
 
@@ -518,6 +766,11 @@ Status Database::exec(const char* sql) {
     // sqlite3_exec runs its own prepare internally, so clear the denial slot
     // first and, on an authorizer denial, surface the capability-scoped message
     // rather than SQLite's fixed "not authorized" (unsupported-write-surface handling).
+    // Same clean-slate rule as prepare_statement for the DROP companion latch.
+    {
+        std::lock_guard<std::mutex> lock(impl_->write_surfaces.mutex);
+        impl_->write_surfaces.preparing_drop.clear();
+    }
     detail::clear_authorizer_denial();
     char* err = nullptr;
     int rc = sqlite3_exec(impl_->db, sql, nullptr, nullptr, &err);

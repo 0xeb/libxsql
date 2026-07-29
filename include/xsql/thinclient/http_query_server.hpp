@@ -10,7 +10,7 @@
  * @file http_query_server.hpp
  * @brief Consolidated HTTP query server for all *sql tools
  *
- * Provides the standard 5 endpoints (/, /help, /query, /status, /shutdown)
+ * Provides the standard 6 endpoints (/, /help, /query, /status, /cancel, /shutdown)
  * with two execution modes:
  *   - Direct: query callback runs on httplib worker thread
  *   - Command-queue: queries are queued for main-thread execution
@@ -47,11 +47,17 @@
 
 #include <xsql/json.hpp>
 #include <xsql/query_script.hpp>
+#include <xsql/thinclient/auth_compare.hpp>
 #include <xsql/thinclient/clipboard.hpp>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -61,7 +67,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <exception>
 
 namespace xsql::thinclient {
 
@@ -76,7 +81,8 @@ struct http_query_server_config {
     /// Help text returned by GET /help
     std::string help_text;
 
-    /// Port to listen on (0 = random port in 8100-8199)
+    /// Port to listen on (0 = random free port in 8100-8999, OS-assigned
+    /// fallback)
     int port = 0;
 
     /// Bind address (default: localhost only)
@@ -99,7 +105,8 @@ struct http_query_server_config {
     /// ScriptResult — no JSON round-trip.
     /// Takes precedence over query_fn. The executor runs one statement and fills
     /// `out`; it is invoked on the worker thread (use_queue=false) or the main
-    /// thread via the queue (use_queue=true), same threading contract as query_fn.
+    /// thread via the queue (use_queue=true), same threading contract as
+    /// query_fn.
     using statement_executor_t =
         std::function<void(const std::string& sql, xsql::ScriptStatementResult& out)>;
     statement_executor_t statement_executor;
@@ -113,8 +120,9 @@ struct http_query_server_config {
     /// stale data after an earlier mutation) rather than executing statements
     /// independently. The returned ScriptResult is formatted by the server
     /// (json/text/csv/tsv). Takes precedence over statement_executor and
-    /// query_fn. Intended for direct/serialize_requests executors (not the
-    /// use_queue main-thread path); thread safety is the caller's responsibility.
+    /// query_fn. With use_queue=true the whole executor runs on the thread that
+    /// calls process_one_command()/run_until_stopped(), preserving engine thread
+    /// affinity. Otherwise thread safety is the caller's responsibility.
     using script_executor_t =
         std::function<xsql::ScriptResult(const std::string& script,
                                          const xsql::ScriptOptions& opts)>;
@@ -138,7 +146,8 @@ struct http_query_server_config {
     /// 0 means unbounded.
     size_t max_queue = 0;
 
-    /// Optional dynamic queue timeout callback (overrides queue_admission_timeout_ms).
+    /// Optional dynamic queue timeout callback (overrides
+    /// queue_admission_timeout_ms).
     using queue_timeout_fn_t = std::function<int()>;
     queue_timeout_fn_t queue_admission_timeout_ms_fn;
 
@@ -158,6 +167,19 @@ struct http_query_server_config {
     /// servers). Locks per request (around the whole script), preserving
     /// multi-statement atomicity. Ignored when use_queue is true.
     bool serialize_requests = false;
+
+    /// If true, GET /status is bearer-guarded like /query (401 without a token
+    /// when auth_token is set). Secure by default; set false only when /status
+    /// is intentionally a public liveness probe that exposes no sensitive
+    /// readiness data. Appended to preserve positional aggregate initializers.
+    bool status_requires_auth = true;
+
+    /// Maximum accepted request-body size in bytes (0 = unlimited). httplib
+    /// fully buffers the body in memory before the handler runs, so an
+    /// unbounded default would let one oversized POST exhaust the host
+    /// process; 64 MiB comfortably covers real SQL scripts. Appended last to
+    /// preserve positional aggregate initializers.
+    std::size_t max_request_body_bytes = 64ull * 1024 * 1024;
 };
 
 // ============================================================================
@@ -167,21 +189,7 @@ struct http_query_server_config {
 class http_query_server {
 public:
     explicit http_query_server(const http_query_server_config& config)
-        : config_(config) {
-        // A whole-script executor has no main-thread queue path: the queue only
-        // drives statement_executor (xsql::run_script on the main thread). With
-        // use_queue=true the /query handler would still call script_executor
-        // directly on an httplib worker thread, silently violating the
-        // thread-affinity contract that use_queue exists to enforce. Reject the
-        // combination loudly at construction rather than mis-executing at runtime.
-        if (config_.script_executor && config_.use_queue) {
-            throw std::invalid_argument(
-                "http_query_server: script_executor is incompatible with use_queue "
-                "(the whole-script executor runs on the httplib worker thread and "
-                "has no main-thread queue path). Use statement_executor for the "
-                "queued/main-thread path, or set use_queue=false.");
-        }
-    }
+        : config_(config) {}
 
     ~http_query_server() {
         stop();
@@ -214,50 +222,51 @@ public:
     int start() {
         if (running_.load()) return port_;
 
-        int port = config_.port;
-        if (port == 0) {
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<> dis(8100, 8199);
-            port = dis(gen);
+        // A fixed (non-zero) port binds exactly that port with the fixed-port
+        // socket profile: POSIX SO_REUSEADDR (fast restart out of our own
+        // TIME_WAIT socket, but EADDRINUSE against a LIVE listener) and Windows
+        // SO_EXCLUSIVEADDRUSE. Never httplib's default, which sets SO_REUSEPORT
+        // on POSIX — that lets a second live process bind the same port and the
+        // kernel load-balance connections between them, the exact cross-routing
+        // failure the ephemeral search below exists to prevent.
+        if (config_.port != 0) {
+            const int bound = try_serve(config_.port, /*exclusive=*/false);
+            return bound > 0 ? bound : -1;
         }
 
-        svr_ = std::make_unique<httplib::Server>();
-        setup_routes(*svr_, port);
-
-        if (config_.extra_routes) {
-            config_.extra_routes(*svr_);
+        // Ephemeral (port == 0): search the documented 8100-8999 range for a
+        // port we can bind *exclusively*. Exclusive binding is what makes the
+        // search correct under concurrency: if a port is already held by a live
+        // server the bind fails and we move on, so two servers can never share a
+        // port. A shared port cross-routes clients to the wrong server (the root
+        // cause of flaky HTTP tests, where a client received another server's
+        // response). The wide 900-slot band keeps a predictable high range clear of
+        // the tools' fixed defaults (8080/8081/17198-17200) while making collisions
+        // vanishingly rare. Shuffle so concurrent servers spread across the range;
+        // if the whole range is busy, fall back to an OS-assigned free port.
+        std::array<int, 900> range;
+        for (int i = 0; i < 900; ++i) range[i] = 8100 + i;
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::shuffle(range.begin(), range.end(), gen);
+        // Bound the search: a plain bind failure is cheap, but a port that
+        // BINDS and then never reports a running accept loop costs ~500 ms of
+        // polling plus a teardown each — that is an environment problem
+        // (firewall sandboxing, exhausted handles) which 900 candidates cannot
+        // fix, and unbounded it turns start() into a multi-minute hang. Give
+        // up after a few such stalls or a total wall-clock budget.
+        const auto search_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        int stalled_binds = 0;
+        for (int candidate : range) {
+            if (std::chrono::steady_clock::now() >= search_deadline) return -1;
+            const int bound = try_serve(candidate, /*exclusive=*/true);
+            if (bound > 0) return bound;
+            if (bound == kBoundButNotServing && ++stalled_binds >= 3) return -1;
         }
-
-        port_ = port;
-        server_thread_ = std::thread([this, port]() {
-            svr_->listen(config_.bind_address.c_str(), port);
-        });
-
-        // Wait for server to start
-        int attempts = 0;
-        while (!svr_->is_running() && attempts < 50) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            attempts++;
-        }
-
-        if (!svr_->is_running()) {
-            // Bind failed (listen() already returned). Tear down cleanly: stop()
-            // unblocks listen() if it is somehow still mid-flight, then JOIN the
-            // thread (never detach -- a detached thread racing svr_.reset() is a
-            // use-after-free) and clear the stale endpoint so status/port() do
-            // not report a port we never bound.
-            svr_->stop();
-            if (server_thread_.joinable()) {
-                server_thread_.join();
-            }
-            svr_.reset();
-            port_ = 0;
-            return -1;
-        }
-
-        running_.store(true);
-        return port_;
+        // Range exhausted (heavy concurrency): let the OS assign any free port.
+        const int bound = try_serve(0, /*exclusive=*/true);
+        return bound > 0 ? bound : -1;
     }
 
     /**
@@ -323,8 +332,101 @@ public:
 
 private:
     // ========================================================================
+    // Server binding
+    // ========================================================================
+
+    // A bind that succeeded but whose accept loop never reported running —
+    // distinct from a plain bind failure (-1) so start()'s ephemeral search can
+    // stop burning ~500 ms per candidate on an environment that will never
+    // serve. Both map to -1 at the public start() boundary.
+    static constexpr int kBoundButNotServing = -2;
+
+    // Bind + start serving on `port` (0 = OS-assigned). Returns the bound port,
+    // -1 if the bind failed (port busy) so the caller can try another, or
+    // kBoundButNotServing (see above). Binds synchronously (bind_to_port /
+    // bind_to_any_port) before spawning the accept thread, so a busy port is
+    // detected immediately instead of after a poll.
+    //
+    // Socket profiles — NEITHER uses httplib's default_socket_options, whose
+    // POSIX SO_REUSEPORT would let a second live process bind the same port
+    // with the kernel load-balancing connections between them (cross-routing):
+    //   exclusive=true  (ephemeral probe): Windows SO_EXCLUSIVEADDRUSE; POSIX
+    //     no reuse flags at all, so a live OR TIME_WAIT port fails EADDRINUSE
+    //     and the search moves on.
+    //   exclusive=false (fixed port): Windows SO_EXCLUSIVEADDRUSE; POSIX
+    //     SO_REUSEADDR only — fast restart out of our own TIME_WAIT socket,
+    //     while a bind against a live listener still fails.
+    // A generic lambda deduces the socket handle type across httplib versions.
+    int try_serve(int port, bool exclusive) {
+        auto svr = std::make_unique<httplib::Server>();
+        svr->set_socket_options([exclusive](auto sock) {
+#ifdef _WIN32
+            (void)exclusive;
+            int yes = 1;
+            setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       reinterpret_cast<const char*>(&yes), sizeof(yes));
+#else
+            if (!exclusive) {
+                int yes = 1;
+                setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+                           reinterpret_cast<const char*>(&yes), sizeof(yes));
+            }
+#endif
+        });
+        if (config_.max_request_body_bytes > 0) {
+            svr->set_payload_max_length(config_.max_request_body_bytes);
+        }
+
+        int bound = port;
+        if (port == 0) {
+            bound = svr->bind_to_any_port(config_.bind_address.c_str());
+            if (bound <= 0) return -1;
+        } else if (!svr->bind_to_port(config_.bind_address.c_str(), port)) {
+            return -1;  // port already taken -- caller tries the next one
+        }
+
+        setup_routes(*svr, bound);
+        if (config_.extra_routes) config_.extra_routes(*svr);
+
+        svr_ = std::move(svr);
+        port_ = bound;
+        server_thread_ = std::thread([this]() { svr_->listen_after_bind(); });
+        return await_running();
+    }
+
+    // Wait for the accept loop to come up after a successful bind. The bind
+    // already succeeded, so this normally returns immediately; the teardown path
+    // guards the rare case where listen_after_bind never reports running (never
+    // detach the worker -- a detached thread racing svr_.reset() is a
+    // use-after-free -- and clear the endpoint so status/port() do not report a
+    // port we never served).
+    int await_running() {
+        int attempts = 0;
+        while (!svr_->is_running() && attempts < 50) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            attempts++;
+        }
+        if (!svr_->is_running()) {
+            svr_->stop();
+            if (server_thread_.joinable()) server_thread_.join();
+            svr_.reset();
+            port_ = 0;
+            return kBoundButNotServing;
+        }
+        running_.store(true);
+        return port_;
+    }
+
+    // ========================================================================
     // Internal command queue (for use_queue mode)
     // ========================================================================
+
+    enum class command_state {
+        queued,
+        started,
+        completed,
+        cancelled,
+    };
 
     struct pending_command {
         std::string sql;
@@ -332,10 +434,26 @@ private:
         bool use_executor = false;       // executor path: fill script_result
         xsql::ScriptOptions opts;
         xsql::ScriptResult script_result;
-        bool completed = false;
-        bool cancelled = false;          // waiter timed out/abandoned; worker must skip
+        // Late-bound /cancel snapshot: opts.should_cancel compares the live
+        // epoch against this cell. The worker re-stores the current epoch the
+        // moment execution starts, so a /cancel that arrives while the command
+        // is still QUEUED does not abort it — only actually-running queries
+        // observe a cancel (matching the libxsql-py per-request model).
+        std::shared_ptr<std::atomic<std::uint64_t>> cancel_epoch_cell;
+        int http_status = 200;
+        command_state state = command_state::queued;
         std::mutex done_mutex;
         std::condition_variable done_cv;
+    };
+
+    struct queued_string_result {
+        int http_status = 200;
+        std::string body;
+    };
+
+    struct queued_script_result {
+        int http_status = 200;
+        xsql::ScriptResult script;
     };
 
     static xsql::ScriptResult make_error_script_result(const std::string& msg) {
@@ -354,6 +472,9 @@ private:
             res.set_content(xsql::script_result_to_csv(sr), "text/csv");
         } else if (format == "tsv") {
             res.set_content(xsql::script_result_to_tsv(sr), "text/tab-separated-values");
+        } else if (format == "jsonl") {
+            res.set_content(xsql::script_result_to_jsonl(sr),
+                            "application/x-ndjson");
         } else {
             res.set_content(xsql::script_result_to_json(sr, include_sql), "application/json");
         }
@@ -364,10 +485,6 @@ private:
     // Admit a command to the queue and wait for the main thread to run it.
     // Shared by the legacy string path and the executor path.
     admit_result admit_and_wait(const std::shared_ptr<pending_command>& cmd) {
-        if (!running_.load()) {
-            return admit_result::not_running;
-        }
-
         int queue_timeout_ms = config_.queue_admission_timeout_ms;
         if (config_.queue_admission_timeout_ms_fn) {
             queue_timeout_ms = config_.queue_admission_timeout_ms_fn();
@@ -378,22 +495,29 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
+            // Synchronize the running check with stop()'s queue drain. Without
+            // this check under queue_mutex_, stop could drain the queue between
+            // an earlier check and this push, leaving an infinite-timeout
+            // waiter stranded forever.
+            if (!running_.load()) {
+                return admit_result::not_running;
+            }
             size_t max_queue = config_.max_queue;
             if (config_.max_queue_fn) {
                 max_queue = config_.max_queue_fn();
             }
             // max_queue bounds outstanding requests = those waiting in the queue
-            // PLUS the one currently in-flight on the main thread (processing_).
+            // PLUS commands currently in-flight on processing threads.
             // The worker pops a command before running it, so an in-flight command
-            // is no longer in pending_commands_; counting processing_ keeps this
+            // is no longer in pending_commands_; counting processing keeps this
             // path's effective ceiling identical to the serialize path (which
             // counts its lock holder via serialize_pending_). See POST /query.
             const size_t outstanding =
-                pending_commands_.size() + (processing_ ? 1 : 0);
+                pending_commands_.size() + processing_count_;
             if (max_queue > 0 && outstanding >= max_queue) {
                 return admit_result::queue_full;
             }
-            pending_commands_.push(cmd);
+            pending_commands_.push_back(cmd);
         }
         queue_cv_.notify_one();
 
@@ -401,63 +525,101 @@ private:
         {
             std::unique_lock<std::mutex> lock(cmd->done_mutex);
             if (queue_timeout_ms == 0) {
-                while (!cmd->completed) {
+                while (cmd->state != command_state::completed &&
+                       cmd->state != command_state::cancelled) {
                     cmd->done_cv.wait_for(lock, std::chrono::milliseconds(100));
                 }
-            } else if (!cmd->done_cv.wait_for(lock, std::chrono::milliseconds(queue_timeout_ms),
-                                              [&]() { return cmd->completed; })) {
-                // Timed out waiting in the queue. The command may still be sitting
-                // in pending_commands_ (shared_ptr keeps it alive); mark it
-                // cancelled so the worker skips it instead of running a request the
-                // client has already abandoned. If it completed in the race window,
-                // honor the result rather than discarding it.
-                if (cmd->completed) {
-                    return admit_result::ok;
+            } else {
+                const auto deadline =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(queue_timeout_ms);
+                if (!cmd->done_cv.wait_until(lock, deadline,
+                                              [&]() {
+                                                  return cmd->state != command_state::queued;
+                                              })) {
+                    // Admission timed out before execution began (the predicate
+                    // held false under the lock, so the command is still
+                    // queued). Mark it cancelled so a worker that races the
+                    // erase below skips it, and REMOVE it from the queue so the
+                    // corpse stops occupying a max_queue slot — the serialize
+                    // path releases its slot immediately via PendingGuard, and
+                    // this keeps the two ceilings genuinely equivalent.
+                    cmd->state = command_state::cancelled;
+                    lock.unlock();
+                    {
+                        std::lock_guard<std::mutex> qlock(queue_mutex_);
+                        auto it = std::find(pending_commands_.begin(),
+                                            pending_commands_.end(), cmd);
+                        if (it != pending_commands_.end()) {
+                            pending_commands_.erase(it);
+                        }
+                    }
+                    return admit_result::timeout;
                 }
-                cmd->cancelled = true;
-                return admit_result::timeout;
+
+                // queue_admission_timeout_ms bounds only time spent waiting for
+                // the main thread. Once execution starts, returning a timeout
+                // would be dishonest: the mutation could continue after the
+                // client was told it failed. Wait for the real result instead.
+                while (cmd->state == command_state::started) {
+                    cmd->done_cv.wait(lock);
+                }
             }
         }
         return admit_result::ok;
     }
 
-    std::string queue_and_wait(const std::string& sql) {
+    queued_string_result queue_and_wait(const std::string& sql) {
         auto cmd = std::make_shared<pending_command>();
         cmd->sql = sql;
         switch (admit_and_wait(cmd)) {
             case admit_result::not_running:
-                return xsql::json{{"success", false}, {"error", "Server not running"}}.dump();
+                return {
+                    503,
+                    xsql::json{
+                        {"success", false}, {"error", "Server not running"}}.dump()};
             case admit_result::queue_full:
-                return xsql::json{
-                    {"success", false}, {"error", "Queue full"},
-                    {"hint", "Reduce concurrency or increase max_queue"}}.dump();
+                return {
+                    503,
+                    xsql::json{
+                        {"success", false}, {"error", "Queue full"},
+                        {"hint", "Reduce concurrency or increase max_queue"}}.dump()};
             case admit_result::timeout:
-                return xsql::json{
-                    {"success", false}, {"error", "Request timed out while waiting in queue"},
-                    {"hint", "Reduce concurrency or increase queue_admission_timeout_ms"}}.dump();
+                return {
+                    408,
+                    xsql::json{
+                        {"success", false},
+                        {"error", "Request timed out while waiting in queue"},
+                        {"hint", "Reduce concurrency or increase "
+                                 "queue_admission_timeout_ms"}}.dump()};
             case admit_result::ok:
                 break;
         }
-        return cmd->result;
+        return {cmd->http_status, std::move(cmd->result)};
     }
 
-    xsql::ScriptResult queue_and_wait_script(const std::string& sql,
-                                             const xsql::ScriptOptions& opts) {
+    queued_script_result queue_and_wait_script(
+        const std::string& sql, const xsql::ScriptOptions& opts,
+        std::shared_ptr<std::atomic<std::uint64_t>> cancel_epoch_cell) {
         auto cmd = std::make_shared<pending_command>();
         cmd->sql = sql;
         cmd->use_executor = true;
         cmd->opts = opts;
+        cmd->cancel_epoch_cell = std::move(cancel_epoch_cell);
         switch (admit_and_wait(cmd)) {
             case admit_result::not_running:
-                return make_error_script_result("Server not running");
+                return {
+                    503, make_error_script_result("Server not running")};
             case admit_result::queue_full:
-                return make_error_script_result("Queue full");
+                return {503, make_error_script_result("Queue full")};
             case admit_result::timeout:
-                return make_error_script_result("Request timed out while waiting in queue");
+                return {
+                    408,
+                    make_error_script_result(
+                        "Request timed out while waiting in queue")};
             case admit_result::ok:
                 break;
         }
-        return cmd->script_result;
+        return {cmd->http_status, std::move(cmd->script_result)};
     }
 
     bool process_one_command_internal(std::chrono::milliseconds timeout) {
@@ -471,38 +633,57 @@ private:
             }
             if (!pending_commands_.empty()) {
                 cmd = pending_commands_.front();
-                pending_commands_.pop();
+                pending_commands_.pop_front();
                 // Count this command as in-flight so admit_and_wait's max_queue
                 // ceiling stays exact across the pop→run→complete window.
-                processing_ = true;
+                ++processing_count_;
             }
         }
 
         if (!cmd) return false;
 
-        // Clear processing_ on every exit path once we've popped a command.
+        // Decrement the processing count on every exit path after a pop.
         struct ProcessingGuard {
             std::mutex& m;
-            bool& flag;
+            std::size_t& count;
             ~ProcessingGuard() {
                 std::lock_guard<std::mutex> lock(m);
-                flag = false;
+                if (count != 0) {
+                    --count;
+                }
             }
-        } processing_guard{queue_mutex_, processing_};
+        } processing_guard{queue_mutex_, processing_count_};
 
         // Skip a command whose waiter already timed out / was drained: the client
         // is gone, so running it (especially an engine mutation) would be wrong.
+        // Otherwise mark it started while holding the same mutex used by the
+        // admission waiter, making the timeout-vs-start race deterministic.
         {
             std::lock_guard<std::mutex> lock(cmd->done_mutex);
-            if (cmd->cancelled || cmd->completed) {
+            if (cmd->state == command_state::cancelled ||
+                cmd->state == command_state::completed) {
                 return true;  // popped and discarded; nothing to execute
             }
+            // Arm the /cancel snapshot at the moment execution starts, then
+            // flip the state under the same lock: only cancels issued AFTER
+            // this point abort the command. A /cancel that raced in while the
+            // command sat in the queue is deliberately not honored — it targets
+            // the query that was in flight at the time, not this one.
+            if (cmd->cancel_epoch_cell) {
+                cmd->cancel_epoch_cell->store(cancel_epoch_.load());
+            }
+            cmd->state = command_state::started;
         }
+        cmd->done_cv.notify_one();
 
         try {
-            if (cmd->use_executor && config_.statement_executor) {
+            if (cmd->use_executor && config_.script_executor) {
+                cmd->script_result = config_.script_executor(cmd->sql, cmd->opts);
+            } else if (cmd->use_executor && config_.statement_executor) {
                 cmd->script_result =
                     xsql::run_script(cmd->sql, cmd->opts, config_.statement_executor);
+            } else if (cmd->use_executor) {
+                cmd->script_result = make_error_script_result("No query handler");
             } else if (config_.query_fn) {
                 cmd->result = config_.query_fn(cmd->sql);
             } else {
@@ -514,11 +695,20 @@ private:
             } else {
                 cmd->result = xsql::json{{"success", false}, {"error", e.what()}}.dump();
             }
+        } catch (...) {
+            if (cmd->use_executor) {
+                cmd->script_result =
+                    make_error_script_result("Unhandled query exception");
+            } else {
+                cmd->result = xsql::json{
+                    {"success", false},
+                    {"error", "Unhandled query exception"}}.dump();
+            }
         }
 
         {
             std::lock_guard<std::mutex> lock(cmd->done_mutex);
-            cmd->completed = true;
+            cmd->state = command_state::completed;
         }
         cmd->done_cv.notify_one();
         return true;
@@ -531,7 +721,7 @@ private:
     // less ScriptResult (silent failure on stop). Branch on use_executor so both
     // paths surface the shutdown reason.
     void drain_pending_commands(const std::string& message) {
-        std::queue<std::shared_ptr<pending_command>> pending;
+        std::deque<std::shared_ptr<pending_command>> pending;
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             std::swap(pending, pending_commands_);
@@ -542,18 +732,20 @@ private:
 
         while (!pending.empty()) {
             auto cmd = pending.front();
-            pending.pop();
+            pending.pop_front();
             if (!cmd) continue;
 
             {
                 std::lock_guard<std::mutex> lock(cmd->done_mutex);
-                if (!cmd->completed) {
+                if (cmd->state != command_state::completed &&
+                    cmd->state != command_state::cancelled) {
                     if (cmd->use_executor) {
                         cmd->script_result = make_error_script_result(message);
                     } else {
                         cmd->result = legacy_json;
                     }
-                    cmd->completed = true;
+                    cmd->http_status = 503;
+                    cmd->state = command_state::completed;
                 }
             }
             cmd->done_cv.notify_one();
@@ -578,7 +770,7 @@ private:
             }
         }
 
-        if (token == config_.auth_token) return true;
+        if (detail::timing_safe_equal(token, config_.auth_token)) return true;
 
         res.status = 401;
         res.set_content(R"({"success":false,"error":"Unauthorized"})", "application/json");
@@ -593,17 +785,26 @@ private:
         const auto& tool = config_.tool_name;
 
         // GET / - Welcome message (public, no auth)
-        svr.Get("/", [tool, port](const httplib::Request&, httplib::Response& res) {
+        // /cancel exists as a route for every config but hard-409s unless the
+        // whole-script executor is wired; only advertise what actually works.
+        const bool cancel_supported = static_cast<bool>(config_.script_executor);
+        svr.Get("/", [tool, port, cancel_supported](const httplib::Request&,
+                                                    httplib::Response& res) {
             // Uppercase tool name for display (e.g. "pdbsql" -> "PDBSQL HTTP Server")
             std::string display = tool;
             for (auto& c : display) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
             std::string welcome = display + " HTTP Server\n\nEndpoints:\n"
                 "  GET  /help     - API documentation\n"
-                "  POST /query    - Execute SQL query\n"
+                "  POST /query    - Execute SQL query\n";
+            if (cancel_supported) {
+                welcome += "  POST /cancel   - Cancel the in-flight query\n";
+            }
+            welcome +=
                 "  GET  /status   - Health check\n"
                 "  POST /shutdown - Stop server\n\n"
                 "Example: curl -X POST http://localhost:" + std::to_string(port) +
-                "/query -d \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n";
+                                  "/query -d \"SELECT name FROM sqlite_master WHERE "
+                                  "type='table' LIMIT 10\"\n";
             res.set_content(welcome, "text/plain");
         });
 
@@ -669,7 +870,8 @@ private:
                         res.set_content(xsql::json{
                             {"success", false},
                             {"error", "Request timed out while waiting for serialization"},
-                            {"hint", "Reduce concurrency or increase queue_admission_timeout_ms"}}.dump(),
+                            {"hint", "Reduce concurrency or increase "
+                                         "queue_admission_timeout_ms"}}.dump(),
                             "application/json");
                         return;
                     }
@@ -683,13 +885,14 @@ private:
                 auto fmt_it = req.params.find("format");
                 if (fmt_it != req.params.end() && !fmt_it->second.empty()) {
                     format = fmt_it->second;
-                    if (format != "json" && format != "text" &&
-                        format != "csv" && format != "tsv") {
+                    if (format != "json" && format != "jsonl" &&
+                        format != "text" && format != "csv" &&
+                        format != "tsv") {
                         res.status = 400;
                         res.set_content(
                             xsql::json{{"success", false},
                                        {"error", "unrecognized ?format '" + format +
-                                            "' (expected json, text, csv, or tsv)"}}.dump(),
+                                            "' (expected json, jsonl, text, csv, or tsv)"}}.dump(),
                             "application/json");
                         return;
                     }
@@ -762,7 +965,8 @@ private:
                 }
 
                 // Merge options from query params and the JSON body; either source
-                // setting a flag true enables it.
+                // setting a flag true enables it. Returns the /cancel snapshot
+                // cell so the caller can re-arm it when execution actually starts.
                 auto parse_opts = [&](xsql::ScriptOptions& opts) {
                     auto cont_it = req.params.find("continue_on_error");
                     if (cont_it != req.params.end() && cont_it->second == "1") {
@@ -774,32 +978,69 @@ private:
                     }
                     if (json_continue_on_error) opts.continue_on_error = true;
                     if (json_include_sql) opts.include_sql = true;
+                    // Cooperative cancellation via POST /cancel. The predicate
+                    // compares the live epoch against a per-request cell that is
+                    // re-armed at EXECUTION start (worker pop / just before the
+                    // direct call), so a /cancel only ever aborts queries that
+                    // were actually running when it arrived — queued-but-unstarted
+                    // work is not collateral. Unlike a shared bool that each new
+                    // request resets, a newly arrived request also cannot
+                    // un-cancel the query already in flight.
+                    auto cell = std::make_shared<std::atomic<std::uint64_t>>(
+                        cancel_epoch_.load());
+                    opts.should_cancel = [this, cell]() {
+                        return cancel_epoch_.load() != cell->load();
+                    };
+                    return cell;
                 };
 
                 if (config_.script_executor) {
                     // Engine-owned orchestration: the server parses options and
                     // formatting but hands the whole script to the executor so it
-                    // can wrap the run (batch/refresh semantics). No round-trip.
+                    // can wrap the run (batch/refresh semantics). In use_queue mode
+                    // the executor runs on the queue-processing thread.
                     xsql::ScriptOptions opts;
-                    parse_opts(opts);
-                    xsql::ScriptResult script = config_.script_executor(sql_text, opts);
+                    auto cancel_cell = parse_opts(opts);
+                    xsql::ScriptResult script;
+                    if (config_.use_queue) {
+                        auto queued =
+                            queue_and_wait_script(sql_text, opts, cancel_cell);
+                        res.status = queued.http_status;
+                        script = std::move(queued.script);
+                    } else {
+                        cancel_cell->store(cancel_epoch_.load());
+                        script = config_.script_executor(sql_text, opts);
+                    }
                     set_formatted(res, script, format, opts.include_sql);
                 } else if (config_.statement_executor) {
                     // Preferred path: the server owns option parsing + run_script
                     // + formatting, straight from the ScriptResult (no round-trip).
                     xsql::ScriptOptions opts;
-                    parse_opts(opts);
-                    xsql::ScriptResult script = config_.use_queue
-                        ? queue_and_wait_script(sql_text, opts)
-                        : xsql::run_script(sql_text, opts, config_.statement_executor);
+                    auto cancel_cell = parse_opts(opts);
+                    xsql::ScriptResult script;
+                    if (config_.use_queue) {
+                        auto queued =
+                            queue_and_wait_script(sql_text, opts, cancel_cell);
+                        res.status = queued.http_status;
+                        script = std::move(queued.script);
+                    } else {
+                        cancel_cell->store(cancel_epoch_.load());
+                        script = xsql::run_script(
+                            sql_text, opts, config_.statement_executor);
+                    }
                     set_formatted(res, script, format, opts.include_sql);
                 } else if (config_.query_fn) {
                     // Legacy path: callback returns a JSON string. Re-parse only
                     // for non-json formats (continue_on_error/include_sql are not
                     // available here — the callback owns its own ScriptOptions).
-                    std::string result = config_.use_queue
-                        ? queue_and_wait(sql_text)
-                        : config_.query_fn(sql_text);
+                    std::string result;
+                    if (config_.use_queue) {
+                        auto queued = queue_and_wait(sql_text);
+                        res.status = queued.http_status;
+                        result = std::move(queued.body);
+                    } else {
+                        result = config_.query_fn(sql_text);
+                    }
                     if (format == "json") {
                         res.set_content(result, "application/json");
                     } else {
@@ -825,10 +1066,11 @@ private:
             }
         });
 
-        // GET /status - Server status
+        // GET /status - Server status. It shares the configured authentication
+        // boundary by default. A tool may explicitly opt out when this route is
+        // a deliberately public liveness probe that exposes no sensitive data.
         svr.Get("/status", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!check_auth(req, res)) return;
-
+            if (config_.status_requires_auth && !check_auth(req, res)) return;
             try {
                 xsql::json status = {
                     {"success", true},
@@ -866,14 +1108,28 @@ private:
             }
             try {
                 std::thread([this] {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    stop();
-                    // Release the latch only after stop() has fully returned, so
-                    // the destructor cannot race ahead and free members we still
-                    // touch.
-                    std::lock_guard<std::mutex> lk(shutdown_latch_mu_);
-                    --shutdown_threads_inflight_;
-                    shutdown_latch_cv_.notify_all();
+                    // The decrement+notify must run on EVERY exit path of this
+                    // detached body: an exception escaping a detached thread is
+                    // std::terminate, and a skipped decrement leaves the
+                    // destructor's deliberately-unbounded latch wait hanging
+                    // forever. The guard releases only after stop() has fully
+                    // returned (or thrown), so the destructor can never race
+                    // ahead and free members this thread still touches.
+                    struct LatchRelease {
+                        http_query_server* self;
+                        ~LatchRelease() {
+                            std::lock_guard<std::mutex> lk(
+                                self->shutdown_latch_mu_);
+                            --self->shutdown_threads_inflight_;
+                            self->shutdown_latch_cv_.notify_all();
+                        }
+                    } release{this};
+                    try {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(100));
+                        stop();
+                    } catch (...) {
+                    }
                 }).detach();
             } catch (...) {
                 // The std::thread constructor threw (e.g. resource exhaustion),
@@ -885,6 +1141,36 @@ private:
                 --shutdown_threads_inflight_;
                 shutdown_latch_cv_.notify_all();
             }
+        });
+
+        // POST /cancel - Cooperatively cancel the in-flight query (guarded like
+        // /query and /shutdown). Advances the server-wide epoch; every query
+        // whose EXECUTION started before this request observes the change
+        // through ScriptOptions::should_cancel (each request re-arms its epoch
+        // snapshot at execution start, so queued-but-unstarted work is never
+        // collateral) and keeps any partial rows already gathered.
+        svr.Post("/cancel", [this](const httplib::Request& req, httplib::Response& res) {
+            if (!check_auth(req, res)) return;
+            // Only the whole-script executor receives ScriptOptions and can
+            // propagate should_cancel into an in-flight statement. The legacy
+            // query callback and statement executor receive SQL alone; they can
+            // observe cancellation only between statements, so acknowledging
+            // an in-flight cancellation request would be dishonest.
+            if (!config_.script_executor) {
+                res.status = 409;
+                res.set_content(
+                    xsql::json{
+                        {"success", false},
+                        {"error", "cancellation is not supported by "
+                                                     "the configured query callback"}}
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            cancel_epoch_.fetch_add(1);
+            res.set_content(
+                xsql::json{{"success", true}, {"message", "cancel requested"}}.dump(),
+                "application/json");
         });
     }
 
@@ -906,15 +1192,25 @@ private:
     std::timed_mutex serialize_mutex_; // serializes /query when serialize_requests
     std::atomic<size_t> serialize_pending_{0};  // in-flight+waiting serialize requests
     std::atomic<bool> running_{false};
+    // Server-wide cooperative-cancel epoch. Each /query holds a per-request
+    // snapshot cell that is re-armed when its execution starts; POST /cancel
+    // increments the epoch, so exactly the queries executing at that moment
+    // observe it — queued work starts clean, and later requests cannot clear
+    // cancellation for the query already in flight. Whole-script executors that
+    // run through run_database_script receive the predicate and can cancel
+    // mid-statement.
+    std::atomic<std::uint64_t> cancel_epoch_{0};
     int port_{0};
 
     std::function<bool()> interrupt_check_;
 
-    // Command queue (for use_queue mode)
+    // Command queue (for use_queue mode). A deque (not std::queue) so an
+    // admission-timed-out command can be erased from the middle: its slot must
+    // be released immediately, not held until a worker pops the corpse.
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
-    std::queue<std::shared_ptr<pending_command>> pending_commands_;
-    bool processing_ = false;  // a popped command is in-flight (counts toward max_queue)
+    std::deque<std::shared_ptr<pending_command>> pending_commands_;
+    std::size_t processing_count_ = 0;
 };
 
 // ============================================================================
@@ -922,12 +1218,15 @@ private:
 // ============================================================================
 
 /**
- * Format HTTP server info for display.
+ * Format HTTP server info for display. Pass cancel_supported=false when the
+ * server has no whole-script executor (POST /cancel would 409 there, so it
+ * should not be advertised) — the default keeps existing callers' output.
  */
 inline std::string format_http_info(const std::string& tool,
                                     int port,
                                     const std::string& bind_addr,
-                                    const std::string& stop_hint = "Press Ctrl+C to stop and return to REPL.") {
+                                    const std::string& stop_hint = "Press Ctrl+C to stop and return to REPL.",
+                                    bool cancel_supported = true) {
     std::ostringstream ss;
     const std::string rendered_host = format_url_host(bind_addr);
     ss << "HTTP server started on port " << port << "\n";
@@ -935,11 +1234,15 @@ inline std::string format_http_info(const std::string& tool,
     ss << "Endpoints:\n";
     ss << "  GET  /help     - API documentation\n";
     ss << "  POST /query    - Execute SQL query\n";
+    if (cancel_supported) {
+        ss << "  POST /cancel   - Cancel the in-flight query\n";
+    }
     ss << "  GET  /status   - Health check\n";
     ss << "  POST /shutdown - Stop server\n\n";
     ss << "Example:\n";
     ss << "  curl -X POST http://" << rendered_host << ":" << port
-       << "/query -d \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n\n";
+       << "/query -d \"SELECT name FROM sqlite_master WHERE type='table' LIMIT "
+          "10\"\n\n";
     ss << stop_hint << "\n";
     return ss.str();
 }
@@ -974,9 +1277,21 @@ inline std::string format_http_status(int port, bool running) {
 
 #else  // !XSQL_HAS_THINCLIENT
 
+#include <xsql/json.hpp>
+#include <xsql/query_script.hpp>
+
+#include <cstddef>
+#include <functional>
 #include <stdexcept>
 #include <string>
-#include <functional>
+
+// The stub must stay field-for-field and method-for-method in sync with the
+// real class above so a consumer compiles identically in both builds; the
+// httplib-typed members use this forward declaration (never dereferenced in a
+// no-thinclient build).
+namespace httplib {
+class Server;
+}  // namespace httplib
 
 namespace xsql::thinclient {
 
@@ -988,9 +1303,17 @@ struct http_query_server_config {
     std::string auth_token;
     using query_fn_t = std::function<std::string(const std::string& sql)>;
     query_fn_t query_fn;
-    using status_fn_t = std::function<void()>;
+    using statement_executor_t =
+        std::function<void(const std::string& sql,
+                           xsql::ScriptStatementResult& out)>;
+    statement_executor_t statement_executor;
+    using script_executor_t =
+        std::function<xsql::ScriptResult(const std::string& script,
+                                         const xsql::ScriptOptions& opts)>;
+    script_executor_t script_executor;
+    using status_fn_t = std::function<xsql::json()>;
     status_fn_t status_fn;
-    using extra_routes_fn_t = std::function<void(int)>;
+    using extra_routes_fn_t = std::function<void(httplib::Server& svr)>;
     extra_routes_fn_t extra_routes;
     int queue_admission_timeout_ms = 60000;
     size_t max_queue = 0;
@@ -999,6 +1322,9 @@ struct http_query_server_config {
     using max_queue_fn_t = std::function<size_t()>;
     max_queue_fn_t max_queue_fn;
     bool use_queue = false;
+    bool serialize_requests = false;
+    bool status_requires_auth = true;
+    std::size_t max_request_body_bytes = 64ull * 1024 * 1024;
 };
 
 class http_query_server {
@@ -1006,6 +1332,8 @@ public:
     explicit http_query_server(const http_query_server_config&) {
         throw std::runtime_error("Thin client not enabled. Build with XSQL_WITH_THINCLIENT=ON");
     }
+    http_query_server(const http_query_server&) = delete;
+    http_query_server& operator=(const http_query_server&) = delete;
     int start() { return -1; }
     void run_until_stopped() {}
     bool process_one_command() { return false; }
@@ -1014,9 +1342,10 @@ public:
     int port() const { return 0; }
     std::string url() const { return ""; }
     void set_interrupt_check(std::function<bool()>) {}
+    httplib::Server* http_server() { return nullptr; }
 };
 
-inline std::string format_http_info(const std::string&, int, const std::string&, const std::string& = "") { return ""; }
+inline std::string format_http_info(const std::string&, int, const std::string&, const std::string& = "", bool = true) { return ""; }
 inline std::string format_http_info(const std::string&, int, const std::string& = "") { return ""; }
 inline std::string format_http_status(int, bool, const std::string&) { return ""; }
 inline std::string format_http_status(int, bool) { return ""; }

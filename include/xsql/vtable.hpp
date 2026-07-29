@@ -17,40 +17,17 @@
  *   - Fluent builder API
  *   - Constraint pushdown via filter_eq() for O(1) lookups
  *
- * Example (read-only table):
- *
- *   auto def = xsql::table("numbers")
- *       .count([&]() { return data.size(); })
- *       .column_int64("value", [&](size_t i) { return data[i]; })
- *       .build();
- *
- * Example (writable table):
- *
- *   auto def = xsql::table("items")
- *       .count([&]() { return items.size(); })
- *       .on_modify([](const std::string& op) { log(op); })
- *       .column_text_rw("name", getter, setter)
- *       .deletable(delete_fn)
- *       .build();
- *
- * Example (with constraint pushdown):
- *
- *   auto def = xsql::table("xrefs")
- *       .count([&]() { return count_all_xrefs(); })
- *       .column_int64("to_ea", [&](size_t i) { return cache[i].to; })
- *       .filter_eq("to_ea", [](int64_t target) {
- *           return std::make_unique<XrefsToIterator>(target);
- *       }, 10.0)  // estimated cost
- *       .build();
  */
 
 #pragma once
 
 #include "database.hpp"
+#include "interruption.hpp"
 #include <sqlite3.h>
 #include <string>
 #include <vector>
 #include <functional>
+#include <exception>
 #include <sstream>
 #include <cstring>
 #include <cctype>
@@ -71,7 +48,16 @@ namespace detail {
 template <typename T>
 inline T* clone_def(const T* src) {
     if (!src) return nullptr;
-    return new (std::nothrow) T(*src);
+    auto* clone = new (std::nothrow) T(*src);
+    if (clone) {
+        try {
+            clone->transaction_hooks.initialize_state();
+        } catch (...) {
+            delete clone;
+            return nullptr;
+        }
+    }
+    return clone;
 }
 
 template <typename T>
@@ -107,40 +93,23 @@ inline const std::string& get_vtab_error() {
     return g_vtab_error_message;
 }
 
+// Assign pVtab->zErrMsg, freeing any message a previous assignment left there.
+// SQLite frees zErrMsg only when it consumes it, so a second bare assignment
+// before consumption leaks the first buffer — every zErrMsg write in this file
+// funnels through here.
+inline void set_vtab_errmsg(sqlite3_vtab* pVtab, const char* message) {
+    if (!pVtab) return;
+    sqlite3_free(pVtab->zErrMsg);
+    pVtab->zErrMsg = sqlite3_mprintf("%s", message);
+}
+
 inline int return_vtab_error(sqlite3_vtab* pVtab) {
     const std::string& err = get_vtab_error();
     if (!err.empty() && pVtab) {
-        pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+        set_vtab_errmsg(pVtab, err.c_str());
     }
     clear_vtab_error();
     return to_sqlite_status(Status::error);
-}
-
-// ============================================================================
-// Cooperative cancellation
-// ============================================================================
-//
-// SQLite's progress handler / sqlite3_interrupt only takes effect between VDBE
-// opcodes. A virtual-table cache-builder or iterator that loops for seconds in
-// C++ never yields to the VDBE, so the query timeout cannot reach it. To make
-// such loops cancellable, Database::query installs a thread-local interrupt
-// checker (bound to the same timeout deadline); long materialization loops poll
-// vtab_interrupted() and bail out via set_vtab_error() when it returns true.
-inline thread_local std::function<bool()> g_vtab_interrupt_check;
-
-inline void set_interrupt_checker(std::function<bool()> fn) {
-    g_vtab_interrupt_check = std::move(fn);
-}
-
-inline void clear_interrupt_checker() {
-    g_vtab_interrupt_check = nullptr;
-}
-
-// Returns true if the current query has exceeded its deadline. Cheap (a single
-// steady_clock compare behind a null check) -- safe to poll inside hot loops,
-// though callers typically poll every ~1024-4096 iterations to keep overhead nil.
-inline bool vtab_interrupted() {
-    return g_vtab_interrupt_check && g_vtab_interrupt_check();
 }
 
 // ============================================================================
@@ -330,6 +299,69 @@ inline const FilterDef* find_filter_by_column_and_op(const std::vector<FilterDef
 // Virtual Table Definition
 // ============================================================================
 
+// One coherent transaction lifecycle for writable virtual tables.
+//
+// SQLite propagates xSync failures, but ignores xCommit/xRollback failures.
+// Consequently prepare_commit/savepoint/release/rollback_to are fallible Status
+// callbacks, while commit/rollback are deliberately infallible finish callbacks.
+// Implementations of the latter must not throw; the C-boundary adapters still
+// catch defensively so an accidental exception can never unwind through SQLite.
+struct TransactionHooks {
+    using State = std::shared_ptr<void>;
+
+    // A definition may be registered on multiple SQLite connections. The
+    // factory is run when the definition is cloned for one registration, so
+    // staged backing state is connection-local even when the public definition
+    // object is process-global and reused. A `state` assigned directly on the
+    // definition (with no factory) is preserved by the clone and therefore
+    // SHARED across registrations — set state_factory when each connection
+    // needs its own instance.
+    std::function<State()> state_factory;
+    State state;
+    std::function<Status(const State&)> prepare_commit;
+    std::function<void(const State&)> commit;
+    std::function<void(const State&)> rollback;
+    std::function<Status(const State&, int)> savepoint;
+    std::function<Status(const State&, int)> release;
+    std::function<Status(const State&, int)> rollback_to;
+
+    void initialize_state() {
+        // Only a factory replaces the state: a caller-assigned `state` (already
+        // copied from the source definition) must survive registration, not be
+        // silently nulled — hooks dereference it inside SQLite callbacks.
+        if (state_factory) {
+            state = state_factory();
+        }
+    }
+};
+
+namespace detail {
+
+struct TransactionState {
+    struct Snapshot {
+        bool touched = false;
+        bool wrote = false;
+        bool prepared = false;
+    };
+
+    // Set before invoking a mutation callback. Unlike `wrote`, this remains
+    // true when a callback mutates external state and then reports failure, so
+    // xRollback can still run the compensating hook.
+    bool touched = false;
+    bool wrote = false;
+    bool prepared = false;
+    std::unordered_map<int, Snapshot> savepoints;
+
+    void reset() noexcept {
+        touched = false;
+        wrote = false;
+        prepared = false;
+        savepoints.clear();
+    }
+};
+
+} // namespace detail
+
 struct VTableDef {
     std::string name;
 
@@ -357,6 +389,8 @@ struct VTableDef {
     // Hook called before any modification (INSERT/UPDATE/DELETE)
     std::function<void(const std::string&)> before_modify;
 
+    TransactionHooks transaction_hooks;
+
     std::string schema() const {
         return detail::render_table_schema(name, columns);
     }
@@ -379,6 +413,10 @@ struct VTableDef {
 struct Vtab {
     sqlite3_vtab base;
     const VTableDef* def;
+    sqlite3* db = nullptr;
+    std::string schema_name;
+    std::string table_name;
+    detail::TransactionState transaction;
 };
 
 struct Cursor {
@@ -396,7 +434,7 @@ struct Cursor {
 };
 
 // xConnect/xCreate
-inline int vtab_connect(sqlite3* db, void* pAux, int, const char* const*,
+inline int vtab_connect(sqlite3* db, void* pAux, int argc, const char* const* argv,
                         sqlite3_vtab** ppVtab, char**) {
     const VTableDef* def = static_cast<const VTableDef*>(pAux);
 
@@ -406,13 +444,27 @@ inline int vtab_connect(sqlite3* db, void* pAux, int, const char* const*,
     auto* vtab = new Vtab();
     memset(&vtab->base, 0, sizeof(vtab->base));
     vtab->def = def;
+    vtab->db = db;
+    if (argc > 1 && argv && argv[1]) vtab->schema_name = argv[1];
+    if (argc > 2 && argv && argv[2]) vtab->table_name = argv[2];
     *ppVtab = &vtab->base;
+    detail::write_surface_connected(
+        db, argc > 0 && argv ? argv[0] : nullptr,
+        vtab->schema_name.c_str(), vtab->table_name.c_str());
     return to_sqlite_status(Status::ok);
 }
 
 // xDisconnect/xDestroy
 inline int vtab_disconnect(sqlite3_vtab* pVtab) {
     delete reinterpret_cast<Vtab*>(pVtab);
+    return to_sqlite_status(Status::ok);
+}
+
+inline int vtab_destroy(sqlite3_vtab* pVtab) {
+    auto* vtab = reinterpret_cast<Vtab*>(pVtab);
+    detail::write_surface_destroyed(
+        vtab->db, vtab->schema_name.c_str(), vtab->table_name.c_str());
+    delete vtab;
     return to_sqlite_status(Status::ok);
 }
 
@@ -621,8 +673,8 @@ inline Status apply_update_columns(sqlite3_vtab* pVtab, int argc,
             if (sqlite3_value_nochange(argv[i])) continue;
             const size_t c = static_cast<size_t>(i - 2);
             if (!col_writable(c)) {
-                pVtab->zErrMsg = sqlite3_mprintf("column \"%s\" is read-only",
-                                                 col_name(c).c_str());
+                set_vtab_errmsg(pVtab, ("column \"" + col_name(c) +
+                                        "\" is read-only").c_str());
                 return Status::error;
             }
         }
@@ -643,7 +695,7 @@ inline Status apply_update_columns(sqlite3_vtab* pVtab, int argc,
             if (!applied.empty())
                 err += " (partial UPDATE: column(s) [" + applied +
                        "] were already applied and cannot be rolled back)";
-            pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+            set_vtab_errmsg(pVtab, err.c_str());
             clear_vtab_error();
             return Status::error;
         }
@@ -662,11 +714,12 @@ inline Status apply_update_columns(sqlite3_vtab* pVtab, int argc,
 // capability (mutation.<table>.<leaf>, the convention every tool uses in its
 // `capabilities` table), and return SQLITE_ERROR (not SQLITE_READONLY) with it.
 // This is the matched-row half of the fix; the prepare-time authorizer produces
-// the identical message for the 0-row case so both report consistently.
+// the same message for the 0-row case (except that a column-scoped UPDATE
+// denial names the offending column, which only prepare time knows).
 inline int unsupported_write_error(sqlite3_vtab* pVtab, std::string phrase,
                                    const std::string& table, const char* leaf) {
     phrase += " (capability mutation." + table + "." + leaf + " is unavailable)";
-    if (pVtab) pVtab->zErrMsg = sqlite3_mprintf("%s", phrase.c_str());
+    set_vtab_errmsg(pVtab, phrase.c_str());
     return to_sqlite_status(Status::error);
 }
 inline int unsupported_insert(sqlite3_vtab* pVtab, const std::string& table) {
@@ -682,14 +735,15 @@ inline int unsupported_update(sqlite3_vtab* pVtab, const std::string& table) {
                                    table, "*");
 }
 
-// True if any column has a usable setter (the table can service an UPDATE). Used
-// to record a table's write caps for the prepare-time authorizer.
+// Names of columns with usable setters. SQLite's prepare-time authorizer uses
+// these to reject even a zero-row UPDATE of a read-only column.
 template <typename Def>
-inline bool def_has_writable_column(const Def* def) {
+inline std::vector<std::string> def_writable_columns(const Def* def) {
+    std::vector<std::string> out;
     for (const auto& c : def->columns) {
-        if (c.writable && static_cast<bool>(c.set)) return true;
+        if (c.writable && static_cast<bool>(c.set)) out.push_back(c.name);
     }
-    return false;
+    return out;
 }
 
 }  // namespace detail
@@ -713,6 +767,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         }
         size_t rowid = static_cast<size_t>(raw_rowid);
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("DELETE FROM " + def->name);
         }
@@ -720,6 +775,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         if (!def->delete_row(rowid)) {
             return to_sqlite_status(Status::error);
         }
+        vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
     }
 
@@ -733,6 +789,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         }
         size_t old_rowid = static_cast<size_t>(raw_rowid);
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("UPDATE " + def->name);
         }
@@ -744,6 +801,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
             [&](size_t c) { return def->columns[c].writable && static_cast<bool>(def->columns[c].set); },
             [&](size_t c) -> const std::string& { return def->columns[c].name; },
             [&](size_t c) { return def->columns[c].set(old_rowid, FunctionArg(argv[c + 2])); });
+        if (st == Status::ok) vtab->transaction.wrote = true;
         return to_sqlite_status(st);
     }
 
@@ -753,6 +811,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
             return detail::unsupported_insert(pVtab, def->name);
         }
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("INSERT INTO " + def->name);
         }
@@ -767,10 +826,217 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
             return return_vtab_error(pVtab);
         }
         clear_vtab_error();
+        vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
     }
 
     return to_sqlite_status(Status::read_only);
+}
+
+// ============================================================================
+// Transaction hook plumbing (shared by all three module flavors)
+// ============================================================================
+//
+// SQLite only enrolls a vtab into the connection's transaction set (and thus
+// only ever calls xSync/xCommit/xRollback on it) if the module provides a
+// non-null xBegin that returns SQLITE_OK (sqlite3VtabBegin -> addToVTrans).
+// So xBegin is MANDATORY as the enabler. The fallible prepare_commit hook fires
+// in xSync because SQLite propagates xSync errors but discards xCommit's return.
+//
+// A read-only SELECT never enrolls the vtab, but a schema write (CREATE VIRTUAL
+// TABLE) DOES enroll it and drives a full begin/commit cycle. A successful
+// xUpdate sets TransactionState::wrote. Crucially, xSync does NOT clear it: if a
+// later participant's xSync fails, SQLite calls xRollback on every participant
+// and an already-prepared table must still discard its staged external state.
+template <typename VtabT>
+inline int vtab_xbegin(sqlite3_vtab* pVtab) {
+    if (auto* vtab = reinterpret_cast<VtabT*>(pVtab)) {
+        vtab->transaction.reset();
+    }
+    return to_sqlite_status(Status::ok);
+}
+
+inline int return_transaction_hook_status(sqlite3_vtab* pVtab, Status status,
+                                          const char* hook_name) {
+    if (status == Status::ok) {
+        clear_vtab_error();
+        return to_sqlite_status(Status::ok);
+    }
+    const std::string message = get_vtab_error().empty()
+        ? std::string(hook_name) + " transaction hook failed"
+        : get_vtab_error();
+    set_vtab_errmsg(pVtab, message.c_str());
+    clear_vtab_error();
+    return to_sqlite_status(status);
+}
+
+template <typename VtabT>
+inline int vtab_prepare_commit(sqlite3_vtab* pVtab) {
+    auto* vtab = reinterpret_cast<VtabT*>(pVtab);
+    if (!vtab || !vtab->transaction.wrote || vtab->transaction.prepared) {
+        return to_sqlite_status(Status::ok);
+    }
+    if (vtab->def && vtab->def->transaction_hooks.prepare_commit) {
+        clear_vtab_error();
+        try {
+            const Status status =
+                vtab->def->transaction_hooks.prepare_commit(
+                    vtab->def->transaction_hooks.state);
+            if (status != Status::ok) {
+                return return_transaction_hook_status(pVtab, status, "prepare_commit");
+            }
+        } catch (const std::exception& e) {
+            set_vtab_error(e.what());
+            return return_vtab_error(pVtab);
+        } catch (...) {
+            set_vtab_error("prepare_commit transaction hook threw a non-standard exception");
+            return return_vtab_error(pVtab);
+        }
+        clear_vtab_error();
+    }
+    vtab->transaction.prepared = true;
+    return to_sqlite_status(Status::ok);
+}
+
+template <typename VtabT>
+inline int vtab_finish_commit(sqlite3_vtab* pVtab) {
+    auto* vtab = reinterpret_cast<VtabT*>(pVtab);
+    if (!vtab) {
+        return to_sqlite_status(Status::ok);
+    }
+    if (vtab->transaction.wrote && vtab->def &&
+        vtab->def->transaction_hooks.commit) {
+        try {
+            vtab->def->transaction_hooks.commit(
+                vtab->def->transaction_hooks.state);
+        } catch (...) {
+            // No usable failure channel exists here. The public contract makes
+            // commit infallible; contain accidental violations at the boundary.
+        }
+    }
+    vtab->transaction.reset();
+    clear_vtab_error();
+    return to_sqlite_status(Status::ok);
+}
+
+template <typename VtabT>
+inline int vtab_xrollback(sqlite3_vtab* pVtab) {
+    auto* vtab = reinterpret_cast<VtabT*>(pVtab);
+    if (!vtab) {
+        return to_sqlite_status(Status::ok);
+    }
+    if (vtab->transaction.touched && vtab->def &&
+        vtab->def->transaction_hooks.rollback) {
+        try {
+            vtab->def->transaction_hooks.rollback(
+                vtab->def->transaction_hooks.state);
+        } catch (...) {
+            // No usable failure channel exists here. The public contract makes
+            // rollback infallible; contain accidental violations at the boundary.
+        }
+    }
+    vtab->transaction.reset();
+    clear_vtab_error();
+    return to_sqlite_status(Status::ok);
+}
+
+template <typename VtabT>
+inline int vtab_run_savepoint_hook(
+    sqlite3_vtab* pVtab, int savepoint,
+    const std::function<Status(const TransactionHooks::State&, int)>
+        TransactionHooks::*hook_member,
+    const char* hook_name) {
+    auto* vtab = reinterpret_cast<VtabT*>(pVtab);
+    if (!vtab || !vtab->def)
+        return to_sqlite_status(Status::ok);
+    const auto& hook = vtab->def->transaction_hooks.*hook_member;
+    if (!hook)
+        return to_sqlite_status(Status::ok);
+    clear_vtab_error();
+    try {
+        const Status status =
+            hook(vtab->def->transaction_hooks.state, savepoint);
+        if (status != Status::ok) {
+            return return_transaction_hook_status(pVtab, status, hook_name);
+        }
+    } catch (const std::exception& e) {
+        set_vtab_error(e.what());
+        return return_vtab_error(pVtab);
+    } catch (...) {
+        set_vtab_error(std::string(hook_name) + " hook threw a non-standard exception");
+        return return_vtab_error(pVtab);
+    }
+    clear_vtab_error();
+    return to_sqlite_status(Status::ok);
+}
+
+template <typename VtabT> inline int vtab_xsavepoint(sqlite3_vtab* pVtab, int savepoint) {
+    auto* vtab = reinterpret_cast<VtabT*>(pVtab);
+    if (!vtab)
+        return to_sqlite_status(Status::ok);
+    vtab->transaction.savepoints[savepoint] = {
+        vtab->transaction.touched, vtab->transaction.wrote,
+        vtab->transaction.prepared};
+    const int rc =
+        vtab_run_savepoint_hook<VtabT>(
+            pVtab, savepoint, &TransactionHooks::savepoint, "savepoint");
+    if (rc != to_sqlite_status(Status::ok)) {
+        vtab->transaction.savepoints.erase(savepoint);
+    }
+    return rc;
+}
+
+template <typename VtabT> inline int vtab_xrelease(sqlite3_vtab* pVtab, int savepoint) {
+    auto* vtab = reinterpret_cast<VtabT*>(pVtab);
+    if (!vtab)
+        return to_sqlite_status(Status::ok);
+    const int rc =
+        vtab_run_savepoint_hook<VtabT>(
+            pVtab, savepoint, &TransactionHooks::release, "release");
+    if (rc != to_sqlite_status(Status::ok))
+        return rc;
+    for (auto it = vtab->transaction.savepoints.begin();
+         it != vtab->transaction.savepoints.end();) {
+        if (it->first >= savepoint) {
+            it = vtab->transaction.savepoints.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return rc;
+}
+
+template <typename VtabT> inline int vtab_xrollback_to(sqlite3_vtab* pVtab, int savepoint) {
+    auto* vtab = reinterpret_cast<VtabT*>(pVtab);
+    if (!vtab)
+        return to_sqlite_status(Status::ok);
+    const int rc =
+        vtab_run_savepoint_hook<VtabT>(
+            pVtab, savepoint, &TransactionHooks::rollback_to, "rollback_to");
+    if (rc != to_sqlite_status(Status::ok))
+        return rc;
+    const auto snapshot = vtab->transaction.savepoints.find(savepoint);
+    if (snapshot != vtab->transaction.savepoints.end()) {
+        vtab->transaction.touched = snapshot->second.touched;
+        vtab->transaction.wrote = snapshot->second.wrote;
+        vtab->transaction.prepared = snapshot->second.prepared;
+    } else {
+        // SQLite may enlist a virtual table only after a SAVEPOINT was opened.
+        // In that case xSavepoint was never delivered to this module, and every
+        // write it has seen is necessarily newer than the rollback target.
+        vtab->transaction.touched = false;
+        vtab->transaction.wrote = false;
+        vtab->transaction.prepared = false;
+    }
+    for (auto it = vtab->transaction.savepoints.begin();
+         it != vtab->transaction.savepoints.end();) {
+        if (it->first > savepoint) {
+            it = vtab->transaction.savepoints.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return rc;
 }
 
 // Create module with xUpdate support
@@ -781,7 +1047,7 @@ inline sqlite3_module create_module() {
     mod.xConnect = vtab_connect;
     mod.xBestIndex = vtab_best_index;
     mod.xDisconnect = vtab_disconnect;
-    mod.xDestroy = vtab_disconnect;
+    mod.xDestroy = vtab_destroy;
     mod.xOpen = vtab_open;
     mod.xClose = vtab_close;
     mod.xFilter = vtab_filter;
@@ -790,6 +1056,14 @@ inline sqlite3_module create_module() {
     mod.xColumn = vtab_column;
     mod.xRowid = vtab_rowid;
     mod.xUpdate = vtab_update;
+    // xBegin enrolls the vtab; xSync runs the fallible hook; xCommit clears state.
+    mod.xBegin = vtab_xbegin<Vtab>;
+    mod.xSync = vtab_prepare_commit<Vtab>;
+    mod.xCommit = vtab_finish_commit<Vtab>;
+    mod.xRollback = vtab_xrollback<Vtab>;
+    mod.xSavepoint = vtab_xsavepoint<Vtab>;
+    mod.xRelease = vtab_xrelease<Vtab>;
+    mod.xRollbackTo = vtab_xrollback_to<Vtab>;
     return mod;
 }
 
@@ -813,7 +1087,11 @@ inline bool register_vtable_sqlite(sqlite3* db, const char* module_name, const V
     int rc = sqlite3_create_module_v2(db, module_name, &get_module(),
                                       owned, &detail::destroy_def<VTableDef>);
     if (!xsql::is_ok(rc)) {
-        delete owned;
+        // Do NOT delete `owned` here: sqlite3_create_module_v2 invokes the
+        // xDestroy callback (destroy_def) even when registration fails, which
+        // already deletes the clone. A manual delete would be a double-free.
+        // (See SQLite docs: the destructor "is also invoked if the call ...
+        // fails" — same rule as sqlite3_create_function_v2.)
         return false;
     }
     return true;
@@ -848,7 +1126,7 @@ inline bool register_vtable(Database& db, const char* module_name, const VTableD
     db.record_write_surface(module_name,
                             def->supports_insert && static_cast<bool>(def->insert_row),
                             def->supports_delete && static_cast<bool>(def->delete_row),
-                            detail::def_has_writable_column(def));
+                            detail::def_writable_columns(def));
     return true;
 }
 
@@ -868,7 +1146,8 @@ public:
         def_.supports_delete = false;
     }
 
-    VTableBuilder& count(std::function<size_t()> fn) {
+    // Exact row count of the table (required: rows are addressed by index).
+    VTableBuilder& row_count(std::function<size_t()> fn) {
         def_.row_count = std::move(fn);
         return *this;
     }
@@ -882,6 +1161,11 @@ public:
     // Hook called before any modification
     VTableBuilder& on_modify(std::function<void(const std::string&)> fn) {
         def_.before_modify = std::move(fn);
+        return *this;
+    }
+
+    VTableBuilder& transaction_hooks(TransactionHooks hooks) {
+        def_.transaction_hooks = std::move(hooks);
         return *this;
     }
 
@@ -1274,6 +1558,9 @@ struct CachedTableDef {
     std::function<size_t()> estimate_rows_fn;
     std::function<size_t()> row_count_fn;
     std::function<void(std::vector<RowData>&)> cache_builder_fn;
+    std::function<void(
+        const TransactionHooks::State&, std::vector<RowData>&)>
+        stateful_cache_builder_fn;
 
     // Optional projection-aware variant for query-scoped (no_shared_cache)
     // tables. Receives SQLite's colUsed bitmask (bit i => column i is read by
@@ -1292,6 +1579,8 @@ struct CachedTableDef {
     bool supports_insert = false;
     std::function<void(const std::string&)> before_modify;
     std::function<void(const std::string&)> after_modify;
+
+    TransactionHooks transaction_hooks;
 
     // Populate a RowData from xUpdate argv values (argv[2..] = column values).
     // Used when the shared cache is not available (e.g., filter_eq path).
@@ -1375,6 +1664,19 @@ struct CachedTableDef {
         return -1;
     }
 
+    void build_rows(std::vector<RowData>& rows) const {
+        if (stateful_cache_builder_fn) {
+            stateful_cache_builder_fn(transaction_hooks.state, rows);
+        } else if (cache_builder_fn) {
+            cache_builder_fn(rows);
+        }
+    }
+
+    bool has_cache_builder() const noexcept {
+        return static_cast<bool>(stateful_cache_builder_fn) ||
+               static_cast<bool>(cache_builder_fn);
+    }
+
     // Ensure shared cache is built (thread-safe, lazy initialization)
     void ensure_cache_built() const {
         if (!use_shared_cache) return;
@@ -1390,8 +1692,8 @@ struct CachedTableDef {
         shared_cache->mutation_snapshot = false;
 
         // Build the cache
-        if (cache_builder_fn) {
-            cache_builder_fn(shared_cache->data);
+        if (stateful_cache_builder_fn || cache_builder_fn) {
+            build_rows(shared_cache->data);
             if (!get_vtab_error().empty()) {
                 shared_cache->data.clear();
                 shared_cache->indexes.clear();
@@ -1474,7 +1776,7 @@ inline void cached_table_invalidate_after_mutation(const CachedTableDef<RowData>
 // read-only tables, and tables that reconstruct via row_lookup/rowid_fn.
 template<typename RowData>
 inline bool query_scoped_uses_mutation_snapshot(const CachedTableDef<RowData>* def) {
-    if (!def || def->use_shared_cache || !def->cache_builder_fn ||
+    if (!def || def->use_shared_cache || !def->has_cache_builder() ||
         !cached_table_has_scan_driven_mutation(def)) {
         return false;
     }
@@ -1504,7 +1806,7 @@ inline bool ensure_query_scoped_mutation_snapshot(const CachedTableDef<RowData>*
     if (!snap.mutation_snapshot) {
         snap.data.clear();
         clear_vtab_error();
-        def->cache_builder_fn(snap.data);
+        def->build_rows(snap.data);
         if (!get_vtab_error().empty()) {
             snap.data.clear();
             snap.indexes.clear();
@@ -1663,6 +1965,10 @@ template<typename RowData>
 struct CachedVtab {
     sqlite3_vtab base;
     const CachedTableDef<RowData>* def;
+    sqlite3* db = nullptr;
+    std::string schema_name;
+    std::string table_name;
+    detail::TransactionState transaction;
     // NOTE: per-query projection state (colUsed) is NOT stored here. SQLite
     // reuses one vtab object across cursors, table aliases, and interleaved
     // prepared statements, so stashing colUsed on the vtab lets one scan clobber
@@ -1672,7 +1978,8 @@ struct CachedVtab {
 
 // SQLite callbacks for cached tables
 template<typename RowData>
-inline int cached_vtab_connect(sqlite3* db, void* pAux, int, const char* const*,
+inline int cached_vtab_connect(sqlite3* db, void* pAux, int argc,
+                               const char* const* argv,
                                sqlite3_vtab** ppVtab, char**) {
     const auto* def = static_cast<const CachedTableDef<RowData>*>(pAux);
     int rc = sqlite3_declare_vtab(db, def->schema().c_str());
@@ -1680,13 +1987,28 @@ inline int cached_vtab_connect(sqlite3* db, void* pAux, int, const char* const*,
     auto* vtab = new CachedVtab<RowData>();
     memset(&vtab->base, 0, sizeof(vtab->base));
     vtab->def = def;
+    vtab->db = db;
+    if (argc > 1 && argv && argv[1]) vtab->schema_name = argv[1];
+    if (argc > 2 && argv && argv[2]) vtab->table_name = argv[2];
     *ppVtab = &vtab->base;
+    detail::write_surface_connected(
+        db, argc > 0 && argv ? argv[0] : nullptr,
+        vtab->schema_name.c_str(), vtab->table_name.c_str());
     return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
 inline int cached_vtab_disconnect(sqlite3_vtab* pVtab) {
     delete reinterpret_cast<CachedVtab<RowData>*>(pVtab);
+    return to_sqlite_status(Status::ok);
+}
+
+template<typename RowData>
+inline int cached_vtab_destroy(sqlite3_vtab* pVtab) {
+    auto* vtab = reinterpret_cast<CachedVtab<RowData>*>(pVtab);
+    detail::write_surface_destroyed(
+        vtab->db, vtab->schema_name.c_str(), vtab->table_name.c_str());
+    delete vtab;
     return to_sqlite_status(Status::ok);
 }
 
@@ -1964,9 +2286,10 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                             cursor->rowid_lookup_row = shared->data[rowid];
                             cursor->rowid_lookup_eof = false;
                         }
-                    } else if (!cursor->def->row_lookup && cursor->def->cache_builder_fn) {
+                    } else if (!cursor->def->row_lookup &&
+                               cursor->def->has_cache_builder()) {
                         std::vector<RowData> rows;
-                        cursor->def->cache_builder_fn(rows);
+                        cursor->def->build_rows(rows);
                         if (!get_vtab_error().empty()) {
                             return return_vtab_error(pCursor->pVtab);
                         }
@@ -2059,12 +2382,12 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                             return to_sqlite_status(Status::ok);
                         }
                     }
-                } else if (cursor->def->cache_builder_fn) {
+                } else if (cursor->def->has_cache_builder()) {
                     // Query-scoped: build the per-cursor cache once (reused across
                     // this cursor's xFilter calls), then the sorted view on demand.
                     if (!cursor->cursor_index_built) {
                         cursor->index_cache.clear();
-                        cursor->def->cache_builder_fn(cursor->index_cache);
+                        cursor->def->build_rows(cursor->index_cache);
                         if (!get_vtab_error().empty()) {
                             cursor->index_cache.clear();
                             return return_vtab_error(pCursor->pVtab);
@@ -2142,14 +2465,14 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                             return to_sqlite_status(Status::ok);
                         }
                     }
-                } else if (cursor->def->cache_builder_fn) {
+                } else if (cursor->def->has_cache_builder()) {
                     // Query-scoped table: build the per-cursor cache + hash indexes
                     // ONCE, then reuse across this cursor's xFilter calls (a JOIN's
                     // inner loop reuses one cursor) so the JOIN stays fast without an
                     // engine-lifetime shared cache. Rebuilt per statement (new cursor).
                     if (!cursor->cursor_index_built) {
                         cursor->index_cache.clear();
-                        cursor->def->cache_builder_fn(cursor->index_cache);
+                        cursor->def->build_rows(cursor->index_cache);
                         if (!get_vtab_error().empty()) {
                             cursor->index_cache.clear();
                             return return_vtab_error(pCursor->pVtab);
@@ -2201,7 +2524,8 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
         if (!get_vtab_error().empty()) {
             return return_vtab_error(pCursor->pVtab);
         }
-    } else if (cursor->def->projection_cache_builder_fn || cursor->def->cache_builder_fn) {
+    } else if (cursor->def->projection_cache_builder_fn ||
+               cursor->def->has_cache_builder()) {
         cursor->cache.clear();
         clear_vtab_error();
         if (cursor->def->projection_cache_builder_fn) {
@@ -2213,7 +2537,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
             }
             cursor->def->projection_cache_builder_fn(cursor->cache, col_used);
         } else {
-            cursor->def->cache_builder_fn(cursor->cache);
+            cursor->def->build_rows(cursor->cache);
         }
         if (!get_vtab_error().empty()) {
             cursor->cache.clear();
@@ -2274,7 +2598,8 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
 
     // A range is only served off a sorted view, which needs the cache: shared
     // tables (engine-lifetime) or query-scoped tables with a cache_builder.
-    const bool range_eligible = def->use_shared_cache || def->cache_builder_fn;
+    const bool range_eligible =
+        def->use_shared_cache || def->has_cache_builder();
 
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
@@ -2340,7 +2665,7 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
 
         // Check for indexed column. Query-scoped tables also use it: xFilter builds
         // the hash index on a per-cursor cache (needs a cache_builder to (re)build).
-        int idx_pos = (def->use_shared_cache || def->cache_builder_fn)
+        int idx_pos = (def->use_shared_cache || def->has_cache_builder())
                           ? def->find_index(constraint.iColumn) : -1;
         if (idx_pos >= 0) {
             if (def->use_shared_cache) {
@@ -2427,7 +2752,9 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         // Keep the range strictly cheaper than a full scan even on tiny tables so
         // the planner prefers the pushed window (and the plan reports a virtual
         // index, not INDEX 0). Never dip to/below the EQ point-lookup cost (1.0).
-        if (range_cost >= full_cost) range_cost = std::max(1.5, full_cost * 0.75);
+        // Parenthesized to defeat a function-like max() macro (Windows <windows.h>
+        // defines one unless NOMINMAX is set; this header can be included after it).
+        if (range_cost >= full_cost) range_cost = (std::max)(1.5, full_cost * 0.75);
         pInfo->idxNum = RANGE_BASE + range_index_pos * RANGE_STRIDE + range_flags;
         pInfo->estimatedCost = range_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(
@@ -2500,7 +2827,8 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             row_ptr = &shared->data[rowid];
         } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
             row_ptr = &temp_row;
-        } else if (!def->rowid_fn && !def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
+        } else if (!def->rowid_fn && !def->use_shared_cache &&
+                   def->has_cache_builder() && raw_rowid >= 0) {
             // Non-shared positional rebuild: a full-scan rowid IS the row's index
             // in the freshly rebuilt cache (exact, no overlap risk), so it is
             // correct even for opt-out tables -- e.g. names (no_shared_cache,
@@ -2508,7 +2836,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             // position that row_lookup cannot resolve. Only the *shared* positional
             // branches above are gated on reconstruct_by_rowid.
             std::vector<RowData> rows;
-            def->cache_builder_fn(rows);
+            def->build_rows(rows);
             if (rowid < rows.size()) {
                 temp_row = std::move(rows[rowid]);
                 row_ptr = &temp_row;
@@ -2519,6 +2847,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             return to_sqlite_status(Status::error);
         }
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("DELETE FROM " + def->name);
         }
@@ -2528,6 +2857,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         }
         detail::cached_table_invalidate_after_mutation(def);
         if (def->after_modify) def->after_modify("DELETE FROM " + def->name);
+        vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
     }
 
@@ -2550,6 +2880,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             return return_vtab_error(pVtab);
         }
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("UPDATE " + def->name);
         }
@@ -2613,12 +2944,13 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             // row for a multi-row UPDATE, instead of a rebuild on mutated data.
             row_ptr = &shared->data[old_rowid];
         } else if (!def->update_from_column_values && !def->rowid_fn &&
-                   !def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
+                   !def->use_shared_cache && def->has_cache_builder() &&
+                   raw_rowid >= 0) {
             // Position-based rebuild: a full-scan rowid is the row's index in the
             // cache_builder output (only valid when the rowid is positional, i.e.
             // no rowid_fn, and not opted out). NOCHANGE is off here, so safe.
             std::vector<RowData> rows;
-            def->cache_builder_fn(rows);
+            def->build_rows(rows);
             if (old_rowid < rows.size()) {
                 temp_row = std::move(rows[old_rowid]);
                 row_ptr = &temp_row;
@@ -2655,6 +2987,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         if (st != Status::ok) return to_sqlite_status(st);
         detail::cached_table_invalidate_after_mutation(def);
         if (def->after_modify) def->after_modify("UPDATE " + def->name);
+        vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
     }
 
@@ -2664,6 +2997,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             return detail::unsupported_insert(pVtab, def->name);
         }
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("INSERT INTO " + def->name);
         }
@@ -2679,6 +3013,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         clear_vtab_error();
         def->invalidate_cache();
         if (def->after_modify) def->after_modify("INSERT INTO " + def->name);
+        vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
     }
 
@@ -2693,7 +3028,7 @@ inline sqlite3_module create_cached_module() {
     mod.xConnect = cached_vtab_connect<RowData>;
     mod.xBestIndex = cached_vtab_best_index<RowData>;
     mod.xDisconnect = cached_vtab_disconnect<RowData>;
-    mod.xDestroy = cached_vtab_disconnect<RowData>;
+    mod.xDestroy = cached_vtab_destroy<RowData>;
     mod.xOpen = cached_vtab_open<RowData>;
     mod.xClose = cached_vtab_close<RowData>;
     mod.xFilter = cached_vtab_filter<RowData>;
@@ -2702,6 +3037,14 @@ inline sqlite3_module create_cached_module() {
     mod.xColumn = cached_vtab_column<RowData>;
     mod.xRowid = cached_vtab_rowid<RowData>;
     mod.xUpdate = cached_vtab_update<RowData>;
+    // xBegin enrolls the vtab; xSync runs the fallible hook; xCommit clears state.
+    mod.xBegin = vtab_xbegin<CachedVtab<RowData>>;
+    mod.xSync = vtab_prepare_commit<CachedVtab<RowData>>;
+    mod.xCommit = vtab_finish_commit<CachedVtab<RowData>>;
+    mod.xRollback = vtab_xrollback<CachedVtab<RowData>>;
+    mod.xSavepoint = vtab_xsavepoint<CachedVtab<RowData>>;
+    mod.xRelease = vtab_xrelease<CachedVtab<RowData>>;
+    mod.xRollbackTo = vtab_xrollback_to<CachedVtab<RowData>>;
     return mod;
 }
 
@@ -2729,7 +3072,11 @@ inline bool detail::register_cached_vtable_sqlite(sqlite3* db,
     );
 
     if (!xsql::is_ok(rc)) {
-        delete owned;
+        // Do NOT delete `owned` here: sqlite3_create_module_v2 invokes the
+        // xDestroy callback (destroy_def) even when registration fails, which
+        // already deletes the clone. A manual delete would be a double-free.
+        // (See SQLite docs: the destructor "is also invoked if the call ...
+        // fails" — same rule as sqlite3_create_function_v2.)
         return false;
     }
     return true;
@@ -2744,7 +3091,7 @@ inline bool register_cached_vtable(Database& db,
     db.record_write_surface(module_name,
                             def->supports_insert && static_cast<bool>(def->insert_row),
                             def->supports_delete && static_cast<bool>(def->delete_row),
-                            detail::def_has_writable_column(def));
+                            detail::def_writable_columns(def));
     return true;
 }
 
@@ -2764,13 +3111,23 @@ public:
         return *this;
     }
 
-    CachedTableBuilder& count(std::function<size_t()> fn) {
+    // Exact row count for the COUNT_ONLY_SCAN fast path (optional; cheap
+    // count without materializing the cache). Same name and semantics as
+    // GeneratorTableBuilder::row_count.
+    CachedTableBuilder& row_count(std::function<size_t()> fn) {
         def_.row_count_fn = std::move(fn);
         return *this;
     }
 
     CachedTableBuilder& cache_builder(std::function<void(std::vector<RowData>&)> fn) {
         def_.cache_builder_fn = std::move(fn);
+        return *this;
+    }
+
+    CachedTableBuilder& stateful_cache_builder(
+        std::function<void(
+            const TransactionHooks::State&, std::vector<RowData>&)> fn) {
+        def_.stateful_cache_builder_fn = std::move(fn);
         return *this;
     }
 
@@ -2798,6 +3155,11 @@ public:
 
     CachedTableBuilder& after_modify(std::function<void(const std::string&)> fn) {
         def_.after_modify = std::move(fn);
+        return *this;
+    }
+
+    CachedTableBuilder& transaction_hooks(TransactionHooks hooks) {
+        def_.transaction_hooks = std::move(hooks);
         return *this;
     }
 
@@ -3235,7 +3597,19 @@ template<typename RowData>
 struct GeneratorTableDef {
     std::string name;
     std::function<size_t()> estimate_rows_fn;
+    // Optional exact row count. When set, a bare `SELECT COUNT(*)` (no
+    // constraints, no columns) is answered via COUNT_ONLY_SCAN — emitting N
+    // phantom rows — instead of materializing every generated row. Lets a
+    // backend that can count cheaply (e.g. DIA get_Count, memoized) skip a
+    // pathological full enumeration. See generator_table_supports_count_only_scan.
+    std::function<size_t()> row_count_fn;
     std::function<std::unique_ptr<Generator<RowData>>()> generator_factory_fn;
+    // Optional projection-aware full-scan factory. When set, a full-scan plan
+    // carries SQLite's colUsed bitmask (via idxStr, like projection_cache_builder_fn
+    // on cached tables) so the generator can skip materializing expensive unused
+    // columns (e.g. an undecorated name that requires demangling). Null => the plain
+    // generator_factory_fn is used, so existing consumers are unaffected.
+    std::function<std::unique_ptr<Generator<RowData>>(uint64_t)> projection_generator_factory_fn;
     std::vector<CachedColumnDef<RowData>> columns;
     std::vector<FilterDef> filters;
     std::vector<ParametricFilterDef<RowData>> parametric_filters;
@@ -3249,6 +3623,8 @@ struct GeneratorTableDef {
     bool supports_insert = false;
     std::function<void(const std::string&)> before_modify;
     std::function<void(const std::string&)> after_modify;
+
+    TransactionHooks transaction_hooks;
 
     std::string schema() const {
         return detail::render_table_schema(name, columns, [this](size_t i) {
@@ -3288,17 +3664,96 @@ struct GeneratorCursor {
     std::unique_ptr<RowIterator> iterator;
     bool using_iterator = false;
     bool iterator_eof = false;
+    // COUNT_ONLY_SCAN: emit count_only_total phantom (all-NULL) rows without
+    // running the generator, so `SELECT COUNT(*)` returns the right count cheaply.
+    bool using_count_only = false;
+    size_t count_only_total = 0;
+    size_t count_only_row = 0;
 };
+
+namespace detail {
+template<typename RowData>
+inline bool generator_table_supports_count_only_scan(const GeneratorTableDef<RowData>* def) {
+    // A bare COUNT(*) needs neither columns nor rowids, so an exact row_count_fn
+    // is sufficient. (Generator tables have no rowid_fn / scan-driven mutation
+    // path to conflict with, unlike CachedTableDef.)
+    return def && def->row_count_fn;
+}
+
+template<typename RowData>
+inline int materialize_count_only_generator(GeneratorCursor<RowData>* cursor,
+                                            uint64_t col_used) {
+    if (!cursor || !cursor->using_count_only) {
+        return to_sqlite_status(Status::ok);
+    }
+
+    // colUsed == 0 is shared by COUNT(*) and rowid-only scans. COUNT(*) never
+    // asks for xColumn/xRowid, but a rowid scan does; lazily switch that scan to
+    // the real generator so it observes backend rowids instead of phantom
+    // positional values.
+    //
+    // That switch IS a full enumeration, so a table that forbids full scans must
+    // refuse it here exactly as xFilter's full-scan branch would. Only the
+    // count-only answer (which enumerates nothing) is exempt from the guard.
+    if (!cursor->def->full_scan_error.empty()) {
+        cursor->using_count_only = false;
+        cursor->generator_eof = true;
+        set_vtab_error(cursor->def->full_scan_error);
+        return return_vtab_error(cursor->base.pVtab);
+    }
+
+    clear_vtab_error();
+    if (cursor->def->projection_generator_factory_fn) {
+        cursor->generator =
+            cursor->def->projection_generator_factory_fn(col_used);
+    } else if (cursor->def->generator_factory_fn) {
+        cursor->generator = cursor->def->generator_factory_fn();
+    }
+    if (!get_vtab_error().empty()) {
+        cursor->generator_eof = true;
+        return return_vtab_error(cursor->base.pVtab);
+    }
+
+    cursor->generator_eof = true;
+    for (size_t row = 0; cursor->generator && row <= cursor->count_only_row;
+         ++row) {
+        clear_vtab_error();
+        const bool has_row = cursor->generator->next();
+        if (!get_vtab_error().empty()) {
+            cursor->generator_eof = true;
+            return return_vtab_error(cursor->base.pVtab);
+        }
+        if (!has_row) {
+            cursor->generator_eof = true;
+            break;
+        }
+        cursor->generator_eof = false;
+    }
+
+    cursor->using_count_only = false;
+    if (!cursor->generator || cursor->generator_eof) {
+        set_vtab_error(
+            "generator row_count() exceeded the rows produced by generator()");
+        return return_vtab_error(cursor->base.pVtab);
+    }
+    return to_sqlite_status(Status::ok);
+}
+}  // namespace detail
 
 template<typename RowData>
 struct GeneratorVtab {
     sqlite3_vtab base;
     const GeneratorTableDef<RowData>* def = nullptr;
+    sqlite3* db = nullptr;
+    std::string schema_name;
+    std::string table_name;
+    detail::TransactionState transaction;
 };
 
 // SQLite callbacks for generator tables
 template<typename RowData>
-inline int generator_vtab_connect(sqlite3* db, void* pAux, int, const char* const*,
+inline int generator_vtab_connect(sqlite3* db, void* pAux, int argc,
+                                  const char* const* argv,
                                   sqlite3_vtab** ppVtab, char**) {
     const auto* def = static_cast<const GeneratorTableDef<RowData>*>(pAux);
     int rc = sqlite3_declare_vtab(db, def->schema().c_str());
@@ -3306,13 +3761,28 @@ inline int generator_vtab_connect(sqlite3* db, void* pAux, int, const char* cons
     auto* vtab = new GeneratorVtab<RowData>();
     memset(&vtab->base, 0, sizeof(vtab->base));
     vtab->def = def;
+    vtab->db = db;
+    if (argc > 1 && argv && argv[1]) vtab->schema_name = argv[1];
+    if (argc > 2 && argv && argv[2]) vtab->table_name = argv[2];
     *ppVtab = &vtab->base;
+    detail::write_surface_connected(
+        db, argc > 0 && argv ? argv[0] : nullptr,
+        vtab->schema_name.c_str(), vtab->table_name.c_str());
     return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
 inline int generator_vtab_disconnect(sqlite3_vtab* pVtab) {
     delete reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
+    return to_sqlite_status(Status::ok);
+}
+
+template<typename RowData>
+inline int generator_vtab_destroy(sqlite3_vtab* pVtab) {
+    auto* vtab = reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
+    detail::write_surface_destroyed(
+        vtab->db, vtab->schema_name.c_str(), vtab->table_name.c_str());
+    delete vtab;
     return to_sqlite_status(Status::ok);
 }
 
@@ -3327,6 +3797,9 @@ inline int generator_vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCurs
     cursor->iterator = nullptr;
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
+    cursor->using_count_only = false;
+    cursor->count_only_total = 0;
+    cursor->count_only_row = 0;
     *ppCursor = &cursor->base;
     return to_sqlite_status(Status::ok);
 }
@@ -3340,13 +3813,25 @@ inline int generator_vtab_close(sqlite3_vtab_cursor* pCursor) {
 template<typename RowData>
 inline int generator_vtab_next(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
-    if (cursor->using_iterator && cursor->iterator) {
+    if (cursor->using_count_only) {
+        cursor->count_only_row++;
+    } else if (cursor->using_iterator && cursor->iterator) {
+        clear_vtab_error();
         if (!cursor->iterator->next()) {
             cursor->iterator_eof = true;
         }
+        if (!get_vtab_error().empty()) {
+            cursor->iterator_eof = true;
+            return return_vtab_error(pCursor->pVtab);
+        }
     } else {
+        clear_vtab_error();
         if (!cursor->generator || !cursor->generator->next()) {
             cursor->generator_eof = true;
+        }
+        if (!get_vtab_error().empty()) {
+            cursor->generator_eof = true;
+            return return_vtab_error(pCursor->pVtab);
         }
     }
     return to_sqlite_status(Status::ok);
@@ -3355,6 +3840,9 @@ inline int generator_vtab_next(sqlite3_vtab_cursor* pCursor) {
 template<typename RowData>
 inline int generator_vtab_eof(sqlite3_vtab_cursor* pCursor) {
     auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+    if (cursor->using_count_only) {
+        return cursor->count_only_row >= cursor->count_only_total ? 1 : 0;
+    }
     if (cursor->using_iterator) {
         if (!cursor->iterator || cursor->iterator_eof) return 1;
         return cursor->iterator->eof() ? 1 : 0;
@@ -3367,6 +3855,17 @@ inline int generator_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* 
     auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
     if (sqlite3_vtab_nochange(ctx)) {
         return to_sqlite_status(Status::ok);
+    }
+
+    if (cursor->using_count_only) {
+        // The plan said colUsed == 0, yet a column is being read. We cannot know
+        // which OTHER columns SQLite will ask for on this same row, and the
+        // generator is built exactly once here -- so request every column. A
+        // per-column mask would leave a projection-aware generator silently
+        // omitting the columns fetched after this first one.
+        const int rc =
+            detail::materialize_count_only_generator(cursor, ~uint64_t{0});
+        if (!xsql::is_ok(rc)) return rc;
     }
 
     if (col < 0 || static_cast<size_t>(col) >= cursor->def->columns.size()) {
@@ -3396,6 +3895,11 @@ inline int generator_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* 
 template<typename RowData>
 inline int generator_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid) {
     auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
+    if (cursor->using_count_only) {
+        const int rc =
+            detail::materialize_count_only_generator(cursor, uint64_t{0});
+        if (!xsql::is_ok(rc)) return rc;
+    }
     if (cursor->using_iterator && cursor->iterator) {
         if (cursor->iterator_eof) {
             *pRowid = 0;
@@ -3424,6 +3928,28 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
     cursor->iterator = nullptr;
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
+    cursor->using_count_only = false;
+    cursor->count_only_total = 0;
+    cursor->count_only_row = 0;
+
+    if (idxNum == COUNT_ONLY_SCAN && argc == 0 &&
+        detail::generator_table_supports_count_only_scan(cursor->def)) {
+        clear_vtab_error();
+        cursor->using_count_only = true;
+        // row_count_fn is user code on a C-ABI boundary: an exception must not
+        // unwind through SQLite's VDBE (same rule as the transaction hooks).
+        try {
+            cursor->count_only_total = cursor->def->row_count_fn();
+        } catch (const std::exception& e) {
+            set_vtab_error(e.what());
+        } catch (...) {
+            set_vtab_error("row_count callback threw");
+        }
+        if (!get_vtab_error().empty()) {
+            return return_vtab_error(pCursor->pVtab);
+        }
+        return to_sqlite_status(Status::ok);
+    }
 
     if (idxNum == MISSING_REQUIRED_CONSTRAINT) {
         set_vtab_error(idxStr && idxStr[0] ? idxStr : "required constraint missing");
@@ -3452,17 +3978,19 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
                     }
                     clear_vtab_error();
                     cursor->generator = cf.create(args);
-                    const std::string& err = get_vtab_error();
-                    if (!err.empty()) {
-                        pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
-                        clear_vtab_error();
-                        return to_sqlite_status(Status::error);
+                    if (!get_vtab_error().empty()) {
+                        return return_vtab_error(pCursor->pVtab);
                     }
                     clear_vtab_error();
                     cursor->using_iterator = false;
                     cursor->generator_eof = true;
                     if (cursor->generator) {
+                        clear_vtab_error();
                         cursor->generator_eof = !cursor->generator->next();
+                        if (!get_vtab_error().empty()) {
+                            cursor->generator_eof = true;
+                            return return_vtab_error(pCursor->pVtab);
+                        }
                     }
                     return to_sqlite_status(Status::ok);
                 }
@@ -3480,17 +4008,19 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
                     }
                     clear_vtab_error();
                     cursor->generator = pf.create(args);
-                    const std::string& err = get_vtab_error();
-                    if (!err.empty()) {
-                        pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
-                        clear_vtab_error();
-                        return to_sqlite_status(Status::error);
+                    if (!get_vtab_error().empty()) {
+                        return return_vtab_error(pCursor->pVtab);
                     }
                     clear_vtab_error();
                     cursor->using_iterator = false;
                     cursor->generator_eof = true;
                     if (cursor->generator) {
+                        clear_vtab_error();
                         cursor->generator_eof = !cursor->generator->next();
+                        if (!get_vtab_error().empty()) {
+                            cursor->generator_eof = true;
+                            return return_vtab_error(pCursor->pVtab);
+                        }
                     }
                     return to_sqlite_status(Status::ok);
                 }
@@ -3502,17 +4032,19 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
             if (filter.filter_id == idxNum) {
                 clear_vtab_error();
                 cursor->iterator = filter.create(FunctionArg(argv[0]));
-                const std::string& err = get_vtab_error();
-                if (!err.empty()) {
-                    pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
-                    clear_vtab_error();
-                    return to_sqlite_status(Status::error);
+                if (!get_vtab_error().empty()) {
+                    return return_vtab_error(pCursor->pVtab);
                 }
                 clear_vtab_error();
                 cursor->using_iterator = true;
                 cursor->iterator_eof = true;
                 if (cursor->iterator) {
+                    clear_vtab_error();
                     cursor->iterator_eof = !cursor->iterator->next();
+                    if (!get_vtab_error().empty()) {
+                        cursor->iterator_eof = true;
+                        return return_vtab_error(pCursor->pVtab);
+                    }
                 }
                 return to_sqlite_status(Status::ok);
             }
@@ -3524,13 +4056,31 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
         return return_vtab_error(pCursor->pVtab);
     }
 
-    // Full scan - create generator and position to first row.
+    // Full scan - create generator and position to first row. A projection-aware
+    // factory (if set) receives colUsed (decoded from idxStr, set on the FILTER_NONE
+    // plan) so it can skip expensive unused columns; otherwise the plain factory runs.
     cursor->using_iterator = false;
     cursor->generator_eof = true;
-    if (cursor->def->generator_factory_fn) {
+    clear_vtab_error();
+    if (cursor->def->projection_generator_factory_fn) {
+        uint64_t col_used = ~0ull;  // absent/unparseable => assume all columns (safe)
+        if (idxStr && *idxStr) {
+            col_used = static_cast<uint64_t>(strtoull(idxStr, nullptr, 10));
+        }
+        cursor->generator = cursor->def->projection_generator_factory_fn(col_used);
+    } else if (cursor->def->generator_factory_fn) {
         cursor->generator = cursor->def->generator_factory_fn();
-        if (cursor->generator) {
-            cursor->generator_eof = !cursor->generator->next();
+    }
+    if (!get_vtab_error().empty()) {
+        cursor->generator_eof = true;
+        return return_vtab_error(pCursor->pVtab);
+    }
+    if (cursor->generator) {
+        clear_vtab_error();
+        cursor->generator_eof = !cursor->generator->next();
+        if (!get_vtab_error().empty()) {
+            cursor->generator_eof = true;
+            return return_vtab_error(pCursor->pVtab);
         }
     }
     return to_sqlite_status(Status::ok);
@@ -3540,6 +4090,28 @@ template<typename RowData>
 inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
     auto* vtab = reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
     const auto* def = vtab->def;
+
+    // Bare COUNT(*) (no constraints, no columns referenced): answer via the
+    // exact row_count_fn instead of a full generator enumeration. Mirrors the
+    // CachedTableDef COUNT_ONLY_SCAN plan. Must precede filter matching, though
+    // with nConstraint == 0 no filter would match anyway.
+    if (pInfo->nConstraint == 0 && pInfo->colUsed == 0 &&
+        detail::generator_table_supports_count_only_scan(def)) {
+        // Both callbacks are user code on a C-ABI boundary: a throw must not
+        // unwind through SQLite. A failing estimate simply skips the
+        // COUNT_ONLY promotion and lets the normal full-scan plan proceed
+        // (xFilter re-invokes row_count_fn with its own guard).
+        try {
+            size_t estimated_rows = def->estimate_rows_fn
+                                        ? def->estimate_rows_fn()
+                                        : def->row_count_fn();
+            pInfo->idxNum = COUNT_ONLY_SCAN;
+            pInfo->estimatedCost = static_cast<double>(estimated_rows);
+            pInfo->estimatedRows = static_cast<sqlite3_int64>(estimated_rows);
+            return to_sqlite_status(Status::ok);
+        } catch (...) {
+        }
+    }
 
     // First, check constraint filters (multi-column, multi-operator).
     const ConstraintFilterDef<RowData>* best_cf = nullptr;
@@ -3701,6 +4273,18 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         pInfo->idxNum = FILTER_NONE;
         pInfo->estimatedCost = static_cast<double>(estimated_rows);
         pInfo->estimatedRows = estimated_rows;
+        // Full-scan plan: carry colUsed to xFilter via idxStr (mirrors
+        // projection_cache_builder_fn) so a projection-aware generator can skip
+        // expensive unused columns. Only the FILTER_NONE plan reaches xFilter's
+        // full-scan branch and uses idxStr (filter/constraint plans return above),
+        // so there is no collision. Only allocated for projection-aware tables.
+        if (def->projection_generator_factory_fn) {
+            if (char* s = sqlite3_mprintf("%llu",
+                    static_cast<unsigned long long>(pInfo->colUsed))) {
+                pInfo->idxStr = s;
+                pInfo->needToFreeIdxStr = 1;
+            }
+        }
     }
     return to_sqlite_status(Status::ok);
 }
@@ -3722,12 +4306,13 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
         if (!def->row_lookup(row, raw_rowid)) {
             const std::string& err = get_vtab_error();
             if (!err.empty()) {
-                pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                set_vtab_errmsg(pVtab, err.c_str());
             }
             clear_vtab_error();
             return to_sqlite_status(Status::error);
         }
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("DELETE FROM " + def->name);
         }
@@ -3736,13 +4321,14 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
         if (!def->delete_row(row)) {
             const std::string& err = get_vtab_error();
             if (!err.empty()) {
-                pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                set_vtab_errmsg(pVtab, err.c_str());
             }
             clear_vtab_error();
             return to_sqlite_status(Status::error);
         }
 
         if (def->after_modify) def->after_modify("DELETE FROM " + def->name);
+        vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
     }
 
@@ -3764,12 +4350,13 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
         if (!def->row_lookup(row, raw_rowid)) {
             const std::string& err = get_vtab_error();
             if (!err.empty()) {
-                pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                set_vtab_errmsg(pVtab, err.c_str());
             }
             clear_vtab_error();
             return to_sqlite_status(Status::error);
         }
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("UPDATE " + def->name);
         }
@@ -3785,6 +4372,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
         if (st != Status::ok) return to_sqlite_status(st);
 
         if (def->after_modify) def->after_modify("UPDATE " + def->name);
+        vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
     }
 
@@ -3794,6 +4382,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
             return detail::unsupported_insert(pVtab, def->name);
         }
 
+        vtab->transaction.touched = true;
         if (def->before_modify) {
             def->before_modify("INSERT INTO " + def->name);
         }
@@ -3806,7 +4395,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
         if (!ok) {
             const std::string& err = get_vtab_error();
             if (!err.empty()) {
-                pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                set_vtab_errmsg(pVtab, err.c_str());
             }
             clear_vtab_error();
             return to_sqlite_status(Status::error);
@@ -3814,6 +4403,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
         clear_vtab_error();
 
         if (def->after_modify) def->after_modify("INSERT INTO " + def->name);
+        vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
     }
 
@@ -3826,10 +4416,7 @@ inline int generator_vtab_read_only_update(sqlite3_vtab* pVtab, int, sqlite3_val
     // readonly database" (which misleadingly implies the whole DB is read-only).
     // (This module is shared across row types, so the table name is not reachable
     // here; the message names the surface generically.)
-    if (pVtab) {
-        pVtab->zErrMsg = sqlite3_mprintf(
-            "%s", "this table is read-only (no write capability)");
-    }
+    set_vtab_errmsg(pVtab, "this table is read-only (no write capability)");
     return to_sqlite_status(Status::error);
 }
 
@@ -3841,7 +4428,7 @@ inline sqlite3_module create_generator_module() {
     mod.xConnect = generator_vtab_connect<RowData>;
     mod.xBestIndex = generator_vtab_best_index<RowData>;
     mod.xDisconnect = generator_vtab_disconnect<RowData>;
-    mod.xDestroy = generator_vtab_disconnect<RowData>;
+    mod.xDestroy = generator_vtab_destroy<RowData>;
     mod.xOpen = generator_vtab_open<RowData>;
     mod.xClose = generator_vtab_close<RowData>;
     mod.xFilter = generator_vtab_filter<RowData>;
@@ -3854,6 +4441,16 @@ inline sqlite3_module create_generator_module() {
     } else {
         mod.xUpdate = generator_vtab_read_only_update;
     }
+    // xBegin enrolls the vtab; xSync runs the fallible hook; xCommit clears
+    // state. Inert for read-only generator tables,
+    // which never enroll in a write transaction.
+    mod.xBegin = vtab_xbegin<GeneratorVtab<RowData>>;
+    mod.xSync = vtab_prepare_commit<GeneratorVtab<RowData>>;
+    mod.xCommit = vtab_finish_commit<GeneratorVtab<RowData>>;
+    mod.xRollback = vtab_xrollback<GeneratorVtab<RowData>>;
+    mod.xSavepoint = vtab_xsavepoint<GeneratorVtab<RowData>>;
+    mod.xRelease = vtab_xrelease<GeneratorVtab<RowData>>;
+    mod.xRollbackTo = vtab_xrollback_to<GeneratorVtab<RowData>>;
     return mod;
 }
 
@@ -3881,7 +4478,11 @@ inline bool detail::register_generator_vtable_sqlite(sqlite3* db,
     );
 
     if (!xsql::is_ok(rc)) {
-        delete owned;
+        // Do NOT delete `owned` here: sqlite3_create_module_v2 invokes the
+        // xDestroy callback (destroy_def) even when registration fails, which
+        // already deletes the clone. A manual delete would be a double-free.
+        // (See SQLite docs: the destructor "is also invoked if the call ...
+        // fails" — same rule as sqlite3_create_function_v2.)
         return false;
     }
     return true;
@@ -3899,7 +4500,8 @@ inline bool register_generator_vtable(Database& db,
     db.record_write_surface(module_name,
                             def->supports_insert && static_cast<bool>(def->insert_row),
                             def->supports_delete && static_cast<bool>(def->delete_row) && has_lookup,
-                            detail::def_has_writable_column(def) && has_lookup);
+                            has_lookup ? detail::def_writable_columns(def)
+                                       : std::vector<std::string>{});
     return true;
 }
 
@@ -3926,8 +4528,26 @@ public:
         return *this;
     }
 
+    // Exact row count for the COUNT_ONLY_SCAN fast path. Supply when the backend
+    // can count without a full enumeration (e.g. a memoized DIA get_Count), so a
+    // bare `SELECT COUNT(*)` skips materializing every row.
+    GeneratorTableBuilder& row_count(std::function<size_t()> fn) {
+        def_.row_count_fn = std::move(fn);
+        return *this;
+    }
+
     GeneratorTableBuilder& generator(std::function<std::unique_ptr<Generator<RowData>>()> fn) {
         def_.generator_factory_fn = std::move(fn);
+        return *this;
+    }
+
+    // Projection-aware full-scan factory: receives SQLite's colUsed bitmask so the
+    // generator can skip materializing expensive unused columns (e.g. an undecorated
+    // name that requires demangling). Used for the full-scan plan when set; falls
+    // back to generator() otherwise. Additive — existing tables need not set it.
+    GeneratorTableBuilder& projection_generator(
+            std::function<std::unique_ptr<Generator<RowData>>(uint64_t)> fn) {
+        def_.projection_generator_factory_fn = std::move(fn);
         return *this;
     }
 
@@ -3943,6 +4563,11 @@ public:
 
     GeneratorTableBuilder& after_modify(std::function<void(const std::string&)> fn) {
         def_.after_modify = std::move(fn);
+        return *this;
+    }
+
+    GeneratorTableBuilder& transaction_hooks(TransactionHooks hooks) {
+        def_.transaction_hooks = std::move(hooks);
         return *this;
     }
 

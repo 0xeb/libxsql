@@ -33,7 +33,7 @@ int main() {
 
     // Define virtual table
     auto def = xsql::table("products")
-        .count([&]() { return products.size(); })
+        .row_count([&]() { return products.size(); })
         .column_int("id", [&](size_t i) { return products[i].id; })
         .column_text("name", [&](size_t i) { return products[i].name; })
         .column_double("price", [&](size_t i) { return products[i].price; })

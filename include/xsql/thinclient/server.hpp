@@ -41,6 +41,8 @@
 #undef _XSQL_RESTORE_STRTOULL
 #endif
 
+#include <xsql/thinclient/auth_compare.hpp>
+
 #include <string>
 #include <functional>
 #include <atomic>
@@ -89,6 +91,24 @@ public:
      * Returns when server is stopped.
      */
     void run() {
+        // Fixed-port socket profile (same rationale as http_query_server):
+        // never httplib's default, whose POSIX SO_REUSEPORT lets a SECOND LIVE
+        // process bind the same port with the kernel load-balancing accepted
+        // connections between them — silent cross-routing. SO_REUSEADDR alone
+        // keeps the fast restart out of our own TIME_WAIT socket; Windows gets
+        // SO_EXCLUSIVEADDRUSE so the port cannot be hijacked.
+        svr_.set_socket_options([](auto sock) {
+#ifdef _WIN32
+            int yes = 1;
+            setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       reinterpret_cast<const char*>(&yes), sizeof(yes));
+#else
+            int yes = 1;
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+                       reinterpret_cast<const char*>(&yes), sizeof(yes));
+#endif
+        });
+
         // Let the application set up its routes
         if (config_.setup_routes) {
             config_.setup_routes(svr_);
@@ -187,7 +207,7 @@ public:
             }
         }
 
-        if (token == config_.auth_token) return true;
+        if (detail::timing_safe_equal(token, config_.auth_token)) return true;
 
         res.status = 401;
         res.set_content(R"({"success":false,"error":"Unauthorized"})", "application/json");
