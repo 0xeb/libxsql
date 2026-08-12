@@ -16,7 +16,6 @@
  *   - before_modify hook for undo/transaction integration
  *   - Fluent builder API
  *   - Constraint pushdown via filter_eq() for O(1) lookups
- *
  */
 
 #pragma once
@@ -240,6 +239,16 @@ struct FilterDef {
 
     // Factory: create iterator for the given constraint value
     std::function<std::unique_ptr<RowIterator>(FunctionArg)> create;
+
+    // Optional projection-aware factory: receives SQLite's colUsed bitmask
+    // (same encoding as GeneratorTableBuilder::projection_generator) alongside
+    // the constraint value, so a single-column EQ pushdown can pick a cheaper
+    // producer when the query's projection doesn't need an expensive/
+    // non-portable column. When set, xBestIndex carries colUsed through
+    // idxStr (otherwise unused by this filter shape) and xFilter calls this
+    // instead of `create`. Additive: a filter that never sets this leaves
+    // idxStr untouched and its behavior is byte-for-byte unchanged.
+    std::function<std::unique_ptr<RowIterator>(FunctionArg, uint64_t)> create_with_col_used;
 
     FilterDef(int col, int id, double cost, double rows,
               std::function<std::unique_ptr<RowIterator>(FunctionArg)> factory,
@@ -3579,6 +3588,13 @@ struct ParametricFilterDef {
     // Factory receives constraint values in column_indices order
     std::function<std::unique_ptr<Generator<RowData>>(
         const std::vector<FunctionArg>&)> create;
+
+    // Optional projection-aware factory (see FilterDef::create_with_col_used
+    // for the full rationale): receives colUsed alongside the constraint
+    // values. When set, used INSTEAD of `create`; additive, existing
+    // parametric_filter() callers are unaffected.
+    std::function<std::unique_ptr<Generator<RowData>>(
+        const std::vector<FunctionArg>&, uint64_t)> create_with_col_used;
 };
 
 template<typename RowData>
@@ -4007,7 +4023,19 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
                         args.emplace_back(argv[i]);
                     }
                     clear_vtab_error();
-                    cursor->generator = pf.create(args);
+                    if (pf.create_with_col_used) {
+                        // colUsed was carried through idxStr by xBestIndex
+                        // (see the projection-aware match above); absent/
+                        // unparseable => assume all columns (safe default,
+                        // same convention as the full-scan projection path).
+                        uint64_t col_used = ~0ull;
+                        if (idxStr && *idxStr) {
+                            col_used = static_cast<uint64_t>(strtoull(idxStr, nullptr, 10));
+                        }
+                        cursor->generator = pf.create_with_col_used(args, col_used);
+                    } else {
+                        cursor->generator = pf.create(args);
+                    }
                     if (!get_vtab_error().empty()) {
                         return return_vtab_error(pCursor->pVtab);
                     }
@@ -4031,7 +4059,15 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
                 clear_vtab_error();
-                cursor->iterator = filter.create(FunctionArg(argv[0]));
+                if (filter.create_with_col_used) {
+                    uint64_t col_used = ~0ull;
+                    if (idxStr && *idxStr) {
+                        col_used = static_cast<uint64_t>(strtoull(idxStr, nullptr, 10));
+                    }
+                    cursor->iterator = filter.create_with_col_used(FunctionArg(argv[0]), col_used);
+                } else {
+                    cursor->iterator = filter.create(FunctionArg(argv[0]));
+                }
                 if (!get_vtab_error().empty()) {
                     return return_vtab_error(pCursor->pVtab);
                 }
@@ -4232,6 +4268,14 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
             pInfo->idxNum = pf.filter_id;
             pInfo->estimatedCost = pf.estimated_cost;
             pInfo->estimatedRows = static_cast<sqlite3_int64>(pf.estimated_rows);
+            // Carry colUsed to xFilter for a projection-aware parametric
+            // filter, exactly like the full-scan projection_generator plan
+            // does (idxStr is otherwise unused by this filter shape).
+            if (pf.create_with_col_used) {
+                pInfo->idxStr = sqlite3_mprintf(
+                    "%llu", static_cast<unsigned long long>(pInfo->colUsed));
+                pInfo->needToFreeIdxStr = 1;
+            }
             return to_sqlite_status(Status::ok);
         }
     }
@@ -4259,6 +4303,13 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         pInfo->idxNum = best_filter->filter_id;
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
+        // Carry colUsed to xFilter for a projection-aware single-column
+        // filter (see the parametric-filter branch above for the same idiom).
+        if (best_filter->create_with_col_used) {
+            pInfo->idxStr = sqlite3_mprintf(
+                "%llu", static_cast<unsigned long long>(pInfo->colUsed));
+            pInfo->needToFreeIdxStr = 1;
+        }
     } else if (!missing_required_error.empty()) {
         pInfo->idxNum = MISSING_REQUIRED_CONSTRAINT;
         pInfo->idxStr = sqlite3_mprintf("%s", missing_required_error.c_str());
@@ -4702,6 +4753,28 @@ public:
         return *this;
     }
 
+    // Projection-aware single-EQ-column filter: like filter_eq(), but the
+    // factory also receives SQLite's colUsed bitmask (same encoding as
+    // projection_generator/projection_cache_builder), so a query that does
+    // not select an expensive or non-portable column can be routed to a
+    // cheaper/different producer than one that does. Additive: existing
+    // filter_eq() callers are unaffected.
+    GeneratorTableBuilder& filter_eq_projection(
+            const char* column_name,
+            std::function<std::unique_ptr<RowIterator>(int64_t, uint64_t)> factory,
+            double cost = 10.0, double est_rows = 10.0) {
+        int col_idx = def_.find_column(column_name);
+        if (col_idx < 0) return *this;
+        int filter_id = static_cast<int>(def_.filters.size()) + 1;
+        def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
+            std::function<std::unique_ptr<RowIterator>(FunctionArg)>{});
+        def_.filters.back().create_with_col_used =
+            [factory = std::move(factory)](FunctionArg val, uint64_t col_used) -> std::unique_ptr<RowIterator> {
+                return factory(val.as_int64(), col_used);
+            };
+        return *this;
+    }
+
     // Hidden columns: input parameters not part of output, constrained via WHERE clause.
     // These appear as HIDDEN in the schema and are typically used with parametric_filter().
     GeneratorTableBuilder& hidden_column_int64(const char* name) {
@@ -4739,6 +4812,29 @@ public:
         pf.estimated_cost = cost;
         pf.estimated_rows = est_rows;
         pf.create = std::move(factory);
+        def_.parametric_filters.push_back(std::move(pf));
+        return *this;
+    }
+
+    // Projection-aware parametric filter: like parametric_filter(), but the
+    // factory also receives SQLite's colUsed bitmask (see
+    // filter_eq_projection() for the full rationale). Additive: existing
+    // parametric_filter() callers are unaffected.
+    GeneratorTableBuilder& parametric_filter_projection(
+            std::initializer_list<const char*> param_columns,
+            std::function<std::unique_ptr<Generator<RowData>>(
+                const std::vector<FunctionArg>&, uint64_t)> factory,
+            double cost = 1.0, double est_rows = 100.0) {
+        ParametricFilterDef<RowData> pf;
+        for (const char* col_name : param_columns) {
+            int idx = def_.find_column(col_name);
+            if (idx < 0) return *this;  // Column not found
+            pf.column_indices.push_back(idx);
+        }
+        pf.filter_id = PARAMETRIC_FILTER_BASE + static_cast<int>(def_.parametric_filters.size());
+        pf.estimated_cost = cost;
+        pf.estimated_rows = est_rows;
+        pf.create_with_col_used = std::move(factory);
         def_.parametric_filters.push_back(std::move(pf));
         return *this;
     }
