@@ -180,6 +180,125 @@ struct http_query_server_config {
     /// process; 64 MiB comfortably covers real SQL scripts. Appended last to
     /// preserve positional aggregate initializers.
     std::size_t max_request_body_bytes = 64ull * 1024 * 1024;
+
+    /// Sink a streaming executor writes output chunks to. Returns false if the
+    /// client disconnected (httplib DataSink::write's own signal), so a
+    /// streaming executor should stop producing more chunks once it does.
+    using stream_sink_t = std::function<bool(const char* data, std::size_t len)>;
+
+    /// Optional: a TRUE chunked-response executor, for tools whose engine can
+    /// stream a result row-by-row with bounded memory (e.g. a live database
+    /// cursor) instead of building one xsql::ScriptResult first. Activated only
+    /// when the client sends `X-XSQL-Stream: 1` (row-by-row JSON envelope) or
+    /// `X-XSQL-Stream: ndjson` (one JSON object per row per line) on POST
+    /// /query, AND use_queue is false (queue-mode streaming is not supported —
+    /// the queue's main-thread execution model does not fit a chunked
+    /// response). Without this set, `X-XSQL-Stream` is silently ignored and
+    /// /query falls through to script_executor/statement_executor/query_fn,
+    /// which always materialize the full result before responding.
+    ///
+    /// `serialize_requests` DOES protect this executor even though the
+    /// chunked content provider httplib invokes runs AFTER the route handler
+    /// returns: the lock acquired for the handler is moved into the
+    /// provider's capture instead of released early, so it stays held for
+    /// the whole streamed execution, same guarantee as script_executor/
+    /// statement_executor. Not honored in use_queue mode (streaming is
+    /// unsupported there — see above).
+    using streaming_executor_t = std::function<void(
+        const std::string& script, const xsql::ScriptOptions& opts,
+        bool ndjson, const stream_sink_t& sink)>;
+    streaming_executor_t streaming_executor;
+
+    /// Requests served per kept-alive connection before the connection is
+    /// closed and a client must reconnect. httplib's own default
+    /// (CPPHTTPLIB_KEEPALIVE_MAX_COUNT) is 5 -- far too low for a batch
+    /// client issuing many small, fast queries (symbolize N addresses in a
+    /// loop -- exactly what pdbsql's fast pushdowns, symbol_at included,
+    /// exist to make cheap): every 5th request in a sequence
+    /// of otherwise sub-millisecond warm-connection queries cost roughly 2x
+    /// (reconnect overhead) under that default, a pattern that scales with
+    /// real network RTT, not just loopback. Raised high enough that a
+    /// realistic batch workflow never hits it.
+    ///
+    /// Deliberately NOT paired with a raised keep_alive_timeout: httplib's
+    /// Server::stop() only closes the LISTENING socket -- an already-accepted
+    /// connection's worker stays blocked reading the next request until that
+    /// per-connection read times out (httplib's own keep-alive idle timeout),
+    /// and stop()/join() cannot return until it does. Raising the idle
+    /// timeout to make batch scripts tolerate think-time between requests
+    /// would mean POST /shutdown (or the destructor) blocking for that same
+    /// duration whenever a client's connection happens to be idle-but-open --
+    /// found live while testing this exact change (a keep-alive connection
+    /// idle at stop() time hung join() until the timeout elapsed). Bounded to
+    /// the request COUNT instead: a continuously-batching client never idles
+    /// long enough to hit httplib's default timeout regardless, so this gets
+    /// the reconnect-avoidance win with no shutdown-latency cost.
+    std::size_t keep_alive_max_count = 1000;
+};
+
+// ============================================================================
+// StreamWriteCoalescer
+// ============================================================================
+
+// A `streaming_executor` emits one physical-write call per ROW (see
+// query_script.hpp's stream_database_script_json/_ndjson) -- forwarding each
+// of those straight to httplib's chunked-transfer DataSink::write() (one
+// framed chunk and one write() call per row) is several times SLOWER than
+// the buffered (non-streamed) path for an identical bulk pull, purely from
+// per-call framing/syscall overhead, not from the underlying bytes.
+//
+// StreamWriteCoalescer sits between the per-row emits and the real sink,
+// batching them into `flush_threshold_bytes`-sized physical writes. This
+// cuts the write-call count by 2-3 orders of magnitude on a bulk export
+// while keeping every byte on the wire identical to the unbatched form
+// (verified: the client-assembled body is unchanged either way) and keeping
+// time-to-first-byte well under a second (the default 64 KB threshold is
+// reached after a few hundred rows on any real table). `real_write` returns
+// false on a failed/disconnected write, matching DataSink::write's contract;
+// once that happens, every subsequent write()/flush() no-ops and returns
+// false, so a caller's existing "sink returned false -> abort" latch (see
+// query_script.hpp's `emit`) keeps working, just detected up to one
+// buffer's worth of rows later than before -- the same bounded-latency
+// tradeoff any buffered stream makes.
+class StreamWriteCoalescer {
+public:
+    using write_fn_t = std::function<bool(const char*, std::size_t)>;
+
+    explicit StreamWriteCoalescer(write_fn_t real_write,
+                                   std::size_t flush_threshold_bytes = 64 * 1024)
+        : real_write_(std::move(real_write))
+        , flush_threshold_bytes_(flush_threshold_bytes) {
+        buf_.reserve(flush_threshold_bytes_ + 4096);
+    }
+
+    // Matches the stream_sink_t signature so it can be handed directly to a
+    // streaming_executor as the sink.
+    bool write(const char* d, std::size_t n) {
+        if (failed_) return false;
+        buf_.append(d, n);
+        if (buf_.size() >= flush_threshold_bytes_) flush();
+        return !failed_;
+    }
+
+    // Sends any buffered remainder. Idempotent; safe to call even if nothing
+    // is buffered or a prior write already failed.
+    void flush() {
+        if (buf_.empty() || failed_) return;
+        ++real_write_count_;
+        if (!real_write_(buf_.data(), buf_.size())) failed_ = true;
+        buf_.clear();
+    }
+
+    // Number of times real_write() was actually invoked -- exposed for
+    // testing the coalescing behavior itself, not used by production code.
+    std::size_t real_write_count() const { return real_write_count_; }
+
+private:
+    write_fn_t real_write_;
+    std::size_t flush_threshold_bytes_;
+    std::string buf_;
+    bool failed_ = false;
+    std::size_t real_write_count_ = 0;
 };
 
 // ============================================================================
@@ -376,6 +495,7 @@ private:
         if (config_.max_request_body_bytes > 0) {
             svr->set_payload_max_length(config_.max_request_body_bytes);
         }
+        svr->set_keep_alive_max_count(config_.keep_alive_max_count);
 
         int bound = port;
         if (port == 0) {
@@ -978,6 +1098,22 @@ private:
                     }
                     if (json_continue_on_error) opts.continue_on_error = true;
                     if (json_include_sql) opts.include_sql = true;
+                    // Optional per-request timeout override: `X-XSQL-Timeout: <ms>`
+                    // (0 = explicitly no limit). Left at ScriptOptions's own
+                    // default (0) when absent -- a tool with its own
+                    // server-side default timeout (e.g. a runtime_settings
+                    // value) applies it in its executor when it sees
+                    // opts.timeout_ms == 0, which also means an explicit
+                    // `X-XSQL-Timeout: 0` is indistinguishable from omitting
+                    // the header for such a tool (both apply that default);
+                    // send a large value instead of literal 0 to guarantee
+                    // "no limit" against a tool with its own default.
+                    if (req.has_header("X-XSQL-Timeout")) {
+                        try {
+                            const long ms = std::stol(req.get_header_value("X-XSQL-Timeout"));
+                            if (ms >= 0) opts.timeout_ms = static_cast<int>(ms);
+                        } catch (...) { /* invalid header: leave opts.timeout_ms as-is */ }
+                    }
                     // Cooperative cancellation via POST /cancel. The predicate
                     // compares the live epoch against a per-request cell that is
                     // re-armed at EXECUTION start (worker pop / just before the
@@ -993,6 +1129,88 @@ private:
                     };
                     return cell;
                 };
+
+                // Real chunked streaming: only for tools that provide a
+                // streaming_executor, only outside queue mode, only when the
+                // client opts in via X-XSQL-Stream. Everyone else falls
+                // through to the materialized dispatch below unchanged.
+                if (config_.streaming_executor && !config_.use_queue) {
+                    const std::string stream_hdr = req.has_header("X-XSQL-Stream")
+                        ? req.get_header_value("X-XSQL-Stream") : std::string();
+                    const bool stream_ndjson = (stream_hdr == "ndjson");
+                    const bool stream = stream_ndjson || stream_hdr == "1" || stream_hdr == "true";
+                    if (stream) {
+                        // The chunked-streaming path only knows how to shape
+                        // its output as a JSON-envelope-per-row stream
+                        // (X-XSQL-Stream: 1/true) or an NDJSON stream
+                        // (X-XSQL-Stream: ndjson) -- it has no CSV/TSV/text
+                        // serializer, and its NDJSON shape is not the same
+                        // code path as the buffered ?format=jsonl renderer.
+                        // Silently taking the streaming branch regardless of
+                        // an incompatible ?format= would return JSON to a
+                        // client that explicitly asked for csv/tsv/text (or
+                        // jsonl under a non-ndjson stream header) with no
+                        // indication its format request was ignored -- reject
+                        // it instead, matching the strict ?format= validation
+                        // already enforced a few lines above for the
+                        // buffered path (an unrecognized value is a 400,
+                        // never a silent fallback to json).
+                        const bool format_matches_stream_shape =
+                            format == "json" || (format == "jsonl" && stream_ndjson);
+                        if (!format_matches_stream_shape) {
+                            res.status = 400;
+                            res.set_content(
+                                xsql::json{{"success", false},
+                                           {"error", "?format=" + format +
+                                                " is incompatible with X-XSQL-Stream: " +
+                                                stream_hdr + " (streaming only supports "
+                                                "json, or jsonl with X-XSQL-Stream: ndjson "
+                                                "-- drop ?format= or X-XSQL-Stream to use "
+                                                "the other)"}}.dump(),
+                                "application/json");
+                            return;
+                        }
+                        xsql::ScriptOptions opts;
+                        auto cancel_cell = parse_opts(opts);
+                        cancel_cell->store(cancel_epoch_.load());
+                        auto executor = config_.streaming_executor;
+                        std::string sql_copy = sql_text;
+                        // Move the already-acquired serialize_lock into the
+                        // provider's capture: the lock was taken above (if
+                        // serialize_requests is set) for the whole handler,
+                        // but the chunked provider httplib calls runs AFTER
+                        // this handler returns. Moving it here extends the
+                        // critical section through the actual streamed
+                        // execution instead of releasing it early.
+                        // httplib's chunked-content-provider callback is a
+                        // std::function, which requires a copy-constructible
+                        // target -- std::unique_lock is move-only, so it must
+                        // be wrapped in a shared_ptr to live inside the
+                        // capture (still exactly one lock instance; released
+                        // when the provider's last copy is destroyed).
+                        auto shared_lock = std::make_shared<std::unique_lock<std::timed_mutex>>(
+                            std::move(serialize_lock));
+                        res.set_chunked_content_provider(
+                            stream_ndjson ? "application/x-ndjson" : "application/json",
+                            [executor, sql_copy, opts, stream_ndjson, shared_lock]
+                            (size_t, httplib::DataSink& sink) {
+                                // See StreamWriteCoalescer's doc comment: the
+                                // executor emits one call per row, which would
+                                // otherwise become one chunked-transfer frame
+                                // and one DataSink::write() call per row.
+                                StreamWriteCoalescer coalescer(
+                                    [&sink](const char* d, std::size_t n) { return sink.write(d, n); });
+                                auto out = [&coalescer](const char* d, std::size_t n) {
+                                    return coalescer.write(d, n);
+                                };
+                                executor(sql_copy, opts, stream_ndjson, out);
+                                coalescer.flush();
+                                sink.done();
+                                return true;
+                            });
+                        return;
+                    }
+                }
 
                 if (config_.script_executor) {
                     // Engine-owned orchestration: the server parses options and

@@ -3607,6 +3607,16 @@ struct ConstraintFilterDef {
     bool ordered_desc = false;
     std::function<std::unique_ptr<Generator<RowData>>(
         const std::vector<GeneratorConstraintArg>&)> create;
+
+    // Optional projection-aware factory (see FilterDef::create_with_col_used
+    // for the full rationale): receives colUsed alongside the constraint
+    // args. When set, used INSTEAD of `create`; additive, existing
+    // constraint_filter() callers (which never set this) are unaffected --
+    // xBestIndex only changes idxStr's encoding (prefixing colUsed) for a
+    // filter that actually has this set, so every other filter's idxStr
+    // format is byte-identical to before.
+    std::function<std::unique_ptr<Generator<RowData>>(
+        const std::vector<GeneratorConstraintArg>&, uint64_t)> create_with_col_used;
 };
 
 template<typename RowData>
@@ -3654,6 +3664,10 @@ struct GeneratorTableDef {
 
     const FilterDef* find_filter(int col_index) const {
         return detail::find_filter_by_column(filters, col_index);
+    }
+
+    const FilterDef* find_filter(int col_index, int op) const {
+        return detail::find_filter_by_column_and_op(filters, col_index, op);
     }
 };
 
@@ -3977,7 +3991,23 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
         if (idxNum >= CONSTRAINT_FILTER_BASE) {
             for (const auto& cf : cursor->def->constraint_filters) {
                 if (cf.filter_id == idxNum) {
-                    std::vector<int> spec_indices = parse_constraint_index_list(idxStr);
+                    // Projection-aware filters get colUsed prefixed onto idxStr
+                    // by xBestIndex (see the "best_cf->create_with_col_used"
+                    // branch there) as "<colUsed>;<spec-index-list>"; every
+                    // other filter's idxStr is just the plain spec-index list,
+                    // unchanged from before this existed.
+                    const char* spec_list_str = idxStr;
+                    uint64_t col_used = ~0ull;
+                    std::string stripped_idx_str;
+                    if (cf.create_with_col_used && idxStr) {
+                        const char* sep = strchr(idxStr, ';');
+                        if (sep) {
+                            col_used = static_cast<uint64_t>(strtoull(idxStr, nullptr, 10));
+                            stripped_idx_str.assign(sep + 1);
+                            spec_list_str = stripped_idx_str.c_str();
+                        }
+                    }
+                    std::vector<int> spec_indices = parse_constraint_index_list(spec_list_str);
                     std::vector<GeneratorConstraintArg> args;
                     args.reserve(static_cast<size_t>(argc));
                     for (int i = 0; i < argc && i < static_cast<int>(spec_indices.size()); i++) {
@@ -3993,7 +4023,9 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
                         });
                     }
                     clear_vtab_error();
-                    cursor->generator = cf.create(args);
+                    cursor->generator = cf.create_with_col_used
+                        ? cf.create_with_col_used(args, col_used)
+                        : cf.create(args);
                     if (!get_vtab_error().empty()) {
                         return return_vtab_error(pCursor->pVtab);
                     }
@@ -4212,6 +4244,18 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
 
     if (best_cf) {
         std::ostringstream idx_str;
+        // Projection-aware constraint filter: prefix idxStr with colUsed +
+        // ';' before the usual comma-separated spec-index list (idxStr is
+        // otherwise just that list -- see parse_constraint_index_list /
+        // xFilter's matching split below). Only done when this specific
+        // filter actually has create_with_col_used set, so every filter
+        // that doesn't use this (every pre-existing constraint_filter()
+        // registration in every tool) gets the exact same idxStr format as
+        // before -- fully additive, same idiom as ParametricFilterDef's
+        // create_with_col_used.
+        if (best_cf->create_with_col_used) {
+            idx_str << static_cast<unsigned long long>(pInfo->colUsed) << ";";
+        }
         int argv_index = 1;
         bool first = true;
         for (size_t s = 0; s < best_matched_constraints.size(); ++s) {
@@ -4280,15 +4324,23 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         }
     }
 
-    // Next, check single-column filters.
+    // Next, check single-column filters. EQ filters are trusted (omit=1).
+    // LIKE/GLOB filters are a best-effort superset optimization (omit=0, so
+    // SQLite re-applies the real pattern) -- same idiom as CachedTableDef's
+    // xBestIndex; only claimed when the pattern has a usable literal prefix,
+    // otherwise left to the full scan.
     const FilterDef* best_filter = nullptr;
     int best_constraint_idx = -1;
 
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
         if (!constraint.usable) continue;
-        if (constraint.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
-        const FilterDef* filter = def->find_filter(constraint.iColumn);
+        const bool is_eq = (constraint.op == SQLITE_INDEX_CONSTRAINT_EQ);
+        const bool is_like = (constraint.op == SQLITE_INDEX_CONSTRAINT_LIKE ||
+                              constraint.op == SQLITE_INDEX_CONSTRAINT_GLOB);
+        if (!is_eq && !is_like) continue;
+        if (is_like && !detail::like_constraint_has_usable_prefix(pInfo, i)) continue;
+        const FilterDef* filter = def->find_filter(constraint.iColumn, constraint.op);
         if (filter) {
             if (!best_filter || filter->estimated_cost < best_filter->estimated_cost) {
                 best_filter = filter;
@@ -4299,7 +4351,8 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
 
     if (best_filter && best_constraint_idx >= 0) {
         pInfo->aConstraintUsage[best_constraint_idx].argvIndex = 1;
-        pInfo->aConstraintUsage[best_constraint_idx].omit = 1;
+        pInfo->aConstraintUsage[best_constraint_idx].omit =
+            (best_filter->op == SQLITE_INDEX_CONSTRAINT_EQ) ? 1 : 0;
         pInfo->idxNum = best_filter->filter_id;
         pInfo->estimatedCost = best_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_filter->estimated_rows);
@@ -4753,6 +4806,33 @@ public:
         return *this;
     }
 
+    // `WHERE <column> LIKE ?` pushdown for a single text column. Unlike
+    // filter_eq_text, this is always a best-effort SUPERSET: xBestIndex only
+    // claims the constraint when the pattern has a usable literal prefix (not
+    // a leading wildcard), and leaves it unconsumed (omit=0) so SQLite
+    // re-applies the real pattern to every row -- correctness never depends
+    // on the factory's own filtering being exact. `factory` receives the raw
+    // LIKE pattern (e.g. "foo%") and SQLite's colUsed bitmask, since a LIKE
+    // match can yield far more rows than an EQ lookup usually does, making an
+    // unconditional expensive-column materialization much more costly to skip.
+    GeneratorTableBuilder& filter_like_text(
+            const char* column_name,
+            std::function<std::unique_ptr<RowIterator>(const char*, uint64_t)> factory,
+            double cost = 10.0, double est_rows = 1000.0) {
+        int col_idx = def_.find_column(column_name);
+        if (col_idx < 0) return *this;
+        int filter_id = static_cast<int>(def_.filters.size()) + 1;
+        def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
+            std::function<std::unique_ptr<RowIterator>(FunctionArg)>{},
+            SQLITE_INDEX_CONSTRAINT_LIKE);
+        def_.filters.back().create_with_col_used =
+            [factory = std::move(factory)](FunctionArg val, uint64_t col_used) -> std::unique_ptr<RowIterator> {
+                const char* text = val.as_c_str();
+                return factory(text ? text : "", col_used);
+            };
+        return *this;
+    }
+
     // Projection-aware single-EQ-column filter: like filter_eq(), but the
     // factory also receives SQLite's colUsed bitmask (same encoding as
     // projection_generator/projection_cache_builder), so a query that does
@@ -4859,6 +4939,39 @@ public:
         cf.estimated_cost = cost;
         cf.estimated_rows = est_rows;
         cf.create = std::move(factory);
+        def_.constraint_filters.push_back(std::move(cf));
+        return *this;
+    }
+
+    // Projection-aware constraint filter: like constraint_filter(), but the
+    // factory also receives SQLite's colUsed bitmask (see
+    // filter_eq_projection() for the full rationale -- skip an expensive
+    // per-row field, e.g. a demangle, when the query never selects it).
+    // Additive: existing constraint_filter() callers are unaffected, and
+    // registering both a plain and a projection-aware constraint_filter on
+    // the SAME columns (e.g. one order-claiming, one not) is a supported,
+    // independent axis from this one -- set create_with_col_used on either,
+    // both, or neither as needed.
+    GeneratorTableBuilder& constraint_filter_projection(
+            std::initializer_list<ConstraintRequest> constraints,
+            std::function<std::unique_ptr<Generator<RowData>>(
+                const std::vector<GeneratorConstraintArg>&, uint64_t)> factory,
+            double cost = 1.0, double est_rows = 100.0) {
+        ConstraintFilterDef<RowData> cf;
+        for (const auto& req : constraints) {
+            int idx = def_.find_column(req.column_name);
+            if (idx < 0) return *this;
+            cf.specs.push_back(GeneratorConstraintSpec{
+                idx,
+                req.op,
+                req.required,
+                req.missing_error
+            });
+        }
+        cf.filter_id = CONSTRAINT_FILTER_BASE + static_cast<int>(def_.constraint_filters.size());
+        cf.estimated_cost = cost;
+        cf.estimated_rows = est_rows;
+        cf.create_with_col_used = std::move(factory);
         def_.constraint_filters.push_back(std::move(cf));
         return *this;
     }

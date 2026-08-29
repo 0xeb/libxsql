@@ -3512,6 +3512,14 @@ inline bool can_compress_content_type(const std::string &content_type) {
   case "application/json"_t:
   case "application/xml"_t:
   case "application/protobuf"_t:
+  // xsql local patch (see VENDORED.md "Local Patches"): NDJSON streaming
+  // responses (xsql::thinclient::http_query_server's `X-XSQL-Stream: ndjson`
+  // mode) are served as application/x-ndjson, which upstream cpp-httplib
+  // does not recognize as compressible -- live-verified via curl that an
+  // ndjson bulk export never got gzip'd even with Accept-Encoding: gzip sent,
+  // while the identical query under `X-XSQL-Stream: 1` (application/json)
+  // compressed correctly. Re-apply this case on every httplib.h update.
+  case "application/x-ndjson"_t:
   case "application/xhtml+xml"_t: return true;
 
   default:
@@ -3555,7 +3563,20 @@ inline gzip_compressor::gzip_compressor() {
   strm_.zfree = Z_NULL;
   strm_.opaque = Z_NULL;
 
-  is_valid_ = deflateInit2(&strm_, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 31, 8,
+  // xsql local patch (see VENDORED.md "Local Patches"): Z_BEST_SPEED, not
+  // upstream's Z_DEFAULT_COMPRESSION (zlib level 6). Every *sql tool's HTTP
+  // response is generated fresh per request and never cached, so compression
+  // CPU is paid on every single query, not amortized like a static asset --
+  // and xsql's HTTP servers are serialize_requests-protected (one query at a
+  // time), so compression time adds directly to that query's latency AND
+  // delays the next query in the queue. Measured live against a real
+  // 50,000-row functions dump from a large PDB (7.5 MB uncompressed JSON):
+  // level 6 took 163.8ms for a 5.30x ratio; Z_BEST_SPEED (level 1) took
+  // 56.5ms (2.9x faster) for a 4.21x ratio -- keeps ~79% of the compression
+  // benefit at little more than a third of the CPU cost. See
+  // kb/pdbsql/benchmarks/large-pdb-benchmarks.md 2026-08-24 for the full
+  // level-by-level (1-9) sweep this was chosen from.
+  is_valid_ = deflateInit2(&strm_, Z_BEST_SPEED, Z_DEFLATED, 31, 8,
                            Z_DEFAULT_STRATEGY) == Z_OK;
 }
 

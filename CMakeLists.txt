@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.20)
 # Enable CMAKE_MSVC_RUNTIME_LIBRARY support (required for IDA SDK compatibility)
 cmake_policy(SET CMP0091 NEW)
 
-project(libxsql VERSION 1.0.14 LANGUAGES C CXX)
+project(libxsql VERSION 1.0.15 LANGUAGES C CXX)
 
 # Detect if we're being built standalone or as part of a larger project
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -89,7 +89,26 @@ endif()
 if(XSQL_OWNS_NLOHMANN_JSON)
     set(XSQL_EXPORT_TARGETS xsql sqlite3 nlohmann_json)
     if(XSQL_WITH_THINCLIENT)
+        # zlibstatic: httplib's optional gzip-compression dependency
+        # (CPPHTTPLIB_ZLIB_SUPPORT, external/httplib/CMakeLists.txt) --
+        # httplib now links it, so when OUR add_subdirectory(external/httplib)
+        # is what defines httplib::httplib, zlibstatic must be in the same
+        # build-tree export set or `export(TARGETS httplib ...)` below fails
+        # ("requires target zlibstatic that is not in any export set").
+        #
+        # Guard on TARGET zlibstatic, not just XSQL_WITH_THINCLIENT: a
+        # consumer can pre-define httplib::httplib itself before this file's
+        # `if(NOT TARGET httplib::httplib) add_subdirectory(external/httplib)`
+        # runs (ghidrasql does exactly this -- CMakeLists.txt fetches its own
+        # httplib v0.16.3 with zlib deliberately OFF, for ODR safety between
+        # itself and libghidra). In that case our external/httplib/CMakeLists.txt
+        # -- and its zlib FetchContent -- never runs, so zlibstatic never
+        # exists here even though XSQL_WITH_THINCLIENT is ON. Exporting a
+        # nonexistent target is a hard configure error, not a graceful skip.
         list(APPEND XSQL_EXPORT_TARGETS httplib)
+        if(TARGET zlibstatic)
+            list(APPEND XSQL_EXPORT_TARGETS zlibstatic)
+        endif()
     endif()
 
     export(TARGETS ${XSQL_EXPORT_TARGETS}
