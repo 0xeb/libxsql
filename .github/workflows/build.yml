@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: ["**"]
+    tags: ["v*", "V*"]
   pull_request:
     branches: ["**"]
   workflow_dispatch:
@@ -36,3 +37,20 @@ jobs:
       - name: Build
         shell: bash
         run: cmake --build build --config Release
+
+  # Creates the GitHub Release entry when a vX.Y.Z tag is pushed. libxsql is a
+  # source-only release -- there are no binaries to attach, so this just turns
+  # the tag into a Release rather than requiring one to be created by hand.
+  # Gated on `build` so a tag on a broken tree cannot produce a release.
+  publish-release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
