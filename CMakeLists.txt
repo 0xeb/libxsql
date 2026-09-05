@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.20)
 # Enable CMAKE_MSVC_RUNTIME_LIBRARY support (required for IDA SDK compatibility)
 cmake_policy(SET CMP0091 NEW)
 
-project(libxsql VERSION 1.0.16 LANGUAGES C CXX)
+project(libxsql VERSION 1.0.17 LANGUAGES C CXX)
 
 # Detect if we're being built standalone or as part of a larger project
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -99,12 +99,16 @@ if(XSQL_OWNS_NLOHMANN_JSON)
         # Guard on TARGET zlibstatic, not just XSQL_WITH_THINCLIENT: a
         # consumer can pre-define httplib::httplib itself before this file's
         # `if(NOT TARGET httplib::httplib) add_subdirectory(external/httplib)`
-        # runs (ghidrasql does exactly this -- CMakeLists.txt fetches its own
-        # httplib v0.16.3 with zlib deliberately OFF, for ODR safety between
-        # itself and libghidra). In that case our external/httplib/CMakeLists.txt
-        # -- and its zlib FetchContent -- never runs, so zlibstatic never
-        # exists here even though XSQL_WITH_THINCLIENT is ON. Exporting a
-        # nonexistent target is a hard configure error, not a graceful skip.
+        # runs. In that case our external/httplib/CMakeLists.txt -- and its zlib
+        # FetchContent -- never runs, so zlibstatic never exists here even
+        # though XSQL_WITH_THINCLIENT is ON. Exporting a nonexistent target is a
+        # hard configure error, not a graceful skip.
+        #
+        # No known consumer does this any more: a build that pre-fetched a
+        # second httplib dropped it on 2026-09-02 when this vendored copy was
+        # bumped to 0.16.3 (see external/httplib/VENDORED.md "Why 0.16.3"). The
+        # guard stays because it protects a supported integration shape, not
+        # because anything here still relies on it.
         list(APPEND XSQL_EXPORT_TARGETS httplib)
         if(TARGET zlibstatic)
             list(APPEND XSQL_EXPORT_TARGETS zlibstatic)
@@ -115,9 +119,13 @@ if(XSQL_OWNS_NLOHMANN_JSON)
         NAMESPACE xsql::
         FILE "${CMAKE_CURRENT_BINARY_DIR}/xsqlTargets.cmake"
     )
+    set(XSQL_CONFIG_PREAMBLE "")
+    if(XSQL_WITH_THINCLIENT)
+        string(APPEND XSQL_CONFIG_PREAMBLE
+            "include(CMakeFindDependencyMacro)\nfind_dependency(Threads)\n")
+    endif()
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/xsqlConfig.cmake"
-        "include(\"\${CMAKE_CURRENT_LIST_DIR}/xsqlTargets.cmake\")\n"
-    )
+        "${XSQL_CONFIG_PREAMBLE}include(\"\${CMAKE_CURRENT_LIST_DIR}/xsqlTargets.cmake\")\n")
     set(xsql_DIR "${CMAKE_CURRENT_BINARY_DIR}" CACHE PATH "xsql config directory" FORCE)
 endif()
 
@@ -141,6 +149,37 @@ if(XSQL_STANDALONE)
     if(XSQL_OWNS_NLOHMANN_JSON)
         list(APPEND XSQL_INSTALL_TARGETS nlohmann_json)
     endif()
+    if(XSQL_WITH_THINCLIENT)
+        # xsql publicly links the header-only httplib target, so an installed
+        # xsqlTargets.cmake must export it too. When this standalone build owns
+        # the vendored httplib target it also owns zlibstatic; make that target
+        # relocatable and install the two public zlib headers it exposes.
+        list(APPEND XSQL_INSTALL_TARGETS httplib)
+        # Only when OUR external/httplib actually ran do we own zlibstatic and
+        # know where its headers are. A consumer that pre-defined
+        # httplib::httplib leaves zlibstatic defined by someone else (or not at
+        # all) and these two vars unset -- installing "/zlib.h" would be a hard
+        # configure error, so require both the target AND the paths.
+        if(TARGET zlibstatic AND DEFINED XSQL_HTTPLIB_ZLIB_SOURCE_DIR
+                             AND DEFINED XSQL_HTTPLIB_ZLIB_BINARY_DIR)
+            # APPEND, never overwrite: zlibstatic is a third-party FetchContent
+            # target shared with every other consumer in the build tree, and a
+            # plain set_property() would discard whatever zlib's own CMakeLists
+            # put there. We are only adding the INSTALL_INTERFACE view needed to
+            # make the exported target relocatable.
+            set_property(TARGET zlibstatic APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES
+                "$<BUILD_INTERFACE:${XSQL_HTTPLIB_ZLIB_SOURCE_DIR}>"
+                "$<BUILD_INTERFACE:${XSQL_HTTPLIB_ZLIB_BINARY_DIR}>"
+                "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
+            list(APPEND XSQL_INSTALL_TARGETS zlibstatic)
+            install(FILES
+                "${XSQL_HTTPLIB_ZLIB_SOURCE_DIR}/zlib.h"
+                "${XSQL_HTTPLIB_ZLIB_BINARY_DIR}/zconf.h"
+                DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+        endif()
+        install(FILES external/httplib/httplib.h
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    endif()
 
     install(TARGETS ${XSQL_INSTALL_TARGETS}
         EXPORT xsqlTargets
@@ -152,10 +191,26 @@ if(XSQL_STANDALONE)
     install(DIRECTORY include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
+    install(FILES external/sqlite/sqlite3.h external/sqlite/sqlite3ext.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    if(XSQL_OWNS_NLOHMANN_JSON)
+        install(DIRECTORY external/nlohmann/include/
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    endif()
 
     install(EXPORT xsqlTargets
-        FILE xsqlConfig.cmake
+        FILE xsqlTargets.cmake
         NAMESPACE xsql::
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/xsql
     )
+    set(XSQL_INSTALL_CONFIG_PREAMBLE "")
+    if(XSQL_WITH_THINCLIENT)
+        string(APPEND XSQL_INSTALL_CONFIG_PREAMBLE
+            "include(CMakeFindDependencyMacro)\nfind_dependency(Threads)\n")
+    endif()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/xsqlConfig-install.cmake"
+        "${XSQL_INSTALL_CONFIG_PREAMBLE}include(\"\${CMAKE_CURRENT_LIST_DIR}/xsqlTargets.cmake\")\n")
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/xsqlConfig-install.cmake"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/xsql
+        RENAME xsqlConfig.cmake)
 endif()

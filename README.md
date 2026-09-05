@@ -302,6 +302,23 @@ configurations only): it cooperatively cancels the queries whose execution
 started before the request arrived — queued-but-unstarted work is not
 affected.
 
+Adapters that can block inside a downstream engine call may set the server
+configuration's `cancel_fn`. The server advances its own cancel epoch before
+invoking that hook, allowing the adapter to forward an out-of-band cancellation
+request while the normal query channel is occupied.
+
+With curl, frame the empty POST body explicitly:
+
+```bash
+curl -X POST -d '' http://127.0.0.1:8080/cancel
+```
+
+`-d ''` sends `Content-Length: 0`. A bare `curl -X POST` can leave the request
+body unframed, causing the server to wait for a body boundary before route
+dispatch. Buffered queries require this explicit cancellation request (or a
+timeout); only the opt-in streaming path can notice a client disconnect while
+the query is still producing rows.
+
 ## Capabilities Table
 
 `capabilities.hpp` provides the one canonical capability surface used across

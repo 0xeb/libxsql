@@ -1,4 +1,4 @@
-# cpp-httplib v0.15.3 — https://github.com/yhirose/cpp-httplib
+# cpp-httplib v0.16.3 — https://github.com/yhirose/cpp-httplib
 # Vendored single-header distribution (MIT License)
 
 add_library(httplib INTERFACE)
@@ -39,6 +39,13 @@ FetchContent_Declare(
 set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zlib_httplib)
+
+# Export the fetched header locations to libxsql's parent CMake scope so the
+# standalone install rules can make the public httplib/zlib dependency graph
+# relocatable. FetchContent's variables otherwise remain local to this wrapper
+# subdirectory.
+set(XSQL_HTTPLIB_ZLIB_SOURCE_DIR "${zlib_httplib_SOURCE_DIR}" PARENT_SCOPE)
+set(XSQL_HTTPLIB_ZLIB_BINARY_DIR "${zlib_httplib_BINARY_DIR}" PARENT_SCOPE)
 
 target_compile_definitions(httplib INTERFACE CPPHTTPLIB_ZLIB_SUPPORT)
 target_link_libraries(httplib INTERFACE zlibstatic)

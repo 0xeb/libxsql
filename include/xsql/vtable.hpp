@@ -28,6 +28,7 @@
 #include <functional>
 #include <exception>
 #include <sstream>
+#include <stdexcept>
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
@@ -217,6 +218,111 @@ constexpr int RANGE_HAS_HIGH = 0x4;      // an upper bound (<= or <) is present
 constexpr int RANGE_HIGH_STRICT = 0x8;   // upper bound is strict (<, not <=)
 constexpr int RANGE_FLAG_MASK = RANGE_HAS_LOW | RANGE_LOW_STRICT |
                                 RANGE_HAS_HIGH | RANGE_HIGH_STRICT;
+
+// Multi-column/operator filters use a disjoint high range. cached_vtab_filter
+// checks this range before decoding RANGE_BASE, whose index encoding is open
+// ended by design.
+constexpr int CACHED_CONSTRAINT_FILTER_BASE = 1000000;
+
+// "Open ended" is why the disjointness needs a guard rather than a comment:
+// RANGE_BASE encodes as RANGE_BASE + index_pos * RANGE_STRIDE, so the two
+// spaces collide once a single table registers this many indexes. That ceiling
+// is far beyond anything real, but a silent collision would mis-dispatch a
+// range query into the constraint-filter arm and return wrong rows, so make the
+// bound an explicit, checkable constant instead of an assumption.
+constexpr int CACHED_CONSTRAINT_FILTER_MAX_INDEXES =
+    (CACHED_CONSTRAINT_FILTER_BASE - RANGE_BASE) / RANGE_STRIDE;
+static_assert(CACHED_CONSTRAINT_FILTER_BASE > RANGE_BASE,
+              "constraint-filter idxNum space must sit above the range space");
+static_assert(CACHED_CONSTRAINT_FILTER_MAX_INDEXES > 0,
+              "range idxNum space must leave room below the constraint-filter base");
+
+enum class ConstraintOp {
+    Eq,
+    Gt,
+    Le,
+    Lt,
+    Ge,
+    Like
+};
+
+inline int sqlite_constraint_op(ConstraintOp op) {
+    switch (op) {
+        case ConstraintOp::Eq: return SQLITE_INDEX_CONSTRAINT_EQ;
+        case ConstraintOp::Gt: return SQLITE_INDEX_CONSTRAINT_GT;
+        case ConstraintOp::Le: return SQLITE_INDEX_CONSTRAINT_LE;
+        case ConstraintOp::Lt: return SQLITE_INDEX_CONSTRAINT_LT;
+        case ConstraintOp::Ge: return SQLITE_INDEX_CONSTRAINT_GE;
+        case ConstraintOp::Like: return SQLITE_INDEX_CONSTRAINT_LIKE;
+    }
+    return SQLITE_INDEX_CONSTRAINT_EQ;
+}
+
+struct ConstraintRequest {
+    std::string column_name;
+    ConstraintOp op = ConstraintOp::Eq;
+    bool required = false;
+    std::string missing_error;
+};
+
+inline ConstraintRequest required_eq(const char* column_name, const char* missing_error) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Eq, true,
+                             missing_error ? missing_error : ""};
+}
+
+inline ConstraintRequest required_gt(const char* column_name, const char* missing_error) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Gt, true,
+                             missing_error ? missing_error : ""};
+}
+
+inline ConstraintRequest required_le(const char* column_name, const char* missing_error) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Le, true,
+                             missing_error ? missing_error : ""};
+}
+
+inline ConstraintRequest required_like(const char* column_name, const char* missing_error) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Like, true,
+                             missing_error ? missing_error : ""};
+}
+
+inline ConstraintRequest optional_eq(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Eq, false, ""};
+}
+
+inline ConstraintRequest optional_like(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Like, false, ""};
+}
+
+inline ConstraintRequest optional_gt(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Gt, false, ""};
+}
+
+inline ConstraintRequest optional_ge(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Ge, false, ""};
+}
+
+inline ConstraintRequest optional_lt(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Lt, false, ""};
+}
+
+inline ConstraintRequest optional_le(const char* column_name) {
+    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Le, false, ""};
+}
+
+struct GeneratorConstraintSpec {
+    int column_index = -1;
+    ConstraintOp op = ConstraintOp::Eq;
+    bool required = false;
+    std::string missing_error;
+};
+
+struct GeneratorConstraintArg {
+    int column_index = -1;
+    ConstraintOp op = ConstraintOp::Eq;
+    FunctionArg value;
+};
+
+inline std::vector<int> parse_constraint_index_list(const char* idx_str);
 
 /**
  * Defines a filter for a specific column constraint.
@@ -1561,6 +1667,23 @@ struct SharedCache {
     mutable std::mutex mutex;
 };
 
+// A multi-column / multi-operator pushdown filter, e.g. an interval-containment
+// join (`p.value >= i.start AND p.value < i.end`) that a single-column FilterDef
+// cannot express, so SQLite would otherwise be left with a cross product.
+//
+// Unlike FilterDef this matches a SET of constraints at once; xBestIndex picks
+// the cheapest fully-satisfied spec set and encodes the chosen constraint
+// positions into idxStr, which xFilter decodes back into GeneratorConstraintArgs.
+template<typename RowData>
+struct CachedConstraintFilterDef {
+    std::vector<GeneratorConstraintSpec> specs;
+    int filter_id = CACHED_CONSTRAINT_FILTER_BASE;
+    double estimated_cost = 1.0;
+    double estimated_rows = 1.0;
+    std::function<std::unique_ptr<RowIterator>(
+        const std::vector<GeneratorConstraintArg>&)> create;
+};
+
 template<typename RowData>
 struct CachedTableDef {
     std::string name;
@@ -1582,6 +1705,9 @@ struct CachedTableDef {
     std::function<void(std::vector<RowData>&, uint64_t)> projection_cache_builder_fn;
     std::vector<CachedColumnDef<RowData>> columns;
     std::vector<FilterDef> filters;
+    // Multi-column/operator pushdown specs (see CachedConstraintFilterDef).
+    // Additive: a table with none behaves exactly as before.
+    std::vector<CachedConstraintFilterDef<RowData>> constraint_filters;
     std::function<bool(RowData&)> delete_row;
     bool supports_delete = false;
     std::function<bool(int argc, FunctionArg* argv)> insert_row;
@@ -2316,6 +2442,138 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
             return to_sqlite_status(Status::ok);
         }
 
+        // Multi-column/operator constraint filter. Tested BEFORE RANGE_BASE:
+        // the latter intentionally uses an open-ended numeric encoding, so its
+        // decode would happily swallow a constraint-filter idxNum.
+        if (idxNum >= CACHED_CONSTRAINT_FILTER_BASE) {
+            for (const auto& filter : cursor->def->constraint_filters) {
+                if (filter.filter_id != idxNum) continue;
+
+                const std::vector<int> spec_indices =
+                    parse_constraint_index_list(idxStr);
+                std::vector<GeneratorConstraintArg> args;
+                args.reserve(static_cast<size_t>(argc));
+                for (int i = 0;
+                     i < argc && i < static_cast<int>(spec_indices.size()); ++i) {
+                    const int spec_index = spec_indices[static_cast<size_t>(i)];
+                    if (spec_index < 0 ||
+                        static_cast<size_t>(spec_index) >= filter.specs.size()) {
+                        // xBestIndex set omit=1 for every constraint it encoded,
+                        // so SQLite is NOT re-checking them. Silently dropping an
+                        // arg here would widen the result set instead of
+                        // narrowing it -- wrong rows, no error. Fail loudly.
+                        set_vtab_error(
+                            "constraint filter argument " + std::to_string(i) +
+                            " maps to out-of-range spec index " +
+                            std::to_string(spec_index) + " on table '" +
+                            cursor->def->name + "'");
+                        return return_vtab_error(pCursor->pVtab);
+                    }
+                    const auto& spec = filter.specs[static_cast<size_t>(spec_index)];
+                    args.push_back(GeneratorConstraintArg{
+                        spec.column_index, spec.op, FunctionArg(argv[i])});
+                }
+
+                clear_vtab_error();
+
+                // Factory-backed: the source resolves the predicate exactly and
+                // streams only matching rows. Nothing is materialized here.
+                if (filter.create) {
+                    cursor->iterator = filter.create(args);
+                    cursor->using_iterator = true;
+                    cursor->iterator_eof = true;
+                    if (cursor->iterator) {
+                        cursor->iterator_eof = !cursor->iterator->next();
+                    }
+                    if (!get_vtab_error().empty()) {
+                        return return_vtab_error(pCursor->pVtab);
+                    }
+                    return to_sqlite_status(Status::ok);
+                }
+
+                // Cache-backed: evaluate the predicates in memory over a
+                // materialization. Which materialization depends on the table's
+                // own caching model -- this arm must serve BOTH, exactly like
+                // the range arm below:
+                //   * shared-cache tables (clangsql, dwarfsql) reuse the
+                //     engine-lifetime cache and must not rebuild per statement;
+                //   * query-scoped tables (no_shared_cache) build a cursor-lived
+                //     copy so every statement sees fresh rows.
+                const auto& index_defs = cursor->def->index_defs;
+                auto row_matches = [&](const RowData& row) -> bool {
+                    for (const auto& arg : args) {
+                        if (arg.value.is_null()) return false;
+                        const int index_position =
+                            cursor->def->find_index(arg.column_index);
+                        if (index_position < 0) return false;
+                        const auto lhs = index_defs[
+                            static_cast<size_t>(index_position)].second(row);
+                        const auto rhs = arg.value.as_int64();
+                        bool ok = false;
+                        switch (arg.op) {
+                            case ConstraintOp::Eq: ok = lhs == rhs; break;
+                            case ConstraintOp::Gt: ok = lhs > rhs;  break;
+                            case ConstraintOp::Le: ok = lhs <= rhs; break;
+                            case ConstraintOp::Lt: ok = lhs < rhs;  break;
+                            case ConstraintOp::Ge: ok = lhs >= rhs; break;
+                            // Rejected by constraint_cache_filter() at build
+                            // time; unreachable unless that guard is loosened.
+                            case ConstraintOp::Like: ok = false; break;
+                        }
+                        if (!ok) return false;
+                    }
+                    return true;
+                };
+
+                cursor->range_matches.clear();
+                if (cursor->def->use_shared_cache) {
+                    cursor->def->ensure_cache_built();
+                    if (!get_vtab_error().empty()) {
+                        return return_vtab_error(pCursor->pVtab);
+                    }
+                    const auto& shared = cursor->def->shared_cache;
+                    if (shared) {
+                        // Same hardening as the range arm: evaluate AND copy the
+                        // matched rows into cursor-owned storage under the cache
+                        // mutex, so index_data_source never points into
+                        // shared->data once the lock is released (a concurrent
+                        // invalidate reallocates it -> use-after-free).
+                        std::lock_guard<std::mutex> lock(shared->mutex);
+                        cursor->index_row_copy.clear();
+                        for (const auto& row : shared->data) {
+                            if (!row_matches(row)) continue;
+                            cursor->index_row_copy.push_back(row);
+                            cursor->range_matches.push_back(
+                                cursor->index_row_copy.size() - 1);
+                        }
+                    }
+                    cursor->index_data_source = &cursor->index_row_copy;
+                } else {
+                    if (!cursor->cursor_index_built) {
+                        cursor->index_cache.clear();
+                        cursor->def->build_rows(cursor->index_cache);
+                        if (!get_vtab_error().empty()) {
+                            cursor->index_cache.clear();
+                            return return_vtab_error(pCursor->pVtab);
+                        }
+                        cursor->cursor_index_built = true;
+                    }
+                    for (size_t row_index = 0;
+                         row_index < cursor->index_cache.size(); ++row_index) {
+                        if (row_matches(cursor->index_cache[row_index])) {
+                            cursor->range_matches.push_back(row_index);
+                        }
+                    }
+                    cursor->index_data_source = &cursor->index_cache;
+                }
+
+                cursor->using_index = true;
+                cursor->index_matches = &cursor->range_matches;
+                cursor->index_pos = 0;
+                return to_sqlite_status(Status::ok);
+            }
+        }
+
         // Check for a range (>=, >, <=, <, BETWEEN) plan on an indexed column.
         // RANGE_BASE sits above INDEX_BASE, so this must be tested BEFORE the
         // equality-index branch below. The sorted view is built lazily here and
@@ -2597,6 +2855,14 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
     bool range_low_strict = false;    // GT (>) vs GE (>=)
     bool range_high_strict = false;   // LT (<) vs LE (<=)
 
+    // A cached-table constraint filter can consume a relationship spanning
+    // multiple columns/operators (for example interval containment). This is
+    // evaluated independently from the legacy single-column choices below and
+    // competes by the cost supplied by the table author.
+    const CachedConstraintFilterDef<RowData>* best_constraint_filter = nullptr;
+    std::vector<int> best_constraint_matches;
+    int best_constraint_match_count = -1;
+
     auto estimate_full_scan_rows = [&]() -> size_t {
         size_t estimated_rows = 1000;
         if (def->estimate_rows_fn) {
@@ -2609,6 +2875,45 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
     // tables (engine-lifetime) or query-scoped tables with a cache_builder.
     const bool range_eligible =
         def->use_shared_cache || def->has_cache_builder();
+
+    // Pick the cheapest constraint filter whose REQUIRED specs are all present
+    // in this query. Ties break toward the spec set that consumes more
+    // constraints, since each one consumed is a predicate SQLite no longer has
+    // to re-check.
+    for (const auto& filter : def->constraint_filters) {
+        std::vector<int> matched(filter.specs.size(), -1);
+        bool all_required_matched = true;
+        int matched_count = 0;
+        for (size_t spec_index = 0; spec_index < filter.specs.size(); ++spec_index) {
+            const auto& spec = filter.specs[spec_index];
+            const int sqlite_op = sqlite_constraint_op(spec.op);
+            bool found = false;
+            for (int i = 0; i < pInfo->nConstraint; ++i) {
+                const auto& constraint = pInfo->aConstraint[i];
+                if (!constraint.usable || constraint.iColumn != spec.column_index ||
+                    constraint.op != sqlite_op) {
+                    continue;
+                }
+                matched[spec_index] = i;
+                ++matched_count;
+                found = true;
+                break;
+            }
+            if (spec.required && !found) {
+                all_required_matched = false;
+                break;
+            }
+        }
+        if (all_required_matched && matched_count > 0 &&
+            (!best_constraint_filter ||
+             filter.estimated_cost < best_constraint_filter->estimated_cost ||
+             (filter.estimated_cost == best_constraint_filter->estimated_cost &&
+              matched_count > best_constraint_match_count))) {
+            best_constraint_filter = &filter;
+            best_constraint_matches = std::move(matched);
+            best_constraint_match_count = matched_count;
+        }
+    }
 
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
@@ -2711,6 +3016,31 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         pInfo->idxNum = ROWID_FILTER;
         pInfo->estimatedCost = 1.0;
         pInfo->estimatedRows = 1;
+    } else if (best_constraint_filter &&
+               best_constraint_filter->estimated_cost < best_cost) {
+        // Encode WHICH spec each argv slot corresponds to, in argv order, so
+        // xFilter can rebuild the (column, op, value) triples. omit=1 tells
+        // SQLite not to re-check these constraints -- which is why xFilter
+        // treats an undecodable spec index as a hard error rather than skipping.
+        std::ostringstream idx_str;
+        int argv_index = 1;
+        bool first = true;
+        for (size_t spec_index = 0;
+             spec_index < best_constraint_matches.size(); ++spec_index) {
+            const int constraint_index = best_constraint_matches[spec_index];
+            if (constraint_index < 0) continue;
+            pInfo->aConstraintUsage[constraint_index].argvIndex = argv_index++;
+            pInfo->aConstraintUsage[constraint_index].omit = 1;
+            if (!first) idx_str << ",";
+            idx_str << spec_index;
+            first = false;
+        }
+        pInfo->idxNum = best_constraint_filter->filter_id;
+        pInfo->idxStr = sqlite3_mprintf("%s", idx_str.str().c_str());
+        pInfo->needToFreeIdxStr = 1;
+        pInfo->estimatedCost = best_constraint_filter->estimated_cost;
+        pInfo->estimatedRows = static_cast<sqlite3_int64>(
+            best_constraint_filter->estimated_rows);
     } else if (best_index_pos >= 0 && best_index_constraint_idx >= 0 &&
                !best_filter) {
         pInfo->aConstraintUsage[best_index_constraint_idx].argvIndex = 1;
@@ -3368,6 +3698,96 @@ public:
         return *this;
     }
 
+    /**
+     * Add an exact multi-column/operator pushdown filter to a cached table.
+     *
+     * Every required constraint must be usable before SQLite selects the plan.
+     * The factory receives matched values in declaration order and MUST emit
+     * exactly the rows satisfying all consumed constraints; SQLite omits their
+     * recheck. This complements index_on(), whose range support covers only one
+     * column, for relations such as interval containment.
+     *
+     * Unlike the older single-column builders above, a misconfiguration here
+     * THROWS rather than quietly returning *this. Those builders can degrade to
+     * "no pushdown, still correct"; so can this one, but silently losing a
+     * containment filter is exactly the regression this API exists to prevent,
+     * and it would only ever surface as an unexplained full scan. These are new
+     * builders with no existing callers, so a stricter contract breaks nothing,
+     * and registration happens at table-setup time -- never inside a SQLite
+     * callback -- so throwing here cannot unwind through the C API.
+     */
+    CachedTableBuilder& constraint_filter(
+            std::initializer_list<ConstraintRequest> constraints,
+            std::function<std::unique_ptr<RowIterator>(
+                const std::vector<GeneratorConstraintArg>&)> factory,
+            double cost = 1.0,
+            double est_rows = 100.0) {
+        CachedConstraintFilterDef<RowData> filter;
+        for (const auto& request : constraints) {
+            const int column_index = def_.find_column(request.column_name);
+            if (column_index < 0) {
+                throw std::invalid_argument(
+                    "constraint_filter on table '" + def_.name +
+                    "': unknown column '" + request.column_name + "'");
+            }
+            filter.specs.push_back(GeneratorConstraintSpec{
+                column_index, request.op, request.required, request.missing_error});
+        }
+        filter.filter_id = CACHED_CONSTRAINT_FILTER_BASE +
+                           static_cast<int>(def_.constraint_filters.size());
+        filter.estimated_cost = cost;
+        filter.estimated_rows = est_rows;
+        filter.create = std::move(factory);
+        def_.constraint_filters.push_back(std::move(filter));
+        return *this;
+    }
+
+    /**
+     * Add an exact multi-column/operator filter evaluated in memory over the
+     * table's materialization. Every referenced column must ALSO be registered
+     * with index_on(): that integer key extractor is what supplies the
+     * comparison value, so a column with a getter but no index cannot be
+     * compared and is rejected here rather than silently never matching.
+     *
+     * Works on both caching models -- a shared-cache table evaluates against the
+     * engine-lifetime cache, a query-scoped table against its cursor-lived
+     * materialization (see cached_vtab_filter).
+     */
+    CachedTableBuilder& constraint_cache_filter(
+            std::initializer_list<ConstraintRequest> constraints,
+            double cost = 1.0,
+            double est_rows = 100.0) {
+        CachedConstraintFilterDef<RowData> filter;
+        for (const auto& request : constraints) {
+            const int column_index = def_.find_column(request.column_name);
+            if (column_index < 0) {
+                throw std::invalid_argument(
+                    "constraint_cache_filter on table '" + def_.name +
+                    "': unknown column '" + request.column_name + "'");
+            }
+            if (def_.find_index(column_index) < 0) {
+                throw std::invalid_argument(
+                    "constraint_cache_filter on table '" + def_.name +
+                    "': column '" + request.column_name +
+                    "' needs a matching index_on() to supply its comparison value");
+            }
+            if (request.op == ConstraintOp::Like) {
+                throw std::invalid_argument(
+                    "constraint_cache_filter on table '" + def_.name +
+                    "': LIKE is not evaluable against an integer index key "
+                    "(column '" + request.column_name + "')");
+            }
+            filter.specs.push_back(GeneratorConstraintSpec{
+                column_index, request.op, request.required, request.missing_error});
+        }
+        filter.filter_id = CACHED_CONSTRAINT_FILTER_BASE +
+                           static_cast<int>(def_.constraint_filters.size());
+        filter.estimated_cost = cost;
+        filter.estimated_rows = est_rows;
+        def_.constraint_filters.push_back(std::move(filter));
+        return *this;
+    }
+
     CachedTableBuilder& row_populator(std::function<void(RowData&, int argc, FunctionArg* argv)> fn) {
         def_.row_from_argv = std::move(fn);
         return *this;
@@ -3503,81 +3923,6 @@ struct Generator {
 // Filter IDs start at PARAMETRIC_FILTER_BASE to avoid collision with single-column filters.
 constexpr int PARAMETRIC_FILTER_BASE = 500;
 constexpr int CONSTRAINT_FILTER_BASE = 2000;
-
-enum class ConstraintOp {
-    Eq,
-    Gt,
-    Le,
-    Lt,
-    Ge,
-    Like
-};
-
-inline int sqlite_constraint_op(ConstraintOp op) {
-    switch (op) {
-        case ConstraintOp::Eq: return SQLITE_INDEX_CONSTRAINT_EQ;
-        case ConstraintOp::Gt: return SQLITE_INDEX_CONSTRAINT_GT;
-        case ConstraintOp::Le: return SQLITE_INDEX_CONSTRAINT_LE;
-        case ConstraintOp::Lt: return SQLITE_INDEX_CONSTRAINT_LT;
-        case ConstraintOp::Ge: return SQLITE_INDEX_CONSTRAINT_GE;
-        case ConstraintOp::Like: return SQLITE_INDEX_CONSTRAINT_LIKE;
-    }
-    return SQLITE_INDEX_CONSTRAINT_EQ;
-}
-
-struct ConstraintRequest {
-    std::string column_name;
-    ConstraintOp op = ConstraintOp::Eq;
-    bool required = false;
-    std::string missing_error;
-};
-
-inline ConstraintRequest required_eq(const char* column_name, const char* missing_error) {
-    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Eq, true,
-                             missing_error ? missing_error : ""};
-}
-
-inline ConstraintRequest required_like(const char* column_name, const char* missing_error) {
-    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Like, true,
-                             missing_error ? missing_error : ""};
-}
-
-inline ConstraintRequest optional_eq(const char* column_name) {
-    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Eq, false, ""};
-}
-
-inline ConstraintRequest optional_like(const char* column_name) {
-    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Like, false, ""};
-}
-
-inline ConstraintRequest optional_gt(const char* column_name) {
-    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Gt, false, ""};
-}
-
-inline ConstraintRequest optional_ge(const char* column_name) {
-    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Ge, false, ""};
-}
-
-inline ConstraintRequest optional_lt(const char* column_name) {
-    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Lt, false, ""};
-}
-
-inline ConstraintRequest optional_le(const char* column_name) {
-    return ConstraintRequest{column_name ? column_name : "", ConstraintOp::Le, false, ""};
-}
-
-struct GeneratorConstraintSpec {
-    int column_index = -1;
-    ConstraintOp op = ConstraintOp::Eq;
-    bool required = false;
-    std::string missing_error;
-};
-
-struct GeneratorConstraintArg {
-    int column_index = -1;
-    ConstraintOp op = ConstraintOp::Eq;
-    FunctionArg value;
-};
 
 template<typename RowData>
 struct ParametricFilterDef {

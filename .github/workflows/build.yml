@@ -53,4 +53,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          # Without this the release is titled from the bare tag ("v1.0.16");
+          # every prior release here is titled "libxsql vX.Y.Z".
+          name: libxsql ${{ github.ref_name }}
           generate_release_notes: true

@@ -234,6 +234,15 @@ struct http_query_server_config {
     /// long enough to hit httplib's default timeout regardless, so this gets
     /// the reconnect-avoidance win with no shutdown-latency cost.
     std::size_t keep_alive_max_count = 1000;
+
+    /// Optional out-of-band cancellation hook. POST /cancel advances the local
+    /// cooperative-cancel epoch first, then invokes this callback so an adapter
+    /// blocked inside a downstream RPC can forward cancellation without waiting
+    /// for that RPC to return. The callback must be thread-safe and non-blocking
+    /// apart from its bounded control request. Appended to preserve positional
+    /// aggregate initializers.
+    using cancel_fn_t = std::function<void()>;
+    cancel_fn_t cancel_fn;
 };
 
 // ============================================================================
@@ -925,6 +934,13 @@ private:
                 "Example: curl -X POST http://localhost:" + std::to_string(port) +
                                   "/query -d \"SELECT name FROM sqlite_master WHERE "
                                   "type='table' LIMIT 10\"\n";
+            if (cancel_supported) {
+                // -d '' deliberately emits Content-Length: 0. Some HTTP clients
+                // leave a bodyless POST unframed, which makes the server wait for
+                // a request-body boundary instead of reaching /cancel.
+                welcome += "Cancel:  curl -X POST -d '' http://localhost:" +
+                           std::to_string(port) + "/cancel\n";
+            }
             res.set_content(welcome, "text/plain");
         });
 
@@ -1386,6 +1402,31 @@ private:
                 return;
             }
             cancel_epoch_.fetch_add(1);
+            try {
+                if (config_.cancel_fn) {
+                    config_.cancel_fn();
+                }
+            } catch (const std::exception& e) {
+                res.status = 502;
+                res.set_content(
+                    xsql::json{
+                        {"success", false},
+                        {"error", "local cancellation requested, but downstream "
+                                  "propagation failed: " + std::string(e.what())}}
+                        .dump(),
+                    "application/json");
+                return;
+            } catch (...) {
+                res.status = 502;
+                res.set_content(
+                    xsql::json{
+                        {"success", false},
+                        {"error", "local cancellation requested, but downstream "
+                                  "propagation failed"}}
+                        .dump(),
+                    "application/json");
+                return;
+            }
             res.set_content(
                 xsql::json{{"success", true}, {"message", "cancel requested"}}.dump(),
                 "application/json");

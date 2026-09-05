@@ -63,8 +63,11 @@ struct ScriptOptions {
     // return an error (see timeout_ms above for the rollback and zero-row
     // semantics, which apply identically here). Threaded into the
     // buffered path (Database::query's interrupt checker) and polled between rows in
-    // the streaming path, so an HTTP server can abort a runaway query (POST /cancel
-    // or client disconnect) even under timeout_ms==0. Null => never cancelled.
+    // the streaming path, so an HTTP server can abort a runaway query through
+    // POST /cancel even under timeout_ms==0. A streaming HTTP executor can also
+    // stop on client disconnect through its output sink; a buffered executor cannot
+    // observe a disconnect until it tries to write the completed response. Null =>
+    // never cancelled.
     std::function<bool()> should_cancel;
 };
 
