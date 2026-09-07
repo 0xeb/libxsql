@@ -55,14 +55,24 @@ struct RuntimeSettingSpec {
     int64_t maximum = (std::numeric_limits<int64_t>::max)();
 };
 
-// One row in the canonical SQL surface. The richer specification (including
-// default and writable) remains available through RuntimeSettingsCore::specs();
-// SQL intentionally exposes only this stable four-column shape.
+// One row in the canonical SQL surface.
+//
+// `kind` and `settable` exist because `scope` cannot answer "may I change
+// this?". Both query_timeout_ms (tunable) and max_timeout_stack_depth (a
+// read-only live counter) carry scope='common', so a client had to either
+// hardcode the read-only keys or attempt an UPDATE and interpret the failure.
+// `settable` is that answer directly; `kind` names the imperative verbs
+// instead of leaving them inferred from scope=='action'.
+//
+// The richer specification (defaults, ranges) remains available through
+// RuntimeSettingsCore::specs(); SQL exposes only this stable shape.
 struct RuntimeSettingEntry {
     std::string key;
     std::string value;
     std::string type;
     std::string scope;
+    std::string kind;      // "value" or "action"
+    int settable = 0;      // 1 only when UPDATE runtime_settings accepts it
     // Internal registration-local context used by the writable table adapter.
     // It is deliberately not exposed as a SQL column.
     std::shared_ptr<void> connection_state;
@@ -205,9 +215,14 @@ public:
             } else if (key == "timeout_push" || key == "timeout_pop") {
                 value = settings_.at("query_timeout_ms").value;
             }
+            // An action row is never settable even if it registered writable:
+            // timeout_push/timeout_pop are imperative verbs, not values.
+            const bool is_action = record.spec.scope == "action";
             rows.push_back(
                 {record.spec.key, std::move(value),
-                 type_name(record.spec.type), record.spec.scope});
+                 type_name(record.spec.type), record.spec.scope,
+                 is_action ? "action" : "value",
+                 (record.spec.writable && !is_action) ? 1 : 0});
         }
         return rows;
     }

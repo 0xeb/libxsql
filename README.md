@@ -236,7 +236,7 @@ With this filter, `SELECT * FROM xrefs WHERE to_addr = 0x401000` uses the native
 ## Runtime Settings
 
 Runtime configuration is exposed through the writable `runtime_settings` virtual
-table (`key`, `value`, `type`, `scope`). Read a setting with
+table (`key`, `value`, `type`, `scope`, `kind`, `settable`). Read a setting with
 `SELECT value FROM runtime_settings WHERE key = ?` and change it with
 `UPDATE runtime_settings SET value = ? WHERE key = ?`. Multiple
 updates in one SQL transaction commit atomically and roll back together.
@@ -258,6 +258,16 @@ the same core with `register_bool_setting` / `register_integer_setting` /
 
 `scope` is `common` for the shared keys, the product prefix (e.g. `idasql`)
 for product keys, and `action` for the two imperative verbs below.
+
+`kind` is `value` or `action`, and `settable` is `1` only for rows that
+`UPDATE runtime_settings` accepts. `scope` alone cannot answer that: both
+`query_timeout_ms` (tunable) and `max_timeout_stack_depth` (a read-only live
+counter) are `common`. So discover writable keys directly rather than
+hardcoding them or probing with a failing `UPDATE`:
+
+```sql
+SELECT key, type FROM runtime_settings WHERE settable = 1;
+```
 
 Older value-bearing `PRAGMA` commands are retired; reads and writes go through
 `runtime_settings`, and native SQLite PRAGMAs are reserved for SQLite itself.

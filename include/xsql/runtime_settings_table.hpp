@@ -6,7 +6,8 @@
 
 #pragma once
 
-// Canonical transactional `runtime_settings(key, value, type, scope)` table.
+// Canonical transactional
+// `runtime_settings(key, value, type, scope, kind, settable)` table.
 //
 // A table definition owns one connection-local staged overlay. UPDATE validates
 // and canonicalizes values immediately, but does not mutate the shared settings
@@ -288,6 +289,10 @@ define_runtime_settings_table(RuntimeSettingsCore& settings,
             "type", [](const RuntimeSettingEntry& row) { return row.type; })
         .column_text(
             "scope", [](const RuntimeSettingEntry& row) { return row.scope; })
+        .column_text(
+            "kind", [](const RuntimeSettingEntry& row) { return row.kind; })
+        .column_int(
+            "settable", [](const RuntimeSettingEntry& row) { return row.settable; })
         .build();
 }
 
