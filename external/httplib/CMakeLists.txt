@@ -40,6 +40,25 @@ set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zlib_httplib)
 
+# zlib's own CMakeLists never marks zlibstatic position-independent, so linking
+# the archive into any consumer's SHARED library fails on ELF x86_64:
+#
+#   relocation R_X86_64_PC32 against symbol `_length_code' can not be used when
+#   making a shared object; recompile with -fPIC
+#
+# Every tool in this family ships a plugin as a .so, so each one hits this the
+# moment it takes a libxsql carrying zlib (zlib arrived in v1.0.15; anything
+# pinned older never saw it). Caught by bnsql's Linux CI on the v0.0.12 release
+# when it moved off a v1.0.10 pin. PE and Mach-O do not have the distinction,
+# so Windows and macOS build clean and the failure looks Linux-specific.
+#
+# Set it here, where we own the fetched target, rather than in each consumer.
+# libxsql already does the same for its own xsql and sqlite3 targets. Guarded
+# because a parent project may have supplied httplib (and zlib) itself.
+if(TARGET zlibstatic)
+    set_target_properties(zlibstatic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # Export the fetched header locations to libxsql's parent CMake scope so the
 # standalone install rules can make the public httplib/zlib dependency graph
 # relocatable. FetchContent's variables otherwise remain local to this wrapper
