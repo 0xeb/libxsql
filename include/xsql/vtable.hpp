@@ -887,8 +887,11 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
             def->before_modify("DELETE FROM " + def->name);
         }
 
+        // Surface the callback's reason (set_vtab_error) instead of SQLite's
+        // generic "SQL logic error", as the INSERT/UPDATE paths already do.
+        clear_vtab_error();
         if (!def->delete_row(rowid)) {
-            return to_sqlite_status(Status::error);
+            return return_vtab_error(pVtab);
         }
         vtab->transaction.wrote = true;
         return to_sqlite_status(Status::ok);
@@ -3191,8 +3194,11 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             def->before_modify("DELETE FROM " + def->name);
         }
 
+        // Surface the callback's reason (set_vtab_error) instead of SQLite's
+        // generic "SQL logic error", as the INSERT/UPDATE paths already do.
+        clear_vtab_error();
         if (!def->delete_row(*row_ptr)) {
-            return to_sqlite_status(Status::error);
+            return return_vtab_error(pVtab);
         }
         detail::cached_table_invalidate_after_mutation(def);
         if (def->after_modify) def->after_modify("DELETE FROM " + def->name);
