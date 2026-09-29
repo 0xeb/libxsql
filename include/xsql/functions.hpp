@@ -89,6 +89,11 @@ public:
 
     std::string db_error() const;
 
+    // Invalidate every cached table registered on this function's connection,
+    // as a write through each would (see xsql/cache_registry.hpp). Call it from
+    // a function that mutates the engine state the tables read.
+    void invalidate_cached_tables();
+
 private:
     void* ctx_ = nullptr;
 };

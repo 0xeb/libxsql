@@ -3697,8 +3697,22 @@ find_content_type(const std::string &path,
   }
 }
 
-inline bool can_compress_content_type(const std::string &content_type) {
+inline bool can_compress_content_type(const std::string &content_type_header) {
   using udl::operator""_t;
+
+  // xsql local patch (see VENDORED.md "Local Patches"): decide on the media type
+  // alone. Upstream compared the whole header, so "text/event-stream;
+  // charset=utf-8" missed the event-stream exclusion below, fell into the text/*
+  // default and was gzip'd -- a compressed SSE stream is buffered until the
+  // compressor fills, so every MCP client that sends Accept-Encoding: gzip (the
+  // Python MCP SDK's httpx does by default) waited forever for the endpoint
+  // event. fastmcpp's SSE server sends exactly that header.
+  std::string content_type =
+      content_type_header.substr(0, content_type_header.find(';'));
+  while (!content_type.empty() &&
+         (content_type.back() == ' ' || content_type.back() == '\t')) {
+    content_type.pop_back();
+  }
 
   auto tag = str2tag(content_type);
 

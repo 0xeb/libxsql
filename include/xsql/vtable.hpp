@@ -21,6 +21,7 @@
 #pragma once
 
 #include "database.hpp"
+#include "cache_registry.hpp"
 #include "interruption.hpp"
 #include <sqlite3.h>
 #include <string>
@@ -31,6 +32,8 @@
 #include <stdexcept>
 #include <cstring>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <new>
@@ -39,6 +42,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <atomic>
 #include <algorithm>
 #include <utility>
 
@@ -63,6 +67,13 @@ inline T* clone_def(const T* src) {
 template <typename T>
 inline void destroy_def(void* p) {
     delete static_cast<T*>(p);
+}
+
+// Cached-table module destructor: drop the connection-wide invalidator first.
+template <typename RowData>
+inline void destroy_cached_def(void* p) {
+    unregister_cached_table_invalidator(p);
+    delete static_cast<CachedTableDef<RowData>*>(p);
 }
 
 inline bool register_vtable_sqlite(sqlite3* db, const char* module_name, const VTableDef* def);
@@ -322,7 +333,442 @@ struct GeneratorConstraintArg {
     FunctionArg value;
 };
 
-inline std::vector<int> parse_constraint_index_list(const char* idx_str);
+namespace detail {
+
+// Decode a constraint filter's spec-index list (as xBestIndex encoded it) into
+// exactly one spec index per xFilter argument. xBestIndex set omit=1 for every
+// constraint it encoded, so SQLite does not re-check them: an entry that is not
+// a whole number below `spec_count`, or a list whose length differs from
+// `argc`, is an error. Skipping an argument would hand the factory fewer
+// constraints than SQLite omitted and widen the result -- wrong rows, no error.
+inline bool resolve_constraint_specs(const char* list, size_t spec_count, int argc,
+                                     const std::string& table, std::vector<int>& out,
+                                     std::string& error) {
+    out.clear();
+    std::string text = list ? list : "";
+    size_t start = 0;
+    while (start <= text.size() && !text.empty()) {
+        const size_t comma = (std::min)(text.find(',', start), text.size());
+        const std::string part = text.substr(start, comma - start);
+        if (!part.empty()) {
+            const int arg_index = static_cast<int>(out.size());
+            char* end = nullptr;
+            const long long index = std::strtoll(part.c_str(), &end, 10);
+            if (!end || *end != '\0' || index < 0 ||
+                static_cast<unsigned long long>(index) >= spec_count) {
+                error = "constraint filter argument " + std::to_string(arg_index) +
+                        " maps to out-of-range spec index " + part + " on table '" +
+                        table + "'";
+                return false;
+            }
+            out.push_back(static_cast<int>(index));
+        }
+        start = comma + 1;
+    }
+    if (out.size() != static_cast<size_t>(argc < 0 ? 0 : argc)) {
+        error = "constraint filter on table '" + table + "' received " +
+                std::to_string(argc) + " argument(s) for " +
+                std::to_string(out.size()) + " encoded constraint(s)";
+        return false;
+    }
+    return true;
+}
+
+} // namespace detail
+
+// ============================================================================
+// Integer keys versus constraint values, the way SQLite compares them
+// ============================================================================
+//
+// SQLite hands xFilter a constraint's right-hand side with NO column affinity
+// applied (measured: `k = '15'` arrives as the text '15', `k = 10.5` as a real,
+// `k = NULL` as NULL). A plan that sets omit=1 is trusted -- SQLite does not
+// re-check its rows -- so it must answer exactly what SQLite answers for an
+// INTEGER column holding the same keys. Reading the value with as_int64()
+// does not: 10.5 truncates to 10, 'a' and NULL become 0.
+//
+// So the value first gets the column's INTEGER affinity (well-formed numeric
+// text becomes a number, by SQLite's own parser) and is then ordered by
+// SQLite's rules: NULL matches nothing, a real compares exactly against the
+// integer key (no rounding past 2^53), and other text or a blob sorts after
+// every number.
+namespace detail {
+
+// A constraint value as an integer key compares against it.
+struct KeyOperand {
+    enum class Kind {
+        Int,           // compares as the integer `integer`
+        Real,          // compares exactly as the double `real`
+        AboveNumbers,  // non-numeric text or a blob: greater than every number
+        Null           // NULL (or NaN): no comparison is true
+    };
+    Kind kind = Kind::Null;
+    int64_t integer = 0;
+    double real = 0.0;
+};
+
+// 2^63: every int64 is below it and at or above its negation.
+constexpr double kTwoPow63 = 9223372036854775808.0;
+
+// The sqlite3_value a FunctionArg wraps. FunctionArg is static_asserted to be
+// a trivially-copyable, standard-layout, pointer-sized wrapper of exactly this
+// pointer (detail::with_args aliases argv the other way), so this is a copy of
+// its one member, not a reinterpretation.
+inline sqlite3_value* raw_sqlite_value(const FunctionArg& arg) {
+    const void* raw = nullptr;
+    std::memcpy(&raw, &arg, sizeof(raw));
+    return static_cast<sqlite3_value*>(const_cast<void*>(raw));
+}
+
+// Classify `value` for comparison with an INTEGER column. Returns false only
+// when SQLite could not allocate the private copy that numeric affinity needs
+// (the caller reports out-of-memory); applying affinity to `value` itself
+// would change the caller's value (an outer JOIN column, for instance).
+inline bool key_operand(sqlite3_value* value, KeyOperand& out) {
+    out = KeyOperand{};
+    if (!value) return true;
+    switch (sqlite3_value_type(value)) {
+        case SQLITE_INTEGER:
+            out.kind = KeyOperand::Kind::Int;
+            out.integer = sqlite3_value_int64(value);
+            return true;
+        case SQLITE_FLOAT: {
+            const double real = sqlite3_value_double(value);
+            if (!std::isnan(real)) {
+                out.kind = KeyOperand::Kind::Real;
+                out.real = real;
+            }
+            return true;
+        }
+        case SQLITE_TEXT: {
+            sqlite3_value* copy = sqlite3_value_dup(value);
+            if (!copy) return false;
+            switch (sqlite3_value_numeric_type(copy)) {
+                case SQLITE_INTEGER:
+                    out.kind = KeyOperand::Kind::Int;
+                    out.integer = sqlite3_value_int64(copy);
+                    break;
+                case SQLITE_FLOAT: {
+                    const double real = sqlite3_value_double(copy);
+                    out.kind = std::isnan(real) ? KeyOperand::Kind::Null
+                                                : KeyOperand::Kind::Real;
+                    out.real = real;
+                    break;
+                }
+                default:
+                    out.kind = KeyOperand::Kind::AboveNumbers;
+                    break;
+            }
+            sqlite3_value_free(copy);
+            return true;
+        }
+        case SQLITE_BLOB:
+            out.kind = KeyOperand::Kind::AboveNumbers;
+            return true;
+        default:
+            return true;
+    }
+}
+
+// Three-way compare of an integer key with a real, exact over the whole int64
+// range (as sqlite3IntFloatCompare; a plain (double)key rounds past 2^53).
+inline int compare_int_to_real(int64_t key, double real) {
+    if (real >= kTwoPow63) return -1;
+    if (real < -kTwoPow63) return 1;
+    const int64_t whole = static_cast<int64_t>(real);  // truncates; in range
+    if (key != whole) return key < whole ? -1 : 1;
+    const double fraction = real - static_cast<double>(whole);
+    return fraction > 0.0 ? -1 : (fraction < 0.0 ? 1 : 0);
+}
+
+// Whether `key <op> operand` holds under SQLite's ordering.
+inline bool key_satisfies(int64_t key, ConstraintOp op, const KeyOperand& operand) {
+    int order = 0;
+    switch (operand.kind) {
+        case KeyOperand::Kind::Null: return false;
+        case KeyOperand::Kind::Int:
+            order = key < operand.integer ? -1 : (key > operand.integer ? 1 : 0);
+            break;
+        case KeyOperand::Kind::Real:
+            order = compare_int_to_real(key, operand.real);
+            break;
+        case KeyOperand::Kind::AboveNumbers:
+            order = -1;
+            break;
+    }
+    switch (op) {
+        case ConstraintOp::Eq: return order == 0;
+        case ConstraintOp::Gt: return order > 0;
+        case ConstraintOp::Ge: return order >= 0;
+        case ConstraintOp::Lt: return order < 0;
+        case ConstraintOp::Le: return order <= 0;
+        // Not evaluable against an integer key (rejected when the filter is built).
+        case ConstraintOp::Like: return false;
+    }
+    return false;
+}
+
+// The one integer key equal to `operand`, if any (an equality lookup).
+inline std::optional<int64_t> exact_key(const KeyOperand& operand) {
+    if (operand.kind == KeyOperand::Kind::Int) return operand.integer;
+    if (operand.kind == KeyOperand::Kind::Real && operand.real >= -kTwoPow63 &&
+        operand.real < kTwoPow63) {
+        const auto whole = static_cast<int64_t>(operand.real);
+        if (static_cast<double>(whole) == operand.real) return whole;
+    }
+    return std::nullopt;
+}
+
+// One side of a range over integer keys, after SQLite's comparison rules.
+struct KeyBound {
+    enum class Kind {
+        Empty,      // no key satisfies the bound
+        Unbounded,  // every key satisfies it (drop the bound)
+        Inclusive   // keys at or beyond `value` (inclusive) satisfy it
+    };
+    Kind kind = Kind::Empty;
+    int64_t value = 0;
+};
+
+inline KeyBound key_bound_empty() { return KeyBound{KeyBound::Kind::Empty, 0}; }
+inline KeyBound key_bound_unbounded() { return KeyBound{KeyBound::Kind::Unbounded, 0}; }
+inline KeyBound key_bound_at(int64_t value) {
+    return KeyBound{KeyBound::Kind::Inclusive, value};
+}
+
+// The inclusive lower key bound for `key > operand` (strict) or `key >= operand`.
+inline KeyBound lower_key_bound(const KeyOperand& operand, bool strict) {
+    switch (operand.kind) {
+        case KeyOperand::Kind::Null:
+        case KeyOperand::Kind::AboveNumbers:
+            return key_bound_empty();
+        case KeyOperand::Kind::Int:
+            if (!strict) return key_bound_at(operand.integer);
+            if (operand.integer == INT64_MAX) return key_bound_empty();
+            return key_bound_at(operand.integer + 1);
+        case KeyOperand::Kind::Real: {
+            // key > r  <=>  key >= floor(r) + 1;  key >= r  <=>  key >= ceil(r).
+            const double whole = strict ? std::floor(operand.real) : std::ceil(operand.real);
+            if (whole >= kTwoPow63) return key_bound_empty();
+            if (whole < -kTwoPow63) return key_bound_unbounded();
+            const auto bound = static_cast<int64_t>(whole);
+            if (!strict) return key_bound_at(bound);
+            if (bound == INT64_MAX) return key_bound_empty();
+            return key_bound_at(bound + 1);
+        }
+    }
+    return key_bound_empty();
+}
+
+// The inclusive upper key bound for `key < operand` (strict) or `key <= operand`.
+inline KeyBound upper_key_bound(const KeyOperand& operand, bool strict) {
+    switch (operand.kind) {
+        case KeyOperand::Kind::Null:
+            return key_bound_empty();
+        case KeyOperand::Kind::AboveNumbers:
+            // Every number sorts before text and blobs.
+            return key_bound_unbounded();
+        case KeyOperand::Kind::Int:
+            if (!strict) return key_bound_at(operand.integer);
+            if (operand.integer == INT64_MIN) return key_bound_empty();
+            return key_bound_at(operand.integer - 1);
+        case KeyOperand::Kind::Real: {
+            // key < r  <=>  key <= ceil(r) - 1;  key <= r  <=>  key <= floor(r).
+            const double whole = strict ? std::ceil(operand.real) : std::floor(operand.real);
+            if (whole < -kTwoPow63) return key_bound_empty();
+            if (whole >= kTwoPow63) return key_bound_unbounded();
+            const auto bound = static_cast<int64_t>(whole);
+            if (!strict) return key_bound_at(bound);
+            if (bound == INT64_MIN) return key_bound_empty();
+            return key_bound_at(bound - 1);
+        }
+    }
+    return key_bound_empty();
+}
+
+// Whether a text-keyed equality factory (filter_eq_text) can match `value` on a
+// TEXT column: NULL equals nothing, and a blob never equals text. Numbers get
+// the column's TEXT affinity, which is exactly as_c_str()'s rendering.
+inline bool text_key_can_match(const FunctionArg& value) {
+    const int type = value.type();
+    return type != SQLITE_NULL && type != SQLITE_BLOB;
+}
+
+// Replace a plan's idxStr. xBestIndex may already have set one (the colUsed a
+// projection-aware table carries to its full scan) before choosing a plan with
+// its own; overwriting it without freeing leaked the first string.
+inline void replace_plan_idx_str(sqlite3_index_info* info, char* idx_str) {
+    if (info->idxStr && info->needToFreeIdxStr) sqlite3_free(info->idxStr);
+    info->idxStr = idx_str;
+    info->needToFreeIdxStr = idx_str ? 1 : 0;
+}
+
+} // namespace detail
+
+// ============================================================================
+// Constraint values in tool factories
+// ============================================================================
+//
+// A parametric_filter / constraint_filter factory (and a raw FilterDef
+// factory) receives each constraint value exactly as SQLite handed it to
+// xFilter: no column affinity, so `k = '15'` is text, `k = 10.5` a real and
+// `k = NULL` NULL. Those plans are omit=1 -- SQLite does not re-check the
+// rows -- so the factory must answer what SQLite would answer for a native
+// column. Reading the value with as_int64() does not: 10.5 truncates to 10,
+// and 'a' and NULL become 0. These helpers are the comparison the built-in
+// filter_eq / index_on plans use; call them instead of as_int64() / as_c_str()
+// on a constraint value.
+//
+// An exact integer key (an address, an id) in an EQ constraint:
+//
+//     const std::optional<int64_t> ea = xsql::exact_int64(arg.value);
+//     if (!ea) return empty_generator();   // no integer equals the value
+//
+// A key range from GT/GE/LT/LE (and EQ) constraints on one INTEGER column:
+//
+//     xsql::Int64KeyRange range;
+//     for (const auto& arg : args) range.constrain(arg.op, arg.value);
+//     if (range.empty()) return empty_generator();
+//     scan(range.lower(), range.upper());  // both inclusive
+//
+// A parameter that deliberately accepts another spelling (a symbol name or
+// '0x401000' text for an address, say) is a product surface, not a key
+// comparison: parse that spelling on purpose, and use these helpers for the
+// rest.
+
+/**
+ * The int64 that equals `value` under SQLite's comparison with an INTEGER
+ * column, or nullopt when no integer does -- the factory then yields no rows.
+ *
+ * An integer is itself; a real only when it is integral and in int64 range
+ * (10.0 -> 10, 10.5 -> none, compared exactly past 2^53); text only when
+ * SQLite's INTEGER affinity makes it such a number ('10', ' 10 ', '1e1' -> 10;
+ * '0x10' and 'a' -> none); NULL, NaN and blobs never. On allocation failure
+ * the vtab error is set as well, so xFilter reports it.
+ */
+inline std::optional<int64_t> exact_int64(const FunctionArg& value) {
+    detail::KeyOperand operand;
+    if (!detail::key_operand(detail::raw_sqlite_value(value), operand)) {
+        set_vtab_error("out of memory");
+        return std::nullopt;
+    }
+    return detail::exact_key(operand);
+}
+
+/**
+ * The text that equals `value` under SQLite's comparison with a TEXT column,
+ * or nullopt when no text does -- the factory then yields no rows.
+ *
+ * Text is itself; a number gets TEXT affinity, which is its rendering (10 ->
+ * "10", 10.5 -> "10.5"); NULL and blobs never equal text.
+ */
+inline std::optional<std::string> exact_text(const FunctionArg& value) {
+    if (!detail::text_key_can_match(value)) return std::nullopt;
+    const char* text = value.as_c_str();
+    return std::string(text ? text : "");
+}
+
+/**
+ * The inclusive window of int64 keys that satisfies every comparison applied
+ * to it, each compared the way SQLite compares an INTEGER column.
+ *
+ * `constrain(Ge, 14.5)` keeps keys >= 15; `constrain(Lt, 'a')` keeps every key
+ * (text sorts after all numbers); a NULL operand, or an Eq value no integer
+ * can equal, empties the window. Starts as every int64.
+ */
+class Int64KeyRange {
+public:
+    /**
+     * Narrow the window to keys satisfying `key <op> value`. Returns false
+     * once the window is empty. LIKE is not a key comparison: it empties the
+     * window and sets the vtab error, so a mis-routed constraint fails loudly.
+     * On allocation failure the vtab error is set and the window empties.
+     */
+    bool constrain(ConstraintOp op, const FunctionArg& value) {
+        detail::KeyOperand operand;
+        if (!detail::key_operand(detail::raw_sqlite_value(value), operand)) {
+            set_vtab_error("out of memory");
+            return set_empty();
+        }
+        return constrain_operand(op, operand);
+    }
+
+    /// Narrow the window to keys satisfying `key <op> value` for an integer
+    /// the caller resolved itself (e.g. a symbol name parsed to an address).
+    bool constrain(ConstraintOp op, int64_t value) {
+        detail::KeyOperand operand;
+        operand.kind = detail::KeyOperand::Kind::Int;
+        operand.integer = value;
+        return constrain_operand(op, operand);
+    }
+
+    /// True when no key satisfies the comparisons applied so far.
+    bool empty() const { return empty_; }
+
+    /// The smallest key in the window (INT64_MIN when unbounded below).
+    /// Meaningless when empty().
+    int64_t lower() const { return lower_; }
+
+    /// The largest key in the window (INT64_MAX when unbounded above).
+    /// Meaningless when empty().
+    int64_t upper() const { return upper_; }
+
+    /// Whether `key` satisfies every comparison applied so far.
+    bool contains(int64_t key) const {
+        return !empty_ && key >= lower_ && key <= upper_;
+    }
+
+private:
+    bool constrain_operand(ConstraintOp op, const detail::KeyOperand& operand) {
+        switch (op) {
+            case ConstraintOp::Eq: {
+                const std::optional<int64_t> key = detail::exact_key(operand);
+                if (!key) return set_empty();
+                apply_lower(detail::key_bound_at(*key));
+                apply_upper(detail::key_bound_at(*key));
+                break;
+            }
+            case ConstraintOp::Gt:
+            case ConstraintOp::Ge:
+                apply_lower(detail::lower_key_bound(operand, op == ConstraintOp::Gt));
+                break;
+            case ConstraintOp::Lt:
+            case ConstraintOp::Le:
+                apply_upper(detail::upper_key_bound(operand, op == ConstraintOp::Lt));
+                break;
+            case ConstraintOp::Like:
+                set_vtab_error("LIKE is not an integer key comparison");
+                return set_empty();
+        }
+        if (lower_ > upper_) empty_ = true;
+        return !empty_;
+    }
+
+    void apply_lower(const detail::KeyBound& bound) {
+        if (bound.kind == detail::KeyBound::Kind::Empty) {
+            empty_ = true;
+        } else if (bound.kind == detail::KeyBound::Kind::Inclusive) {
+            lower_ = (std::max)(lower_, bound.value);
+        }
+    }
+
+    void apply_upper(const detail::KeyBound& bound) {
+        if (bound.kind == detail::KeyBound::Kind::Empty) {
+            empty_ = true;
+        } else if (bound.kind == detail::KeyBound::Kind::Inclusive) {
+            upper_ = (std::min)(upper_, bound.value);
+        }
+    }
+
+    bool set_empty() {
+        empty_ = true;
+        return false;
+    }
+
+    int64_t lower_ = INT64_MIN;
+    int64_t upper_ = INT64_MAX;
+    bool empty_ = false;
+};
 
 /**
  * Defines a filter for a specific column constraint.
@@ -687,11 +1133,16 @@ inline int vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
                 // Create the filtered iterator
+                clear_vtab_error();
                 cursor->iter = filter.create(FunctionArg(argv[0]));
                 cursor->using_iterator = true;
                 cursor->iterator_eof = true;
                 if (cursor->iter) {
                     cursor->iterator_eof = !cursor->iter->next();
+                }
+                if (!get_vtab_error().empty()) {
+                    cursor->iterator_eof = true;
+                    return return_vtab_error(pCursor->pVtab);
                 }
                 return to_sqlite_status(Status::ok);
             }
@@ -1448,7 +1899,12 @@ public:
         def_.filters.emplace_back(
             col_idx, filter_id, cost, est_rows,
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
-                return factory(val.as_int64());
+                // omit=1: SQLite trusts these rows, so a value no integer key
+                // can equal (10.5, 'a', NULL, a blob) yields none -- the
+                // factory is never asked for as_int64()'s truncation.
+                const std::optional<int64_t> key = exact_int64(val);
+                if (!key) return nullptr;
+                return factory(*key);
             }
         );
         return *this;
@@ -1469,6 +1925,8 @@ public:
         def_.filters.emplace_back(
             col_idx, filter_id, cost, est_rows,
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                // omit=1: NULL equals nothing and a blob never equals text.
+                if (!detail::text_key_can_match(val)) return nullptr;
                 const char* text = val.as_c_str();
                 return factory(text ? text : "");
             }
@@ -1655,6 +2113,23 @@ struct SortedIndex {
     bool built = false;
 };
 
+// Monotonic count of writes through one cached table (INSERT/UPDATE/DELETE, or
+// an explicit invalidate_cache()). A cursor-lived cache records the value it was
+// built at and is reused across that cursor's xFilter calls only while it still
+// matches -- so a JOIN's inner loop builds once, yet a write through the table
+// forces the next probe to rebuild exactly as before.
+//
+// SHARED across copies, like `shared_cache`: registration clones the def
+// (clone_def), and the caller's copy and SQLite's copy must see the same
+// counter, or an invalidate_cache() on the caller's def would never reach the
+// cursors SQLite runs over the registered clone.
+struct WriteGeneration {
+    std::shared_ptr<std::atomic<uint64_t>> value =
+        std::make_shared<std::atomic<uint64_t>>(0);
+    uint64_t load() const { return value->load(std::memory_order_acquire); }
+    void bump() const { value->fetch_add(1, std::memory_order_acq_rel); }
+};
+
 // Shared cache with indexes - lazily built, shared across all cursors
 template<typename RowData>
 struct SharedCache {
@@ -1778,6 +2253,9 @@ struct CachedTableDef {
     // exactly this and was reverted to query-scoped for every mutable table.)
     bool use_shared_cache = true;
     mutable std::shared_ptr<SharedCache<RowData>> shared_cache;
+    // See WriteGeneration. Bumped by every write path; checked by the
+    // cursor-lived caches of query-scoped (no_shared_cache) tables.
+    mutable WriteGeneration write_generation;
 
     std::string schema() const {
         return detail::render_table_schema(name, columns);
@@ -1862,6 +2340,7 @@ struct CachedTableDef {
 
     // Invalidate cache (call when underlying data changes)
     void invalidate_cache() const {
+        write_generation.bump();
         if (shared_cache) {
             std::lock_guard<std::mutex> lock(shared_cache->mutex);
             shared_cache->data.clear();
@@ -1892,7 +2371,9 @@ inline bool cached_table_supports_count_only_scan(const CachedTableDef<RowData>*
 
 template<typename RowData>
 inline void cached_table_invalidate_after_mutation(const CachedTableDef<RowData>* def) {
-    if (!def || !def->shared_cache) return;
+    if (!def) return;
+    def->write_generation.bump();
+    if (!def->shared_cache) return;
     std::lock_guard<std::mutex> lock(def->shared_cache->mutex);
     def->shared_cache->indexes.clear();
     def->shared_cache->sorted_indexes.clear();
@@ -2049,6 +2530,13 @@ struct CachedCursor {
     const CachedTableDef<RowData>* def;
     std::vector<RowData> cache;           // Used only for non-shared fallback
     bool cache_built = false;
+    // Key of the full-scan `cache` above. It is cursor-lived, like index_cache:
+    // reused across this cursor's xFilter calls (a JOIN's inner loop re-filters
+    // one cursor once per outer row) while the projection it was built for and
+    // the table's write generation both still match. A new statement opens a new
+    // cursor, so freshness across statements is unchanged.
+    uint64_t cache_col_used = 0;
+    uint64_t cache_generation = 0;
     size_t current_row = 0;
     std::unique_ptr<RowIterator> iterator;
     bool using_iterator = false;
@@ -2082,6 +2570,7 @@ struct CachedCursor {
     std::vector<RowData> index_cache;
     std::vector<std::unordered_map<int64_t, std::vector<size_t>>> cursor_indexes;
     bool cursor_index_built = false;
+    uint64_t index_generation = 0;  // write generation index_cache was built at
 
     // Cursor-owned copy of a shared-cache EQ lookup's matched rows. The old code
     // stored pointers into the shared index map + data and read them across the
@@ -2370,9 +2859,17 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
     cursor->range_matches.clear();
     cursor->using_count_only = false;
     cursor->count_only_total = 0;
-    cursor->cache.clear();
-    cursor->cache_built = false;
     cursor->current_row = 0;
+    // `cache` and `index_cache` are deliberately NOT cleared here: both are
+    // cursor-lived and reused across this cursor's xFilter calls. Only a write
+    // through the table since they were built invalidates them.
+    if (cursor->cursor_index_built &&
+        cursor->index_generation != cursor->def->write_generation.load()) {
+        cursor->index_cache.clear();
+        cursor->cursor_indexes.clear();
+        cursor->cursor_sorted_indexes.clear();
+        cursor->cursor_index_built = false;
+    }
 
     // A new scan begins a new statement: drop any query-scoped mutation snapshot
     // preserved from a prior scan-driven UPDATE/DELETE (see
@@ -2399,9 +2896,17 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                 return to_sqlite_status(Status::ok);
             }
 
-            const int64_t raw_rowid = FunctionArg(argv[0]).as_int64();
+            // omit=1: only a value an integer rowid can equal finds a row
+            // (`rowid = 1.5` or `rowid = 'a'` must not read as 1 or 0).
+            detail::KeyOperand rowid_operand;
+            if (!detail::key_operand(argv[0], rowid_operand)) {
+                set_vtab_error("out of memory");
+                return return_vtab_error(pCursor->pVtab);
+            }
+            const std::optional<int64_t> exact_rowid = detail::exact_key(rowid_operand);
+            const int64_t raw_rowid = exact_rowid ? *exact_rowid : -1;
             cursor->using_rowid_lookup = true;
-            cursor->rowid_lookup_id = raw_rowid;
+            cursor->rowid_lookup_id = exact_rowid ? raw_rowid : 0;
             cursor->rowid_lookup_eof = true;
 
             if (raw_rowid >= 0) {
@@ -2452,26 +2957,18 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
             for (const auto& filter : cursor->def->constraint_filters) {
                 if (filter.filter_id != idxNum) continue;
 
-                const std::vector<int> spec_indices =
-                    parse_constraint_index_list(idxStr);
+                std::vector<int> spec_indices;
+                std::string spec_error;
+                if (!detail::resolve_constraint_specs(idxStr, filter.specs.size(), argc,
+                                                      cursor->def->name, spec_indices,
+                                                      spec_error)) {
+                    set_vtab_error(std::move(spec_error));
+                    return return_vtab_error(pCursor->pVtab);
+                }
                 std::vector<GeneratorConstraintArg> args;
                 args.reserve(static_cast<size_t>(argc));
-                for (int i = 0;
-                     i < argc && i < static_cast<int>(spec_indices.size()); ++i) {
+                for (int i = 0; i < argc; ++i) {
                     const int spec_index = spec_indices[static_cast<size_t>(i)];
-                    if (spec_index < 0 ||
-                        static_cast<size_t>(spec_index) >= filter.specs.size()) {
-                        // xBestIndex set omit=1 for every constraint it encoded,
-                        // so SQLite is NOT re-checking them. Silently dropping an
-                        // arg here would widen the result set instead of
-                        // narrowing it -- wrong rows, no error. Fail loudly.
-                        set_vtab_error(
-                            "constraint filter argument " + std::to_string(i) +
-                            " maps to out-of-range spec index " +
-                            std::to_string(spec_index) + " on table '" +
-                            cursor->def->name + "'");
-                        return return_vtab_error(pCursor->pVtab);
-                    }
                     const auto& spec = filter.specs[static_cast<size_t>(spec_index)];
                     args.push_back(GeneratorConstraintArg{
                         spec.column_index, spec.op, FunctionArg(argv[i])});
@@ -2502,28 +2999,37 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                 //     engine-lifetime cache and must not rebuild per statement;
                 //   * query-scoped tables (no_shared_cache) build a cursor-lived
                 //     copy so every statement sees fresh rows.
+                // The constraints are omit=1, so each is compared the way
+                // SQLite compares an INTEGER column (see detail::KeyOperand),
+                // resolved once here rather than per row.
                 const auto& index_defs = cursor->def->index_defs;
+                struct KeyPredicate {
+                    int index_position;
+                    ConstraintOp op;
+                    detail::KeyOperand operand;
+                };
+                std::vector<KeyPredicate> predicates;
+                predicates.reserve(args.size());
+                for (const auto& arg : args) {
+                    KeyPredicate predicate{cursor->def->find_index(arg.column_index),
+                                           arg.op, {}};
+                    if (!detail::key_operand(detail::raw_sqlite_value(arg.value),
+                                             predicate.operand)) {
+                        set_vtab_error("out of memory");
+                        return return_vtab_error(pCursor->pVtab);
+                    }
+                    predicates.push_back(predicate);
+                }
                 auto row_matches = [&](const RowData& row) -> bool {
-                    for (const auto& arg : args) {
-                        if (arg.value.is_null()) return false;
-                        const int index_position =
-                            cursor->def->find_index(arg.column_index);
-                        if (index_position < 0) return false;
-                        const auto lhs = index_defs[
-                            static_cast<size_t>(index_position)].second(row);
-                        const auto rhs = arg.value.as_int64();
-                        bool ok = false;
-                        switch (arg.op) {
-                            case ConstraintOp::Eq: ok = lhs == rhs; break;
-                            case ConstraintOp::Gt: ok = lhs > rhs;  break;
-                            case ConstraintOp::Le: ok = lhs <= rhs; break;
-                            case ConstraintOp::Lt: ok = lhs < rhs;  break;
-                            case ConstraintOp::Ge: ok = lhs >= rhs; break;
-                            // Rejected by constraint_cache_filter() at build
-                            // time; unreachable unless that guard is loosened.
-                            case ConstraintOp::Like: ok = false; break;
+                    for (const auto& predicate : predicates) {
+                        if (predicate.index_position < 0) return false;
+                        const int64_t key = index_defs[
+                            static_cast<size_t>(predicate.index_position)].second(row);
+                        // LIKE is rejected by constraint_cache_filter() at build
+                        // time, and key_satisfies() answers false for it anyway.
+                        if (!detail::key_satisfies(key, predicate.op, predicate.operand)) {
+                            return false;
                         }
-                        if (!ok) return false;
                     }
                     return true;
                 };
@@ -2554,6 +3060,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                 } else {
                     if (!cursor->cursor_index_built) {
                         cursor->index_cache.clear();
+                        cursor->index_generation = cursor->def->write_generation.load();
                         cursor->def->build_rows(cursor->index_cache);
                         if (!get_vtab_error().empty()) {
                             cursor->index_cache.clear();
@@ -2584,20 +3091,60 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
         if (idxNum >= RANGE_BASE) {
             const int encoded = idxNum - RANGE_BASE;
             const int index_pos = encoded / RANGE_STRIDE;
-            const int range_flags = encoded & RANGE_FLAG_MASK;
+            int range_flags = encoded & RANGE_FLAG_MASK;
             const auto& index_defs = cursor->def->index_defs;
             if (index_pos >= 0 && static_cast<size_t>(index_pos) < index_defs.size()) {
                 // Decode bounds from argv in the order xBestIndex assigned argvIndex:
                 // low first (if present), then high. Track the next slot to consume so
                 // a high-only range still reads argv[0].
+                //
+                // The plan is omit=1, so each bound is normalized to the
+                // inclusive integer bound with the same meaning over integer
+                // keys (detail::lower_key_bound / upper_key_bound): 14.5 as a
+                // lower bound is 15, text drops an upper bound, NULL empties the
+                // window. Reading them with as_int64() truncated 14.5 to 14 and
+                // turned 'a' and NULL into 0.
                 int slot = 0;
                 int64_t low = 0, high = 0;
-                if (range_flags & RANGE_HAS_LOW) {
-                    if (slot < argc) low = FunctionArg(argv[slot]).as_int64();
-                    ++slot;
+                bool empty_window = false;
+                for (int side = 0; side < 2; ++side) {
+                    const bool is_low = side == 0;
+                    const int has = is_low ? RANGE_HAS_LOW : RANGE_HAS_HIGH;
+                    const int strict_bit = is_low ? RANGE_LOW_STRICT : RANGE_HIGH_STRICT;
+                    if (!(range_flags & has)) continue;
+                    if (slot >= argc) {
+                        range_flags &= ~(has | strict_bit);
+                        continue;
+                    }
+                    detail::KeyOperand operand;
+                    if (!detail::key_operand(argv[slot++], operand)) {
+                        set_vtab_error("out of memory");
+                        return return_vtab_error(pCursor->pVtab);
+                    }
+                    const bool strict = (range_flags & strict_bit) != 0;
+                    const detail::KeyBound bound = is_low
+                        ? detail::lower_key_bound(operand, strict)
+                        : detail::upper_key_bound(operand, strict);
+                    switch (bound.kind) {
+                        case detail::KeyBound::Kind::Empty:
+                            empty_window = true;
+                            break;
+                        case detail::KeyBound::Kind::Unbounded:
+                            range_flags &= ~(has | strict_bit);
+                            break;
+                        case detail::KeyBound::Kind::Inclusive:
+                            range_flags &= ~strict_bit;
+                            (is_low ? low : high) = bound.value;
+                            break;
+                    }
                 }
-                if (range_flags & RANGE_HAS_HIGH) {
-                    if (slot < argc) high = FunctionArg(argv[slot]).as_int64();
+                if (empty_window) {
+                    cursor->range_matches.clear();
+                    cursor->using_index = true;
+                    cursor->index_matches = &cursor->range_matches;
+                    cursor->index_data_source = nullptr;
+                    cursor->index_pos = 0;
+                    return to_sqlite_status(Status::ok);
                 }
                 clear_vtab_error();
                 if (cursor->def->use_shared_cache) {
@@ -2657,6 +3204,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                     // this cursor's xFilter calls), then the sorted view on demand.
                     if (!cursor->cursor_index_built) {
                         cursor->index_cache.clear();
+                        cursor->index_generation = cursor->def->write_generation.load();
                         cursor->def->build_rows(cursor->index_cache);
                         if (!get_vtab_error().empty()) {
                             cursor->index_cache.clear();
@@ -2697,6 +3245,24 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
             int index_pos = idxNum - INDEX_BASE;
             const auto& index_defs = cursor->def->index_defs;
             if (index_pos >= 0 && static_cast<size_t>(index_pos) < index_defs.size()) {
+                // omit=1: probe only for the integer key that equals the value
+                // under SQLite's rules. No such key (NULL, 10.5, 'a', a blob)
+                // means no rows; as_int64() used to look up 10, 0 and 0.
+                detail::KeyOperand operand;
+                if (!detail::key_operand(argv[0], operand)) {
+                    set_vtab_error("out of memory");
+                    return return_vtab_error(pCursor->pVtab);
+                }
+                const std::optional<int64_t> exact = detail::exact_key(operand);
+                if (!exact) {
+                    cursor->range_matches.clear();
+                    cursor->using_index = true;
+                    cursor->index_matches = &cursor->range_matches;
+                    cursor->index_data_source = nullptr;
+                    cursor->index_pos = 0;
+                    return to_sqlite_status(Status::ok);
+                }
+                const int64_t key = *exact;
                 clear_vtab_error();
                 if (cursor->def->use_shared_cache) {
                     // Shared table: index lives in the engine-lifetime shared cache.
@@ -2714,7 +3280,6 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                         std::lock_guard<std::mutex> lock(shared->mutex);
                         if (shared->built &&
                             static_cast<size_t>(index_pos) < shared->indexes.size()) {
-                            int64_t key = FunctionArg(argv[0]).as_int64();
                             auto it = shared->indexes[index_pos].find(key);
                             cursor->index_row_copy.clear();
                             cursor->range_matches.clear();
@@ -2742,6 +3307,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                     // engine-lifetime shared cache. Rebuilt per statement (new cursor).
                     if (!cursor->cursor_index_built) {
                         cursor->index_cache.clear();
+                        cursor->index_generation = cursor->def->write_generation.load();
                         cursor->def->build_rows(cursor->index_cache);
                         if (!get_vtab_error().empty()) {
                             cursor->index_cache.clear();
@@ -2757,7 +3323,6 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                         }
                         cursor->cursor_index_built = true;
                     }
-                    int64_t key = FunctionArg(argv[0]).as_int64();
                     auto& index_map = cursor->cursor_indexes[index_pos];
                     auto it = index_map.find(key);
                     cursor->using_index = true;
@@ -2796,24 +3361,36 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
         }
     } else if (cursor->def->projection_cache_builder_fn ||
                cursor->def->has_cache_builder()) {
-        cursor->cache.clear();
-        clear_vtab_error();
-        if (cursor->def->projection_cache_builder_fn) {
-            // colUsed arrives per-plan via idxStr from xBestIndex (not shared
-            // vtab state). Absent/unparseable => assume all columns (~0, safe).
-            uint64_t col_used = ~0ull;
-            if (idxStr && *idxStr) {
-                col_used = static_cast<uint64_t>(strtoull(idxStr, nullptr, 10));
-            }
-            cursor->def->projection_cache_builder_fn(cursor->cache, col_used);
-        } else {
-            cursor->def->build_rows(cursor->cache);
+        // colUsed arrives per-plan via idxStr from xBestIndex (not shared
+        // vtab state). Absent/unparseable => assume all columns (~0, safe).
+        uint64_t col_used = ~0ull;
+        if (cursor->def->projection_cache_builder_fn && idxStr && *idxStr) {
+            col_used = static_cast<uint64_t>(strtoull(idxStr, nullptr, 10));
         }
-        if (!get_vtab_error().empty()) {
+        const uint64_t generation = cursor->def->write_generation.load();
+        // Reuse this cursor's rows when nothing could have changed them: same
+        // projection, no write through the table since the build. Without this
+        // a nested-loop JOIN rebuilt the whole table once per OUTER row.
+        const bool reuse = cursor->cache_built &&
+                           cursor->cache_col_used == col_used &&
+                           cursor->cache_generation == generation;
+        if (!reuse) {
             cursor->cache.clear();
-            return return_vtab_error(pCursor->pVtab);
+            cursor->cache_built = false;
+            clear_vtab_error();
+            if (cursor->def->projection_cache_builder_fn) {
+                cursor->def->projection_cache_builder_fn(cursor->cache, col_used);
+            } else {
+                cursor->def->build_rows(cursor->cache);
+            }
+            if (!get_vtab_error().empty()) {
+                cursor->cache.clear();
+                return return_vtab_error(pCursor->pVtab);
+            }
+            cursor->cache_built = true;
+            cursor->cache_col_used = col_used;
+            cursor->cache_generation = generation;
         }
-        cursor->cache_built = true;
     }
     cursor->using_iterator = false;
     cursor->using_index = false;
@@ -3039,8 +3616,9 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
             first = false;
         }
         pInfo->idxNum = best_constraint_filter->filter_id;
-        pInfo->idxStr = sqlite3_mprintf("%s", idx_str.str().c_str());
-        pInfo->needToFreeIdxStr = 1;
+        // The spec list replaces the projection colUsed string set above.
+        detail::replace_plan_idx_str(
+            pInfo, sqlite3_mprintf("%s", idx_str.str().c_str()));
         pInfo->estimatedCost = best_constraint_filter->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(
             best_constraint_filter->estimated_rows);
@@ -3413,7 +3991,7 @@ inline bool detail::register_cached_vtable_sqlite(sqlite3* db,
         module_name,
         &get_cached_module<RowData>(),
         owned,
-        &detail::destroy_def<CachedTableDef<RowData>>
+        &detail::destroy_cached_def<RowData>
     );
 
     if (!xsql::is_ok(rc)) {
@@ -3424,6 +4002,12 @@ inline bool detail::register_cached_vtable_sqlite(sqlite3* db,
         // fails" — same rule as sqlite3_create_function_v2.)
         return false;
     }
+    // Let xsql::invalidate_cached_tables(db) reach this clone -- what a SQL
+    // function that mutates the engine calls, since it holds no table handle.
+    // destroy_cached_def removes the entry when SQLite drops the module.
+    detail::register_cached_table_invalidator(db, owned, [owned] {
+        detail::cached_table_invalidate_after_mutation(owned);
+    });
     return true;
 }
 
@@ -3656,7 +4240,12 @@ public:
         int filter_id = static_cast<int>(def_.filters.size()) + 1;
         def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
-                return factory(val.as_int64());
+                // omit=1: SQLite trusts these rows, so a value no integer key
+                // can equal (10.5, 'a', NULL, a blob) yields none -- the
+                // factory is never asked for as_int64()'s truncation.
+                const std::optional<int64_t> key = exact_int64(val);
+                if (!key) return nullptr;
+                return factory(*key);
             });
         return *this;
     }
@@ -3669,6 +4258,8 @@ public:
         int filter_id = static_cast<int>(def_.filters.size()) + 1;
         def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                // omit=1: NULL equals nothing and a blob never equals text.
+                if (!detail::text_key_can_match(val)) return nullptr;
                 const char* text = val.as_c_str();
                 return factory(text ? text : "");
             });
@@ -4022,19 +4613,6 @@ struct GeneratorTableDef {
     }
 };
 
-inline std::vector<int> parse_constraint_index_list(const char* idx_str) {
-    std::vector<int> result;
-    if (!idx_str || !*idx_str) return result;
-
-    std::stringstream ss(idx_str);
-    std::string part;
-    while (std::getline(ss, part, ',')) {
-        if (!part.empty()) {
-            result.push_back(std::atoi(part.c_str()));
-        }
-    }
-    return result;
-}
 
 template<typename RowData>
 struct GeneratorCursor {
@@ -4358,14 +4936,18 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
                             spec_list_str = stripped_idx_str.c_str();
                         }
                     }
-                    std::vector<int> spec_indices = parse_constraint_index_list(spec_list_str);
+                    std::vector<int> spec_indices;
+                    std::string spec_error;
+                    if (!detail::resolve_constraint_specs(spec_list_str, cf.specs.size(),
+                                                          argc, cursor->def->name,
+                                                          spec_indices, spec_error)) {
+                        set_vtab_error(std::move(spec_error));
+                        return return_vtab_error(pCursor->pVtab);
+                    }
                     std::vector<GeneratorConstraintArg> args;
                     args.reserve(static_cast<size_t>(argc));
-                    for (int i = 0; i < argc && i < static_cast<int>(spec_indices.size()); i++) {
-                        int spec_idx = spec_indices[static_cast<size_t>(i)];
-                        if (spec_idx < 0 || static_cast<size_t>(spec_idx) >= cf.specs.size()) {
-                            continue;
-                        }
+                    for (int i = 0; i < argc; i++) {
+                        const int spec_idx = spec_indices[static_cast<size_t>(i)];
                         const auto& spec = cf.specs[static_cast<size_t>(spec_idx)];
                         args.push_back(GeneratorConstraintArg{
                             spec.column_index,
@@ -4597,7 +5179,7 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         std::ostringstream idx_str;
         // Projection-aware constraint filter: prefix idxStr with colUsed +
         // ';' before the usual comma-separated spec-index list (idxStr is
-        // otherwise just that list -- see parse_constraint_index_list /
+        // otherwise just that list -- see detail::resolve_constraint_specs /
         // xFilter's matching split below). Only done when this specific
         // filter actually has create_with_col_used set, so every filter
         // that doesn't use this (every pre-existing constraint_filter()
@@ -4715,11 +5297,17 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
             pInfo->needToFreeIdxStr = 1;
         }
     } else if (!missing_required_error.empty()) {
+        // This plan can only fail, so it must be the one SQLite picks last. In a
+        // join it competes with plans where the other table runs outer and feeds
+        // the required value in per row; priced cheap, it won, and a perfectly
+        // valid `JOIN gen ON gen.key = t.col` failed with the missing-constraint
+        // error. Alone in a query it is still the only plan, so the error stands.
+        // (Same pricing as libxsql-c.)
         pInfo->idxNum = MISSING_REQUIRED_CONSTRAINT;
         pInfo->idxStr = sqlite3_mprintf("%s", missing_required_error.c_str());
         pInfo->needToFreeIdxStr = 1;
-        pInfo->estimatedCost = 1.0;
-        pInfo->estimatedRows = 0;
+        pInfo->estimatedCost = 1e9;
+        pInfo->estimatedRows = 1;
     } else {
         size_t estimated_rows = 1000;
         if (def->estimate_rows_fn) {
@@ -5138,7 +5726,12 @@ public:
         int filter_id = static_cast<int>(def_.filters.size()) + 1;
         def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
-                return factory(val.as_int64());
+                // omit=1: SQLite trusts these rows, so a value no integer key
+                // can equal (10.5, 'a', NULL, a blob) yields none -- the
+                // factory is never asked for as_int64()'s truncation.
+                const std::optional<int64_t> key = exact_int64(val);
+                if (!key) return nullptr;
+                return factory(*key);
             });
         return *this;
     }
@@ -5151,6 +5744,8 @@ public:
         int filter_id = static_cast<int>(def_.filters.size()) + 1;
         def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                // omit=1: NULL equals nothing and a blob never equals text.
+                if (!detail::text_key_can_match(val)) return nullptr;
                 const char* text = val.as_c_str();
                 return factory(text ? text : "");
             });
@@ -5201,7 +5796,9 @@ public:
             std::function<std::unique_ptr<RowIterator>(FunctionArg)>{});
         def_.filters.back().create_with_col_used =
             [factory = std::move(factory)](FunctionArg val, uint64_t col_used) -> std::unique_ptr<RowIterator> {
-                return factory(val.as_int64(), col_used);
+                const std::optional<int64_t> key = exact_int64(val);
+                if (!key) return nullptr;  // see filter_eq()
+                return factory(*key, col_used);
             };
         return *this;
     }

@@ -5,6 +5,7 @@
 // See LICENSE.
 
 #include <xsql/functions.hpp>
+#include <xsql/cache_registry.hpp>
 
 #include <xsql/statement.hpp>
 
@@ -112,6 +113,12 @@ void FunctionContext::result_error(const std::string& msg) {
 
 void FunctionContext::result_error(const char* msg) {
     sqlite3_result_error(static_cast<sqlite3_context*>(ctx_), msg, -1);
+}
+
+void FunctionContext::invalidate_cached_tables() {
+    if (auto* db = sqlite3_context_db_handle(static_cast<sqlite3_context*>(ctx_))) {
+        xsql::invalidate_cached_tables(db);
+    }
 }
 
 std::string FunctionContext::db_error() const {

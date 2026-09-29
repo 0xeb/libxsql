@@ -36,6 +36,21 @@ across libghidra, ghidrasql, and fastmcpp.
 Changes made directly to the vendored `httplib.h`, not present upstream.
 Each is marked in-line with an `xsql local patch` comment at the change site.
 
+- **`detail::can_compress_content_type()` matches the media type only**
+  (2026-09-26): parameters (`; charset=...`) are stripped before the switch.
+  Upstream compared the full header value, so `text/event-stream; charset=utf-8`
+  (what fastmcpp's SSE server sends) missed the event-stream exclusion, fell
+  into the `text/*` default and was gzip'd. A compressed SSE stream is held in
+  the compressor until it fills, so MCP clients that send
+  `Accept-Encoding: gzip` (the Python MCP SDK, via httpx, does by default)
+  never received the `endpoint` event and hung in `initialize`. Measured with
+  curl: without `Accept-Encoding` the stream arrived at once; with gzip the
+  response carried `Content-Encoding: gzip` and no event. A side effect,
+  intended: `application/json; charset=utf-8` now compresses like
+  `application/json`. Regression-guarded by
+  `HttpCompressionTest.MediaTypeParametersDoNotChangeTheDecision` in the
+  project's libxsql suite, and end to end by idasql's MCP SDK e2e test.
+
 - **`detail::can_compress_content_type()` gzip allowlist** (2026-08-23):
   added `application/x-ndjson` alongside `application/json`. Upstream's
   allowlist is a fixed switch over specific content-type strings (plus a

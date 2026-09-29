@@ -7,6 +7,7 @@
 #include <xsql/aggregates.hpp>
 #include <xsql/database.hpp>
 #include <xsql/vtable.hpp>
+#include <xsql/cache_registry.hpp>
 
 #include <sqlite3.h>
 
@@ -849,6 +850,10 @@ void* Database::native_handle_unsafe() const {
 
 sqlite3* Database::sqlite_handle() const {
     return impl_ ? impl_->db : nullptr;
+}
+
+void Database::invalidate_cached_tables() {
+    if (auto* db = sqlite_handle()) xsql::invalidate_cached_tables(db);
 }
 
 } // namespace xsql

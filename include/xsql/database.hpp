@@ -199,6 +199,12 @@ public:
 
     Status register_function(const char* name, int argc, ScalarFn fn);
 
+    // Invalidate every cached table registered on this connection, as a write
+    // through each would (see xsql/cache_registry.hpp). For a caller that
+    // mutates the engine outside SQL; SQL functions use
+    // FunctionContext::invalidate_cached_tables().
+    void invalidate_cached_tables();
+
     // Register a custom aggregate function. step() is invoked once per input
     // row; final() is invoked once per aggregation to produce the result.
     // For per-aggregation state, use AggregateContext::state_ptr().
