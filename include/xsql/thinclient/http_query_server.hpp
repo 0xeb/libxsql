@@ -519,6 +519,11 @@ private:
 
         svr_ = std::move(svr);
         port_ = bound;
+        // Admit queries BEFORE the accept loop can answer anything: a client
+        // that sees GET /status succeed must never have its next /query
+        // refused with 503 "Server not running". (running_ used to be set only
+        // once await_running() saw the loop up, up to one 10 ms poll later.)
+        running_.store(true);
         server_thread_ = std::thread([this]() { svr_->listen_after_bind(); });
         return await_running();
     }
@@ -536,13 +541,15 @@ private:
             attempts++;
         }
         if (!svr_->is_running()) {
+            running_.store(false);
+            queue_cv_.notify_all();
+            drain_pending_commands("HTTP server failed to start");
             svr_->stop();
             if (server_thread_.joinable()) server_thread_.join();
             svr_.reset();
             port_ = 0;
             return kBoundButNotServing;
         }
-        running_.store(true);
         return port_;
     }
 

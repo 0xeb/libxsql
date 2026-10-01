@@ -129,6 +129,26 @@ auto def = xsql::cached_table<XrefInfo>("xrefs")
     .build();
 ```
 
+A writable cached table resolves an UPDATE or DELETE target from its rowid, so
+give it a key. `rowid()` reports that key from full and index scans (a
+`filter_eq()` iterator returns the same key from its own `rowid()`), and
+`row_lookup()` turns the key back into a row. `row_lookup()` is then the only
+resolver: a key it cannot resolve fails the statement with
+`row <id> not found in <table>` instead of being retried as a cache position,
+which would name a different row. `build()` rejects `row_lookup()` without
+`rowid()`.
+
+```cpp
+auto def = xsql::cached_table<NameRow>("names")
+    .cache_builder([](std::vector<NameRow>& rows) { collect_names(rows); })
+    .rowid([](const NameRow& r) { return static_cast<int64_t>(r.addr); })
+    .row_lookup([](NameRow& row, int64_t key) { return lookup_name(row, key); })
+    .column_int64("addr", [](const NameRow& r) { return r.addr; })
+    .column_text_rw("name", [](const NameRow& r) { return r.name; },
+                    [](NameRow& r, const char* v) { return rename(r.addr, v); })
+    .build();
+```
+
 ### Generator Table
 
 For expensive data sources where LIMIT should stop work early.

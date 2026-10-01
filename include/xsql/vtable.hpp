@@ -669,6 +669,15 @@ inline std::optional<std::string> exact_text(const FunctionArg& value) {
 }
 
 /**
+ * An inclusive span of unsigned 64-bit keys, `lo <= hi`. Produced by
+ * Int64KeyRange::unsigned_spans().
+ */
+struct U64Span {
+    uint64_t lo;
+    uint64_t hi;
+};
+
+/**
  * The inclusive window of int64 keys that satisfies every comparison applied
  * to it, each compared the way SQLite compares an INTEGER column.
  *
@@ -716,6 +725,49 @@ public:
     /// Whether `key` satisfies every comparison applied so far.
     bool contains(int64_t key) const {
         return !empty_ && key >= lower_ && key <= upper_;
+    }
+
+    /**
+     * The window as unsigned 64-bit spans, in the order SQL sorts the keys.
+     *
+     * For tables whose key is really an unsigned 64-bit value (an address)
+     * stored as a bit-cast int64. Keys >= 2^63 reach SQL as negative integers,
+     * so SQL order is the high half first (most negative first), then 0, then
+     * the low half, while the engine walks unsigned. A walker that claims
+     * `ORDER BY key`, or omits the constraint, must visit the spans in the
+     * order returned here:
+     *
+     *   empty window        -> no spans
+     *   lo, hi >= 0         -> [lo, hi]
+     *   lo, hi < 0          -> [u(lo), u(hi)]
+     *   lo < 0 <= hi        -> [u(lo), UINT64_MAX], then [0, hi]
+     *
+     * where u() is the bit-cast to uint64. `descending` reverses the order of
+     * the spans; each span stays `lo <= hi`, and the walker decides how to walk
+     * it (downward, for a descending walk). A span only says what SQL order
+     * requires: it does not clamp to anything the engine can address (e.g. the
+     * last span may end at UINT64_MAX even where the engine's top is lower).
+     *
+     * Gotcha for anyone writing such queries: SQLite reads a decimal literal
+     * >= 2^63 (`18446744073709551613`) as a REAL, which no INTEGER key equals
+     * and which bounds the window past every key. Write a hex literal
+     * (`0xFFFFFFFFFFFFFFFD`, read as 64-bit two's complement) or the negative
+     * decimal (`-3`). And `key >= 0xFFFFF80000000000` also includes every
+     * low-half key; `key BETWEEN 0xFFFFF80000000000 AND -1` is the high half.
+     */
+    std::vector<U64Span> unsigned_spans(bool descending = false) const {
+        std::vector<U64Span> spans;
+        if (empty_ || lower_ > upper_) return spans;
+        const uint64_t lo = static_cast<uint64_t>(lower_);
+        const uint64_t hi = static_cast<uint64_t>(upper_);
+        if (lower_ < 0 && upper_ >= 0) {
+            spans.push_back(U64Span{lo, UINT64_MAX});
+            spans.push_back(U64Span{0, hi});
+        } else {
+            spans.push_back(U64Span{lo, hi});
+        }
+        if (descending) std::reverse(spans.begin(), spans.end());
+        return spans;
     }
 
 private:
@@ -2200,16 +2252,20 @@ struct CachedTableDef {
     // If not set, UPDATE only works when the shared cache contains the row.
     std::function<void(RowData&, int argc, FunctionArg* argv)> row_from_argv;
 
-    // Optional row lookup by rowid for UPDATE/DELETE fallback.
-    // Useful for filter iterators whose rowid is not a positional index.
+    // Optional row lookup by rowid (a KEY, never a cache position). When set it
+    // is the sole authority for turning a rowid back into a row: UPDATE, DELETE
+    // and `WHERE rowid = ?` resolve only through it, and a rowid it cannot
+    // resolve matches no row / fails the write -- there is no positional
+    // fallback. Requires rowid_fn (enforced by CachedTableBuilder::build and at
+    // registration) so full and index scans report the same keys.
     std::function<bool(RowData&, int64_t)> row_lookup;
 
     // Optional stable rowid for a row. When set, the full-scan and index cursors
     // report rowid_fn(row) instead of the cache position, so the rowid is
-    // consistent with what filter iterators return (e.g. an ordinal/ea key). This
-    // is required for tables whose filter iterators key by a stable id AND whose
-    // UPDATE/DELETE reconstruct via row_lookup(that id): without it a full-scan
-    // rowid (cache position) and an iterator rowid (the key) would disagree.
+    // consistent with what filter iterators return (e.g. an ordinal/ea key), and
+    // `WHERE rowid = ?` matches it by key. Required whenever row_lookup is set:
+    // without it a full-scan rowid (cache position) and an iterator rowid (the
+    // key) would disagree, and a position read as a key names another row.
     std::function<int64_t(const RowData&)> rowid_fn;
 
     // Opt-IN: extend the query-scoped pre-mutation snapshot (see
@@ -2367,6 +2423,46 @@ template<typename RowData>
 inline bool cached_table_supports_count_only_scan(const CachedTableDef<RowData>* def) {
     return def && def->row_count_fn && !def->rowid_fn &&
            !cached_table_has_scan_driven_mutation(def);
+}
+
+// Row identity. A cached table that sets row_lookup must also set rowid_fn, so
+// that every rowid its scans report is a KEY: filter iterators report their own
+// key, and full/index scans report rowid_fn(row). row_lookup is then the only
+// thing UPDATE/DELETE use to turn a rowid back into a row. Without rowid_fn a
+// full scan would report a cache POSITION, and a position read as a key can name
+// a different, existing row (keys 0..N collide with positions 0..N). Returns the
+// reason the definition breaks the rule, or an empty string.
+template<typename RowData>
+inline std::string cached_table_identity_error(const CachedTableDef<RowData>& def) {
+    if (def.row_lookup && !def.rowid_fn) {
+        return "cached table '" + def.name +
+               "': row_lookup() requires rowid(): scans must report the same key "
+               "row_lookup() resolves, not a cache position";
+    }
+    return {};
+}
+
+template<typename RowData>
+inline int cached_row_not_found(sqlite3_vtab* pVtab, const CachedTableDef<RowData>* def,
+                                int64_t rowid) {
+    if (get_vtab_error().empty()) {
+        set_vtab_error("row " + std::to_string(rowid) + " not found in " + def->name);
+    }
+    return return_vtab_error(pVtab);
+}
+
+// Resolve an UPDATE/DELETE rowid through row_lookup, the sole authority for a
+// table that has one. On failure the vtab error holds row_lookup's own reason,
+// or "row <id> not found in <table>".
+template<typename RowData>
+inline bool cached_row_lookup_or_error(const CachedTableDef<RowData>* def, int64_t rowid,
+                                       RowData& out) {
+    clear_vtab_error();
+    if (def->row_lookup(out, rowid)) return true;
+    if (get_vtab_error().empty()) {
+        set_vtab_error("row " + std::to_string(rowid) + " not found in " + def->name);
+    }
+    return false;
 }
 
 template<typename RowData>
@@ -2719,7 +2815,8 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
     //   - a POSITIONAL shared-cache index (use_shared_cache and no stable
     //     rowid_fn -- with rowid_fn the rowid is a key, not a position, so
     //     xUpdate refuses positional reconstruction), OR
-    //   - a resolving row_lookup.
+    //   - a row_lookup, the sole authority for a table that has one (a rowid it
+    //     cannot resolve fails the UPDATE; it never falls back to argv).
     // and never when the table opts out via update_from_column_values. Otherwise
     // xUpdate reconstructs from real argv values, so reporting NOCHANGE would
     // feed row_from_argv 0/NULL for unchanged identity fields (ea, func_addr).
@@ -2805,9 +2902,8 @@ inline int cached_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid
         // Index path: rowid honors rowid_fn; otherwise the matched cache POSITION
         // (row_idx), NOT cursor->current_row (which the index path does not
         // advance). This must match the full-scan path so positional /
-        // row_lookup()-based UPDATE/DELETE reconstruction resolves the same row --
-        // a query-scoped table with index_on + row_lookup (e.g. idasql `names`)
-        // deletes via this path once index_on is enabled for query-scoped tables.
+        // row_lookup()-based UPDATE/DELETE reconstruction resolves the same row.
+        // A row_lookup table always has a rowid_fn, so it reports a key here.
         if (cursor->index_matches && cursor->index_pos < cursor->index_matches->size()) {
             size_t row_idx = (*cursor->index_matches)[cursor->index_pos];
             if (def->rowid_fn) {
@@ -2909,39 +3005,47 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
             cursor->rowid_lookup_id = exact_rowid ? raw_rowid : 0;
             cursor->rowid_lookup_eof = true;
 
-            if (raw_rowid >= 0) {
+            if (exact_rowid) {
                 clear_vtab_error();
-                bool row_found = false;
-                if (cursor->def->row_lookup) {
-                    row_found = cursor->def->row_lookup(cursor->rowid_lookup_row, raw_rowid);
-                    cursor->rowid_lookup_eof = !row_found;
-                }
-
-                if (!row_found) {
-                    if (cursor->def->use_shared_cache) {
-                        cursor->def->ensure_cache_built();
-                        if (!get_vtab_error().empty()) {
-                            return return_vtab_error(pCursor->pVtab);
-                        }
-                        const auto& shared = cursor->def->shared_cache;
-                        const size_t rowid = static_cast<size_t>(raw_rowid);
-                        if (shared && shared->built && rowid < shared->data.size()) {
-                            cursor->rowid_lookup_row = shared->data[rowid];
+                const auto* def = cursor->def;
+                // Scan a materialization for the row this rowid names: by KEY
+                // (rowid_fn, any sign) when the table has one, else by position.
+                auto pick = [&](std::vector<RowData>& rows, bool take) {
+                    if (def->rowid_fn) {
+                        for (auto& row : rows) {
+                            if (def->rowid_fn(row) != raw_rowid) continue;
+                            cursor->rowid_lookup_row = take ? std::move(row) : row;
                             cursor->rowid_lookup_eof = false;
+                            return;
                         }
-                    } else if (!cursor->def->row_lookup &&
-                               cursor->def->has_cache_builder()) {
-                        std::vector<RowData> rows;
-                        cursor->def->build_rows(rows);
-                        if (!get_vtab_error().empty()) {
-                            return return_vtab_error(pCursor->pVtab);
-                        }
-                        const size_t rowid = static_cast<size_t>(raw_rowid);
-                        if (rowid < rows.size()) {
-                            cursor->rowid_lookup_row = std::move(rows[rowid]);
-                            cursor->rowid_lookup_eof = false;
-                        }
+                    } else if (raw_rowid >= 0 &&
+                               static_cast<uint64_t>(raw_rowid) < rows.size()) {
+                        auto& row = rows[static_cast<size_t>(raw_rowid)];
+                        cursor->rowid_lookup_row = take ? std::move(row) : row;
+                        cursor->rowid_lookup_eof = false;
                     }
+                };
+                if (def->row_lookup) {
+                    // The sole authority (see cached_vtab_update): a key it cannot
+                    // resolve is no row -- never a cache position to retry.
+                    cursor->rowid_lookup_eof =
+                        !def->row_lookup(cursor->rowid_lookup_row, raw_rowid);
+                } else if (def->use_shared_cache) {
+                    def->ensure_cache_built();
+                    if (!get_vtab_error().empty()) {
+                        return return_vtab_error(pCursor->pVtab);
+                    }
+                    const auto& shared = def->shared_cache;
+                    if (shared && shared->built) {
+                        pick(shared->data, false);
+                    }
+                } else if (def->has_cache_builder()) {
+                    std::vector<RowData> rows;
+                    def->build_rows(rows);
+                    if (!get_vtab_error().empty()) {
+                        return return_vtab_error(pCursor->pVtab);
+                    }
+                    pick(rows, true);
                 }
                 if (!get_vtab_error().empty()) {
                     return return_vtab_error(pCursor->pVtab);
@@ -3716,13 +3820,15 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
 
         // Positional cache lookups (shared->data[rowid] / cache_builder[rowid])
         // are valid ONLY when the rowid is a cache position: not opted out
-        // (reconstruct_by_rowid) and no stable rowid_fn. An opt-out table's
-        // filter-iterator rowid may overlap a cache index, so it must resolve via
-        // row_lookup (mirrors the xUpdate reconstruction; see CachedTableDef).
+        // (reconstruct_by_rowid) and no stable rowid_fn -- hence no row_lookup,
+        // which requires one and resolves every rowid itself (see
+        // detail::cached_table_identity_error). An opt-out table's
+        // filter-iterator rowid may overlap a cache index.
         const bool reconstruct_by_rowid =
             !def->update_from_column_values &&
             (((!def->rowid_fn) && def->use_shared_cache) || static_cast<bool>(def->row_lookup));
 
+        clear_vtab_error();
         if (def->snapshot_mutations && def->rowid_fn && shared && shared->mutation_snapshot) {
             // Opt-in snapshot (shifting-identity rowid): resolve by matching
             // rowid_fn over the STABLE pre-mutation snapshot, so a multi-row DELETE
@@ -3733,11 +3839,20 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             for (auto& snap_row : shared->data) {
                 if (def->rowid_fn(snap_row) == raw_rowid) { row_ptr = &snap_row; break; }
             }
+        } else if (def->row_lookup) {
+            // row_lookup is the sole authority for a table that has one: every
+            // rowid its scans report is a key (see CachedTableBuilder::row_lookup),
+            // so an unresolvable rowid is a row that is gone -- never a cache
+            // position to retry.
+            if (!detail::cached_row_lookup_or_error(def, raw_rowid, temp_row)) {
+                return return_vtab_error(pVtab);
+            }
+            row_ptr = &temp_row;
         } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
             raw_rowid >= 0 && rowid < shared->data.size()) {
             row_ptr = &shared->data[rowid];
         } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->mutation_snapshot &&
-                   !def->row_lookup && raw_rowid >= 0 && rowid < shared->data.size()) {
+                   raw_rowid >= 0 && rowid < shared->data.size()) {
             row_ptr = &shared->data[rowid];
         } else if (!def->use_shared_cache && shared && shared->mutation_snapshot &&
                    raw_rowid >= 0 && rowid < shared->data.size()) {
@@ -3745,16 +3860,11 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             // statement, so this rowid still maps to the pre-mutation row (the
             // per-xUpdate rebuild below would read the already-mutated data).
             row_ptr = &shared->data[rowid];
-        } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
-            row_ptr = &temp_row;
         } else if (!def->rowid_fn && !def->use_shared_cache &&
                    def->has_cache_builder() && raw_rowid >= 0) {
-            // Non-shared positional rebuild: a full-scan rowid IS the row's index
-            // in the freshly rebuilt cache (exact, no overlap risk), so it is
-            // correct even for opt-out tables -- e.g. names (no_shared_cache,
-            // opt-out, row_lookup keyed by ea) whose DELETE rowid is a cache
-            // position that row_lookup cannot resolve. Only the *shared* positional
-            // branches above are gated on reconstruct_by_rowid.
+            // Non-shared positional rebuild: without a rowid_fn (and so without a
+            // row_lookup) a full-scan rowid IS the row's index in the freshly
+            // rebuilt cache.
             std::vector<RowData> rows;
             def->build_rows(rows);
             if (rowid < rows.size()) {
@@ -3764,7 +3874,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         }
 
         if (!row_ptr) {
-            return to_sqlite_status(Status::error);
+            return detail::cached_row_not_found(pVtab, def, raw_rowid);
         }
 
         vtab->transaction.touched = true;
@@ -3816,17 +3926,18 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
 
         // Reconstruct-by-rowid (and thus NOCHANGE-eligible) exactly when the row
         // can be resolved from the rowid alone: a POSITIONAL shared-cache index
-        // (no stable rowid_fn), a resolving row_lookup, or a query-scoped mutation
+        // (no stable rowid_fn), a row_lookup (the sole authority: a rowid it
+        // cannot resolve fails the statement), or a query-scoped mutation
         // snapshot (positional, stable for the statement) -- and never when opted
         // out. MUST match the cached_vtab_column() NOCHANGE gate. When true,
-        // unchanged identity columns arrive as NOCHANGE/0/NULL, so row_from_argv
-        // must NOT be used even if rowid resolution later fails (it would write
-        // the wrong row); fall through to read_only instead.
+        // unchanged identity columns arrive as NOCHANGE/0/NULL, so a row_lookup
+        // miss must NOT fall back to row_from_argv (it would write the wrong row).
         const bool reconstruct_by_rowid =
             !def->update_from_column_values &&
             (((!def->rowid_fn) && def->use_shared_cache) || static_cast<bool>(def->row_lookup)
              || detail::query_scoped_uses_mutation_snapshot(def));
 
+        clear_vtab_error();
         if (def->snapshot_mutations && def->rowid_fn && shared && shared->mutation_snapshot) {
             // Opt-in snapshot (shifting-identity rowid, see DELETE): resolve by
             // matching rowid_fn over the STABLE pre-mutation snapshot so a multi-row
@@ -3837,6 +3948,24 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             for (auto& snap_row : shared->data) {
                 if (def->rowid_fn(snap_row) == raw_rowid) { row_ptr = &snap_row; break; }
             }
+        } else if (def->row_lookup) {
+            if (!reconstruct_by_rowid && def->row_from_argv) {
+                // Opted out (update_from_column_values): NOCHANGE is off, so every
+                // column carries its real value and the table reconstructs the row
+                // from them. The rowid is not interpreted at all.
+                detail::with_args(argc, argv, [&](FunctionArg* args) {
+                    def->row_from_argv(temp_row, argc, args);
+                });
+                row_ptr = &temp_row;
+            } else {
+                // row_lookup is the sole authority (see DELETE): every rowid the
+                // scans report is a key, so one it cannot resolve is a row that is
+                // gone -- never a cache position, never argv under NOCHANGE.
+                if (!detail::cached_row_lookup_or_error(def, raw_rowid, temp_row)) {
+                    return return_vtab_error(pVtab);
+                }
+                row_ptr = &temp_row;
+            }
         } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->built &&
             raw_rowid >= 0 && old_rowid < shared->data.size()) {
             // Positional shared-cache reconstruction -- valid only when the rowid
@@ -3845,12 +3974,8 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             // overlap a cache index, so it must reconstruct from argv instead.
             row_ptr = &shared->data[old_rowid];
         } else if (reconstruct_by_rowid && !def->rowid_fn && shared && shared->mutation_snapshot &&
-                   !def->row_lookup && raw_rowid >= 0 && old_rowid < shared->data.size()) {
+                   raw_rowid >= 0 && old_rowid < shared->data.size()) {
             row_ptr = &shared->data[old_rowid];
-        } else if (reconstruct_by_rowid && def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
-            // Trusted rowid: resolves to the exact row (e.g. a filter iterator
-            // rowid that round-trips through row_lookup). NOCHANGE is enabled.
-            row_ptr = &temp_row;
         } else if (!reconstruct_by_rowid && def->row_from_argv) {
             // NOCHANGE is disabled for this table, so unchanged identity columns
             // (ea, func_addr, ...) carry their REAL values in argv. Reconstruct
@@ -3880,23 +4005,23 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             }
         } else if (def->row_from_argv) {
             // Last-resort reconstruction via row_populator. CONTRACT: when this
-            // path can run under NOCHANGE (reconstruct_by_rowid tables whose
-            // positional/row_lookup resolution did not fire, e.g. a not-yet-built
-            // shared cache reached via filter_eq), the populator MUST resolve the
-            // row from the rowid in argv[0] (real even under NOCHANGE) and apply
-            // only non-NOCHANGE column values. Populators that read identity from
-            // argv COLUMNS must keep NOCHANGE disabled -- by opting out, or by
-            // exposing a stable rowid_fn without a row_lookup -- so those columns
-            // carry real values (see the cached_vtab_column() NOCHANGE gate).
+            // path can run under NOCHANGE (a positional shared-cache table whose
+            // cache is not built yet, reached via filter_eq), the populator MUST
+            // resolve the row from the rowid in argv[0] (real even under
+            // NOCHANGE) and apply only non-NOCHANGE column values. Populators
+            // that read identity from argv COLUMNS must keep NOCHANGE disabled --
+            // by opting out, or by exposing a stable rowid_fn without a
+            // row_lookup -- so those columns carry real values (see the
+            // cached_vtab_column() NOCHANGE gate).
             detail::with_args(argc, argv, [&](FunctionArg* args) {
                 def->row_from_argv(temp_row, argc, args);
             });
             row_ptr = &temp_row;
-        } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
-            // Safe rowid resolution (row_lookup returns a real row, never argv).
-            row_ptr = &temp_row;
         } else {
             return to_sqlite_status(Status::read_only);
+        }
+        if (!row_ptr) {
+            return detail::cached_row_not_found(pVtab, def, raw_rowid);
         }
 
         // reconstruct_by_rowid is exactly the xColumn NOCHANGE gate: on reconstruct-
@@ -3982,6 +4107,8 @@ inline bool detail::register_cached_vtable_sqlite(sqlite3* db,
                                                   const char* module_name,
                                                   const CachedTableDef<RowData>* def) {
     if (!db || !module_name || !def) return false;
+    // A def assembled without the builder gets the same row-identity check.
+    if (!detail::cached_table_identity_error(*def).empty()) return false;
 
     auto* owned = detail::clone_def(def);
     if (!owned) return false;
@@ -4390,12 +4517,28 @@ public:
         return *this;
     }
 
+    /**
+     * Resolve a rowid (a KEY) back to its row. This becomes the SOLE authority
+     * for UPDATE, DELETE and `WHERE rowid = ?`: a rowid it cannot resolve (e.g.
+     * a row gone mid-statement) fails the write with "row <id> not found in
+     * <table>" (or the reason row_lookup set) and matches no row on read --
+     * never another row by cache position.
+     *
+     * REQUIRES rowid(): a table with row_lookup must also report keys from its
+     * full and index scans, computed exactly as its filter iterators compute
+     * their rowids and as row_lookup decodes them. build() throws
+     * std::invalid_argument otherwise, and registration refuses such a def.
+     */
     CachedTableBuilder& row_lookup(std::function<bool(RowData&, int64_t)> fn) {
         def_.row_lookup = std::move(fn);
         return *this;
     }
 
-    // Set a stable rowid for full-scan/index cursors (see CachedTableDef::rowid_fn).
+    /**
+     * Set a stable rowid (a KEY) for full-scan and index cursors (see
+     * CachedTableDef::rowid_fn). Mandatory with row_lookup(): it must return the
+     * same key the table's filter iterators report and row_lookup() resolves.
+     */
     CachedTableBuilder& rowid(std::function<int64_t(const RowData&)> fn) {
         def_.rowid_fn = std::move(fn);
         return *this;
@@ -4413,12 +4556,12 @@ public:
     /**
      * Opt OUT of rowid-based UPDATE reconstruction + the SQLITE_NOCHANGE
      * optimization. Set this when the table's rowid is NOT a reliable lookup key
-     * for UPDATE: row_lookup() cannot resolve every rowid the scans produce to
-     * the exact row (e.g. names -- full-scan rowid is a cache position but
-     * row_lookup() expects an ea; ctree_labels -- the func filter iterator's
-     * rowid is func-local but row_lookup() expects a global index). Such tables
-     * are reconstructed from the real column values in argv, which requires
-     * NOCHANGE to stay disabled so unchanged identity columns carry real values.
+     * for UPDATE, or wants UPDATE to see the new values of its identity columns
+     * (e.g. a filter iterator whose rowid is func-local while row_lookup()
+     * expects a global index). Such tables are reconstructed from the real
+     * column values in argv (row_populator), which requires NOCHANGE to stay
+     * disabled so unchanged identity columns carry real values. DELETE still
+     * resolves through row_lookup() when the table has one.
      * Leave OFF (default) for tables whose row_lookup() resolves their scan
      * rowids and for tables with many/paired writable columns that rely on
      * unchanged columns being skipped during xUpdate.
@@ -4471,6 +4614,12 @@ public:
     }
 
     CachedTableDef<RowData> build() {
+        // Registration happens at table-setup time, never inside a SQLite
+        // callback, so throwing here cannot unwind through the C API.
+        const std::string identity_error = detail::cached_table_identity_error(def_);
+        if (!identity_error.empty()) {
+            throw std::invalid_argument(identity_error);
+        }
         // Pre-create shared cache only when requested.
         if (def_.use_shared_cache) {
             def_.shared_cache = std::make_shared<SharedCache<RowData>>();
