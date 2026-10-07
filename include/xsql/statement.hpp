@@ -60,8 +60,11 @@ public:
     Status bind_int(int index, int value);
     Status bind_int64(int index, int64_t value);
     Status bind_double(int index, double value);
+    // Binds the whole string by its length, so an embedded NUL is kept.
     Status bind_text(int index, const std::string& value);
     Status bind_blob(int index, const void* data, size_t size);
+    // Number of placeholders in the statement (sqlite3_bind_parameter_count).
+    int parameter_count() const;
 
     StepResult step();
 

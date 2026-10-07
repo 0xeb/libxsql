@@ -50,22 +50,55 @@ inline std::string format_url_host(const std::string& host) {
     return normalized;
 }
 
+/**
+ * Host a client should dial to reach a server bound to `bind_host`, rendered
+ * for a URL. A wildcard bind (0.0.0.0, ::) accepts connections but is not a
+ * dialable address (curl on Windows refuses both), so it is advertised as the
+ * matching loopback; every other host goes through format_url_host().
+ */
+inline std::string format_connect_url_host(const std::string& bind_host) {
+    const std::string host = normalize_clipboard_host(bind_host);
+    if (host == "0.0.0.0") {
+        return "127.0.0.1";
+    }
+    if (host == "::" || host == "[::]") {
+        return "[::1]";
+    }
+    return format_url_host(host);
+}
+
+/**
+ * Paste-ready instructions for reaching a running HTTP query server, written
+ * for whoever receives them (usually an AI agent): the base URL, a pointer to
+ * GET /help (endpoint and schema discovery), and two curl lines -- /help, then
+ * a POST /query carrying `sample_sql` verbatim as the body (--data-binary, so
+ * newlines and a leading '@' survive). `sample_sql` must not contain double
+ * quotes. A non-empty `auth_token` adds the Authorization header to the query
+ * line; /help is public and never needs it.
+ */
 inline std::string build_http_clipboard_payload(
     const std::string& tool_name,
     const std::string& host,
     int port,
-    const std::string& sample_sql = "SELECT 1",
-    const std::string& connect_with_label = "",
-    const std::string& server_label = "")
+    const std::string& sample_sql,
+    const std::string& auth_token)
 {
+    const std::string base_url =
+        "http://" + format_connect_url_host(host) + ":" + std::to_string(port);
     std::ostringstream ss;
-    const std::string normalized_host = format_url_host(host);
-    const std::string connect_label = connect_with_label.empty() ? tool_name : connect_with_label;
-    const std::string rendered_server_label = server_label.empty() ? tool_name : server_label;
-    ss << "Use " << connect_label << " to connect to this " << rendered_server_label
-       << " HTTP server.\n";
-    ss << "curl -X POST http://" << normalized_host << ":" << port
-       << "/query -d \"" << sample_sql << "\"";
+    ss << tool_name << " HTTP server at " << base_url << "\n";
+    ss << "Read GET /help first (endpoints, schema discovery), then send SQL as the "
+          "body of POST /query; responses are JSON.\n";
+    if (!auth_token.empty()) {
+        ss << "Send the Authorization header shown with every request; "
+              "GET / and GET /help work without it.\n";
+    }
+    ss << "  curl " << base_url << "/help\n";
+    ss << "  curl -X POST " << base_url << "/query";
+    if (!auth_token.empty()) {
+        ss << " -H \"Authorization: Bearer " << auth_token << "\"";
+    }
+    ss << " --data-binary \"" << sample_sql << "\"\n";
     return ss.str();
 }
 
@@ -75,7 +108,7 @@ inline std::string build_mcp_clipboard_payload(
     int port)
 {
     std::ostringstream ss;
-    const std::string normalized_host = format_url_host(host);
+    const std::string normalized_host = format_connect_url_host(host);
     ss << "{\n";
     ss << "  \"mcpServers\": {\n";
     ss << "    \"" << server_name << "\": {\n";

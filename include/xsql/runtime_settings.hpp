@@ -222,7 +222,8 @@ public:
                 {record.spec.key, std::move(value),
                  type_name(record.spec.type), record.spec.scope,
                  is_action ? "action" : "value",
-                 (record.spec.writable && !is_action) ? 1 : 0});
+                 (record.spec.writable && !is_action) ? 1 : 0,
+                 nullptr});
         }
         return rows;
     }

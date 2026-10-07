@@ -10,14 +10,14 @@ SQLite virtual tables. The virtual-table framework, HTTP thinclient, runtime
 settings, and graph utilities are header-based; the database, statement,
 function, aggregate, and script layers are compiled sources. Note that the
 virtual-table headers call into the compiled layer (the prepare-time
-write-surface authorizer), so every consumer links the `xsql` library — the
+write-surface authorizer), so every consumer links the `xsql` library; the
 headers are not usable stand-alone.
 
 SQL is the universal query language. By exposing your application's data as SQL tables, you make it instantly accessible to scripts, CLI pipelines, and AI coding agents. No proprietary API to learn. No SDK to integrate. Just SQL.
 
 Build a CLI tool with libxsql, and any agent (Claude Code, Codex, Copilot) can query your application's internals with zero additional work.
 
-> **Rust port:** [libxsql-rs](https://github.com/0xeb/libxsql-rs) — the same fluent virtual-table API, idiomatic Rust.
+> **Rust port:** [libxsql-rs](https://github.com/0xeb/libxsql-rs): the same fluent virtual-table API, idiomatic Rust.
 
 ## License and Terms of Use
 
@@ -183,6 +183,12 @@ Generator tables also support UPDATE (via `*_rw` column setters) and DELETE (via
 `deletable()`); both resolve the target row through `row_lookup()`, so set a
 `row_lookup()` when enabling either.
 
+A generator table that cannot be read without a `WHERE` -- a `constraint_filter`
+with a `required_*` spec that the query leaves out, or a `full_scan_error()` --
+refuses the scan with its own message and `SQLITE_CONSTRAINT`, SQLite's code for
+an unusable constraint set, so a caller can tell "needs constraints" from a
+failure.
+
 ## Writable Tables
 
 Support UPDATE and DELETE with column setters and `deletable()`.
@@ -212,6 +218,20 @@ auto def = xsql::table("names")
 UPDATE names SET name = 'new_name' WHERE addr = 0x401000;
 DELETE FROM names WHERE addr = 0x402000;
 ```
+
+An index-based table's rowid is the row's position when the statement scanned
+it. A multi-row DELETE hands each handler call the row's *current* index: the
+scanned position minus the rows the same statement already deleted before it.
+So a handler that erases by index, like the one above, removes exactly the rows
+the statement matched. The adjustment lasts one statement; the next scan starts
+fresh.
+
+Every row write a table's callback carries out bumps the connection's
+`db.vtab_write_count()`, so an embedder can ask "did a host-backed table change
+since X?" by comparing two readings. Temp and ordinary SQLite tables never count
+(unlike `total_changes()`), a refused write does not count, and a later
+`ROLLBACK` does not lower it. A session or bookkeeping table opts out with
+`.counts_as_write(false)`; the `runtime_settings` table does.
 
 ## Constraint Pushdown
 
@@ -253,6 +273,15 @@ auto def = xsql::cached_table<XrefInfo>("xrefs")
 
 With this filter, `SELECT * FROM xrefs WHERE to_addr = 0x401000` uses the native xref API instead of scanning all rows.
 
+When a query matches several filters, the cost decides. Single-column filters
+(`filter_eq`, `filter_eq_text`, a `LIKE`/`GLOB` filter whose pattern has a literal
+prefix), parametric filters and multi-constraint `constraint_filter`s all compete
+on their estimated cost, and the cheapest one drives the scan; SQLite re-checks
+whatever it leaves unconsumed. On a tie the single-column filter wins. So on a
+generator with a `name` lookup at cost 5 and an address-range constraint filter at
+cost 1000, `WHERE name = 'x' AND addr > 0x1000` runs the name lookup and applies
+the range to its rows.
+
 ## Runtime Settings
 
 Runtime configuration is exposed through the writable `runtime_settings` virtual
@@ -269,12 +298,12 @@ the same core with `register_bool_setting` / `register_integer_setting` /
 
 | Key | Type | Default | Range | Writable |
 |-----|------|---------|-------|----------|
-| `query_timeout_ms` | int | 60000 | 0 – 3600000 | yes |
-| `queue_admission_timeout_ms` | int | 120000 | 0 – 3600000 | yes |
-| `max_queue` | int | 64 | 0 – 10000 | yes |
-| `hints_enabled` | bool | 1 | – | yes |
-| `timeout_stack_depth` | int | live stack depth | – | no (read-only) |
-| `max_timeout_stack_depth` | int | 64 | – | no (read-only) |
+| `query_timeout_ms` | int | 60000 | 0 to 3600000 | yes |
+| `queue_admission_timeout_ms` | int | 120000 | 0 to 3600000 | yes |
+| `max_queue` | int | 64 | 0 to 10000 | yes |
+| `hints_enabled` | bool | 1 | - | yes |
+| `timeout_stack_depth` | int | live stack depth | - | no (read-only) |
+| `max_timeout_stack_depth` | int | 64 | - | no (read-only) |
 
 `scope` is `common` for the shared keys, the product prefix (e.g. `idasql`)
 for product keys, and `action` for the two imperative verbs below.
@@ -291,8 +320,8 @@ SELECT key, type FROM runtime_settings WHERE settable = 1;
 
 Older value-bearing `PRAGMA` commands are retired; reads and writes go through
 `runtime_settings`, and native SQLite PRAGMAs are reserved for SQLite itself.
-The single sanctioned exception is the imperative timeout stack —
-`PRAGMA <prefix>.timeout_push = <ms>` / `PRAGMA <prefix>.timeout_pop` — which
+The single sanctioned exception is the imperative timeout stack
+(`PRAGMA <prefix>.timeout_push = <ms>` / `PRAGMA <prefix>.timeout_pop`), which
 is a verb, not a value, and therefore stays a PRAGMA. A staged
 `query_timeout_ms` write and an active timeout stack are mutually exclusive
 (the error message names the conflict and how to clear it).
@@ -303,22 +332,22 @@ is a verb, not a value, and therefore stays a PRAGMA. A staged
 script and returns one aggregate `ScriptResult` (per-statement rows, errors,
 timing). `ScriptOptions` carries:
 
-- `timeout_ms` — per-statement wall-clock deadline (0 = none).
-- `should_cancel` — a cooperative cancellation predicate polled between rows
+- `timeout_ms`: per-statement wall-clock deadline (0 = none).
+- `should_cancel`: a cooperative cancellation predicate polled between rows
   and via SQLite's progress handler; once it fires, the rest of the script is
   cancelled too.
-- `continue_on_error`, `include_sql` — aggregation controls.
+- `continue_on_error`, `include_sql`: aggregation controls.
 
 Semantics on cancel/timeout: a read-only statement keeps rows already gathered
-(`partial=true` plus a warning) — but only when at least one row landed; with
+(`partial=true` plus a warning), but only when at least one row landed; with
 zero rows it is an error (`partial` is never set on an empty result, so an
-empty successful result is always complete). A mutation — including
-`DML ... RETURNING` — is aborted through `sqlite3_interrupt`, so SQLite rolls
+empty successful result is always complete). A mutation, including
+`DML ... RETURNING`, is aborted through `sqlite3_interrupt`, so SQLite rolls
 the statement back, and reports an error; if it completes before the abort
 lands, it has committed and reports its honest result.
 
 Serializers over a `ScriptResult`: `script_result_to_json` (canonical
-envelope), `script_result_to_jsonl` (one keyed JSON object per row — NDJSON
+envelope), `script_result_to_jsonl` (one keyed JSON object per row, NDJSON
 "records"), `script_result_to_text`, `_to_csv`, `_to_tsv`.
 
 Streaming twins with O(one row) memory for reads:
@@ -327,9 +356,24 @@ a sink callback (pair them with a chunked HTTP response); mutation RETURNING
 rows stay buffered until the statement succeeds so rolled-back rows never
 reach the sink.
 
+`export_tables(db, tables, path, error)` writes tables as a replayable SQL
+script (`DROP`/`CREATE`/`INSERT` per table) under a `-- SQL Export` /
+`-- Tables: N` header, N counting the tables written. Exporting every table
+(an empty list) skips one that requires constraints and names it on a
+`-- Skipped (requires constraints): a, b` header line; naming such a table
+explicitly fails the export with `Table 'a' cannot be exported: it requires
+constraints (WHERE) to be read (...)`. A failed export leaves `path` untouched.
+
+A query issued on the same connection while another one runs (from a scalar
+function or an embedded host-language bridge) stays inside the enclosing
+query's budget: it stops at its own deadline or the enclosing one, whichever
+comes first, and when the enclosing query is cancelled. That holds even when
+the nested query sets no timeout of its own. A query on another connection
+keeps its own budget.
+
 The HTTP server exposes cancellation as `POST /cancel` (whole-script executor
 configurations only): it cooperatively cancels the queries whose execution
-started before the request arrived — queued-but-unstarted work is not
+started before the request arrived; queued-but-unstarted work is not
 affected.
 
 Adapters that can block inside a downstream engine call may set the server
@@ -363,14 +407,14 @@ duplicate or empty names fail at definition time.
 
 `#include <xsql/graph.hpp>` (also part of the `xsql.hpp` umbrella) is a stock
 directed-graph algorithm library over opaque integer node ids in
-`[0, node_count)` — no reverse-engineering concepts; map your own objects onto
+`[0, node_count)`, with no reverse-engineering concepts; map your own objects onto
 ids. `DirectedGraph` stores the edges (`add_edge` validates ids and permits
 parallel edges and self-loops); the algorithms are free functions:
 
 | Function | Result |
 |----------|--------|
 | `immediate_dominators(g, entry)` | idom per node (`kNoNode` if unreachable) |
-| `dominator_sets(g, entry)` | full sorted dominator sets — O(n²) output; prefer `immediate_dominators` at scale |
+| `dominator_sets(g, entry)` | full sorted dominator sets, O(n^2) output; prefer `immediate_dominators` at scale |
 | `immediate_post_dominators(g)` | ipdom relative to the graph's sinks via a virtual exit |
 | `natural_loops(g, entry)` | back-edge natural loops (header, latch, sorted body); parallel back edges deduped |
 | `strongly_connected_components(g)` | Tarjan SCC component ids |
@@ -437,6 +481,7 @@ printf("%s\n", result.c_str());
 | `generator(fn)` | Generator factory (generator_table only) |
 | `on_modify(fn)` | Hook called before UPDATE/DELETE |
 | `deletable(fn)` | Enable DELETE support |
+| `counts_as_write(false)` | Keep this table's writes out of `vtab_write_count()` |
 | `filter_eq(col, factory, cost, rows)` | Constraint pushdown for int64 |
 | `filter_eq_text(col, factory, cost, rows)` | Constraint pushdown for text |
 
@@ -451,6 +496,38 @@ db.exec("UPDATE ...");                      // Execute statement
 db.close();                                 // Close (automatic in destructor)
 ```
 
+Bound parameters run through the same timeout, cancellation and partial-result
+rules as `query(sql, options)`. Each result cell also carries its SQLite storage
+class, read before the cell was converted to text:
+
+```cpp
+xsql::QueryOptions options;
+options.timeout_ms = 5000;
+auto r = db.query("SELECT name, size FROM items WHERE addr = ? AND tag = ?",
+                  {int64_t{0x401000}, std::string("a\0b", 3)}, options);
+if (r.ok() && !r.empty() && r[0].type(1) == SQLITE_INTEGER) { /* an integer */ }
+```
+
+`?`, `?NNN`, `:name`, `@name` and `$name` placeholders all bind by position. A
+parameter count that differs from the statement's is an error, and the
+statement does not run. Text binds by its length, so an embedded NUL is kept.
+Each parameter is a `QueryParam`: `nullptr`, `int64_t`, `double`, `std::string`
+or `std::vector<uint8_t>`.
+
+A scalar function is not deterministic unless it says so. SQLite may evaluate
+a deterministic call with constant arguments once and reuse the value, which is
+wrong for a function with side effects. A pure function opts in:
+
+```cpp
+db.register_function("bump", 0, bump_fn);                // runs on every call
+db.register_function("twice", 1, twice_fn,
+                     xsql::FunctionFlags::deterministic); // pure, may be folded
+```
+
+`db.total_changes()` counts the rows changed on the connection since it opened.
+`db.vtab_write_count()` counts only virtual-table row writes; see
+[Writable Tables](#writable-tables).
+
 ## CLI Tools and AI Agents
 
 libxsql is designed for building CLI tools that AI coding agents can query directly.
@@ -462,17 +539,17 @@ libxsql is designed for building CLI tools that AI coding agents can query direc
 3. Agents invoke the CLI and parse results
 
 ```
-┌─────────────────┐      SQL over HTTP    ┌─────────────┐
-│  Your App       │◄────────────────────►│  CLI Client │
-│  (libxsql)      │                      │  (thin)     │
-│                 │                      └──────┬──────┘
-│  - funcs table  │                             │
-│  - strings table│                             ▼
-│  - xrefs table  │                      ┌─────────────┐
-└─────────────────┘                      │  AI Agent   │
-                                         │  (invokes   │
-                                         │   CLI)      │
-                                         └─────────────┘
++-----------------+      SQL over HTTP    +-------------+
+|  Your App       |<-------------------->|  CLI Client |
+|  (libxsql)      |                      |  (thin)     |
+|                 |                      +------+------+
+|  - funcs table  |                             |
+|  - strings table|                             v
+|  - xrefs table  |                      +-------------+
++-----------------+                      |  AI Agent   |
+                                         |  (invokes   |
+                                         |   CLI)      |
+                                         +-------------+
 ```
 
 ### Why This Works
@@ -505,10 +582,10 @@ Now an agent can:
 
 ```bash
 # Find largest functions
-curl -X POST http://localhost:8081/query -d "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
+curl -X POST http://localhost:8081/query --data-binary "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
 
 # Search for patterns
-curl -X POST http://localhost:8081/query -d "SELECT * FROM strings WHERE content LIKE '%password%'"
+curl -X POST http://localhost:8081/query --data-binary "SELECT * FROM strings WHERE content LIKE '%password%'"
 ```
 
 The agent writes SQL. Your tool executes it. No glue code required.

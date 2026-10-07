@@ -444,10 +444,15 @@ public:
     bool is_running() const { return running_.load(); }
     int port() const { return port_; }
 
+    /**
+     * Base URL of the listening socket: the bind address as configured (IPv6
+     * bracketed, so "::1" reads http://[::1]:<port>) and the bound port. A
+     * wildcard bind is reported as bound (http://0.0.0.0:<port>,
+     * http://[::]:<port>); the dialable form is format_connect_url_host().
+     */
     std::string url() const {
-        std::ostringstream ss;
-        ss << "http://" << config_.bind_address << ":" << port_;
-        return ss.str();
+        return "http://" + format_url_host(config_.bind_address) + ":" +
+               std::to_string(port_);
     }
 
     /** Set interrupt check function (called during run_until_stopped loop). */
@@ -939,7 +944,7 @@ private:
                 "  GET  /status   - Health check\n"
                 "  POST /shutdown - Stop server\n\n"
                 "Example: curl -X POST http://localhost:" + std::to_string(port) +
-                                  "/query -d \"SELECT name FROM sqlite_master WHERE "
+                                  "/query --data-binary \"SELECT name FROM sqlite_master WHERE "
                                   "type='table' LIMIT 10\"\n";
             if (cancel_supported) {
                 // -d '' deliberately emits Content-Length: 0. Some HTTP clients
@@ -1506,8 +1511,8 @@ inline std::string format_http_info(const std::string& tool,
     ss << "  GET  /status   - Health check\n";
     ss << "  POST /shutdown - Stop server\n\n";
     ss << "Example:\n";
-    ss << "  curl -X POST http://" << rendered_host << ":" << port
-       << "/query -d \"SELECT name FROM sqlite_master WHERE type='table' LIMIT "
+    ss << "  curl -X POST http://" << format_connect_url_host(bind_addr) << ":" << port
+       << "/query --data-binary \"SELECT name FROM sqlite_master WHERE type='table' LIMIT "
           "10\"\n\n";
     ss << stop_hint << "\n";
     return ss.str();

@@ -288,7 +288,7 @@ private:
         std::cout << "  " << program_name_ << " -s test.db -c \"SELECT * FROM funcs\"\n";
         std::cout << "  " << program_name_ << " -s test.db --serve --port 8080\n";
         std::cout << "  " << program_name_ << " --port 8080 -c \"SELECT COUNT(*) FROM funcs\"\n";
-        std::cout << "  curl localhost:8080/query -d \"SELECT * FROM funcs\"\n";
+        std::cout << "  curl localhost:8080/query --data-binary \"SELECT * FROM funcs\"\n";
     }
 };
 

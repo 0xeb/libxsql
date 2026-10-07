@@ -112,7 +112,10 @@ Status Statement::bind_text(int index, const std::string& value) {
     if (!valid()) {
         return Status::misuse;
     }
-    int rc = sqlite3_bind_text(impl_->stmt, index, value.c_str(), -1, SQLITE_TRANSIENT);
+    // By length: -1 would stop at the first embedded NUL.
+    int rc = sqlite3_bind_text64(impl_->stmt, index, value.data(),
+                                 static_cast<sqlite3_uint64>(value.size()),
+                                 SQLITE_TRANSIENT, SQLITE_UTF8);
     impl_->error = is_ok(rc) ? std::string() : std::string(sqlite3_errmsg(impl_->db));
     return to_status(rc);
 }
@@ -121,9 +124,18 @@ Status Statement::bind_blob(int index, const void* data, size_t size) {
     if (!valid()) {
         return Status::misuse;
     }
-    int rc = sqlite3_bind_blob(impl_->stmt, index, data, static_cast<int>(size), SQLITE_TRANSIENT);
+    // An empty blob is still a blob: sqlite3_bind_blob with a null pointer
+    // (an empty vector's data()) would bind SQL NULL instead.
+    int rc = size == 0
+        ? sqlite3_bind_zeroblob(impl_->stmt, index, 0)
+        : sqlite3_bind_blob64(impl_->stmt, index, data,
+                              static_cast<sqlite3_uint64>(size), SQLITE_TRANSIENT);
     impl_->error = is_ok(rc) ? std::string() : std::string(sqlite3_errmsg(impl_->db));
     return to_status(rc);
+}
+
+int Statement::parameter_count() const {
+    return valid() ? sqlite3_bind_parameter_count(impl_->stmt) : 0;
 }
 
 StepResult Statement::step() {

@@ -208,6 +208,8 @@ define_runtime_settings_table(RuntimeSettingsCore& settings,
                 }
             })
         .transaction_hooks(std::move(hooks))
+        // Session settings, not host data: an UPDATE here is not a host write.
+        .counts_as_write(false)
         .column_text(
             "key", [](const RuntimeSettingEntry& row) { return row.key; })
         .column_text_rw(

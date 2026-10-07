@@ -16,8 +16,10 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 
 namespace xsql {
 
@@ -36,10 +38,86 @@ struct WriteSurfaceRegistry {
     std::string preparing_drop;
 };
 
+namespace {
+
+// Deadline and cancellation state of one guarded Database::query. A query issued
+// on the same connection while another one runs (from a scalar function, a
+// virtual-table callback or an embedded host-language bridge) links to it as its
+// parent, and stops as soon as ANY enclosing query is cancelled or past its
+// deadline: a nested query never extends the enclosing statement's budget.
+struct QueryTimeoutState {
+    std::chrono::steady_clock::time_point started_at{};
+    int timeout_ms = 0;
+    bool timed_out = false;
+    const std::function<bool()>* cancel = nullptr;  // optional cooperative-cancel predicate
+    bool cancelled = false;
+    std::string cancel_error;
+    QueryTimeoutState* parent = nullptr;  // enclosing query on this connection
+
+    bool poll_cancel() noexcept {
+        if (!cancel_error.empty() || cancelled) {
+            return true;
+        }
+        if (!cancel || !*cancel) {
+            return false;
+        }
+        try {
+            cancelled = (*cancel)();
+        } catch (const std::exception& e) {
+            cancel_error = std::string("cancellation predicate threw: ") + e.what();
+            return true;
+        } catch (...) {
+            cancel_error = "cancellation predicate threw a non-standard exception";
+            return true;
+        }
+        return cancelled;
+    }
+
+    bool poll_interrupt() noexcept {
+        if (poll_cancel()) {
+            return true;
+        }
+        if (parent != nullptr && parent->poll_interrupt()) {
+            // The enclosing statement's budget is spent: stop this one too, and
+            // classify it by the enclosing cause.
+            if (parent->timed_out) {
+                timed_out = true;
+            } else {
+                cancelled = true;
+            }
+            return true;
+        }
+        if (timeout_ms <= 0) {
+            return false;
+        }
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started_at)
+                .count();
+        if (elapsed_ms >= timeout_ms) {
+            timed_out = true;
+            return true;
+        }
+        return false;
+    }
+
+    static int progress_callback(void* user_data) {
+        auto* state = static_cast<QueryTimeoutState*>(user_data);
+        if (!state) {
+            return 0;
+        }
+        return state->poll_interrupt() ? 1 : 0;
+    }
+};
+
+}  // namespace
+
 struct Database::Impl {
     sqlite3* db = nullptr;
     std::string last_error;
     WriteSurfaceRegistry write_surfaces;
+    // Innermost guarded query running on this connection (see QueryTimeoutState).
+    QueryTimeoutState* active_query = nullptr;
 };
 
 namespace {
@@ -406,7 +484,8 @@ bool Database::register_and_create_table(const VTableDef& def, const char* table
     return register_table(def) && create_table(table_name, def.name.c_str());
 }
 
-Status Database::register_function(const char* name, int argc, ScalarFn fn) {
+Status Database::register_function(const char* name, int argc, ScalarFn fn,
+                                   FunctionFlags flags) {
     if (!is_open()) {
         impl_->last_error = "Database not open";
         return Status::error;
@@ -417,7 +496,8 @@ Status Database::register_function(const char* name, int argc, ScalarFn fn) {
         impl_->db,
         name,
         argc,
-        SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+        SQLITE_UTF8 |
+            (has_flag(flags, FunctionFlags::deterministic) ? SQLITE_DETERMINISTIC : 0),
         wrapper,
         scalar_fn_callback,
         nullptr,
@@ -500,6 +580,21 @@ Result Database::query(const char* sql) {
 }
 
 Result Database::query(const char* sql, const QueryOptions& options) {
+    return query_impl(sql, nullptr, options);
+}
+
+Result Database::query(const char* sql, const std::vector<QueryParam>& params,
+                       const QueryOptions& options) {
+    return query_impl(sql, &params, options);
+}
+
+Result Database::query(const std::string& sql, const std::vector<QueryParam>& params,
+                       const QueryOptions& options) {
+    return query_impl(sql.c_str(), &params, options);
+}
+
+Result Database::query_impl(const char* sql, const std::vector<QueryParam>* params,
+                            const QueryOptions& options) {
     Result result;
     if (!is_open()) {
         result.error = "Database not open";
@@ -507,72 +602,31 @@ Result Database::query(const char* sql, const QueryOptions& options) {
     }
     const auto query_started_at = std::chrono::steady_clock::now();
 
-    struct TimeoutState {
-        std::chrono::steady_clock::time_point started_at{};
-        int timeout_ms = 0;
-        bool timed_out = false;
-        const std::function<bool()>* cancel = nullptr;  // optional cooperative-cancel predicate
-        bool cancelled = false;
-
-        std::string cancel_error;
-
-        bool poll_cancel() noexcept {
-            if (!cancel_error.empty() || cancelled) {
-                return true;
-            }
-            if (!cancel || !*cancel) {
-                return false;
-            }
-            try {
-                cancelled = (*cancel)();
-            } catch (const std::exception& e) {
-                cancel_error = std::string("cancellation predicate threw: ") + e.what();
-                return true;
-            } catch (...) {
-                cancel_error = "cancellation predicate threw a non-standard exception";
-                return true;
-            }
-            return cancelled;
-        }
-
-        bool poll_interrupt() noexcept {
-            if (poll_cancel()) {
-                return true;
-            }
-            if (timeout_ms <= 0) {
-                return false;
-            }
-            const auto elapsed_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - started_at)
-                    .count();
-            if (elapsed_ms >= timeout_ms) {
-                timed_out = true;
-                return true;
-            }
-            return false;
-        }
-    };
-
-    struct ProgressHandler {
-        static int callback(void* user_data) {
-            auto* state = static_cast<TimeoutState*>(user_data);
-            if (!state) {
-                return 0;
-            }
-            return state->poll_interrupt() ? 1 : 0;
-        }
-    };
-
-    TimeoutState timeout_state;
+    QueryTimeoutState timeout_state;
     timeout_state.started_at = query_started_at;
     timeout_state.timeout_ms = options.timeout_ms;
     timeout_state.cancel = options.should_cancel ? &options.should_cancel : nullptr;
+    timeout_state.parent = impl_->active_query;
     const bool timeout_enabled = options.timeout_ms > 0;
     const bool cancel_enabled = static_cast<bool>(options.should_cancel);
     // The progress-handler + interrupt-checker machinery is needed whenever EITHER a
-    // deadline OR a cancel predicate is in play (cancel must work under timeout_ms==0).
-    const bool guard_enabled = timeout_enabled || cancel_enabled;
+    // deadline OR a cancel predicate is in play (cancel must work under timeout_ms==0),
+    // and in every query nested in a guarded one, so the enclosing budget keeps
+    // being enforced while it runs.
+    const bool guard_enabled =
+        timeout_enabled || cancel_enabled || timeout_state.parent != nullptr;
+
+    // This query is the connection's innermost guarded query until it returns.
+    struct ActiveQueryScope {
+        Impl* impl;
+        QueryTimeoutState* previous;
+        ~ActiveQueryScope() {
+            if (impl) impl->active_query = previous;
+        }
+    } active_scope{guard_enabled ? impl_.get() : nullptr, impl_->active_query};
+    if (guard_enabled) {
+        impl_->active_query = &timeout_state;
+    }
 
     // Arm before prepare so xBestIndex and other prepare-time callbacks consume
     // the same per-statement deadline as sqlite3_step(). Both guards restore an
@@ -582,7 +636,7 @@ Result Database::query(const char* sql, const QueryOptions& options) {
     if (guard_enabled) {
         const int progress_steps = options.progress_steps > 0 ? options.progress_steps : 1000;
         progress_guard.emplace(
-            impl_->db, progress_steps, &ProgressHandler::callback,
+            impl_->db, progress_steps, &QueryTimeoutState::progress_callback,
             &timeout_state);
 
         // Interrupt checker for long C++ virtual-table loops: fire on the deadline
@@ -602,7 +656,7 @@ Result Database::query(const char* sql, const QueryOptions& options) {
             result.error = timeout_state.cancel_error;
         } else if (timeout_state.cancelled) {
             result.error = "Query cancelled";
-        } else if (timeout_enabled && timeout_state.timed_out) {
+        } else if (timeout_state.timed_out) {
             result.timed_out = true;
             result.error = "Query timed out";
         } else {
@@ -610,6 +664,48 @@ Result Database::query(const char* sql, const QueryOptions& options) {
                 stmt.error().empty() ? impl_->last_error : stmt.error();
         }
         return result;
+    }
+
+    if (params != nullptr) {
+        auto elapsed_now = [&]() {
+            return static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - query_started_at)
+                    .count());
+        };
+        const int expected = stmt.parameter_count();
+        if (static_cast<size_t>(expected) != params->size()) {
+            result.elapsed_ms = elapsed_now();
+            result.error = "statement has " + std::to_string(expected) +
+                           " parameter(s), " + std::to_string(params->size()) +
+                           " value(s) given";
+            return result;
+        }
+        for (size_t i = 0; i < params->size(); ++i) {
+            const int index = static_cast<int>(i) + 1;
+            const Status st = std::visit(
+                [&](const auto& value) -> Status {
+                    using T = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_same_v<T, std::nullptr_t>) {
+                        return stmt.bind_null(index);
+                    } else if constexpr (std::is_same_v<T, int64_t>) {
+                        return stmt.bind_int64(index, value);
+                    } else if constexpr (std::is_same_v<T, double>) {
+                        return stmt.bind_double(index, value);
+                    } else if constexpr (std::is_same_v<T, std::string>) {
+                        return stmt.bind_text(index, value);
+                    } else {
+                        return stmt.bind_blob(index, value.data(), value.size());
+                    }
+                },
+                (*params)[i]);
+            if (!is_ok(st)) {
+                result.elapsed_ms = elapsed_now();
+                result.error = "cannot bind parameter " + std::to_string(index) +
+                               ": " + stmt.error();
+                return result;
+            }
+        }
     }
 
     const int col_count = stmt.column_count();
@@ -642,7 +738,9 @@ Result Database::query(const char* sql, const QueryOptions& options) {
             }
             return true;
         }
-        if (timeout_enabled && timeout_state.timed_out) {
+        // Its own deadline or an enclosing query's: a nested query that only
+        // inherits the enclosing budget has no timeout_ms of its own.
+        if (timeout_state.timed_out) {
             result.timed_out = true;
             if (partial_capable && !result.rows.empty()) {
                 result.partial = true;
@@ -689,12 +787,17 @@ Result Database::query(const char* sql, const QueryOptions& options) {
             Row row;
             row.values.reserve(static_cast<size_t>(col_count));
             row.nulls.reserve(static_cast<size_t>(col_count));
+            row.types.reserve(static_cast<size_t>(col_count));
             for (int i = 0; i < col_count; ++i) {
-                const bool is_null = stmt.column_is_null(i);
+                // The storage class first: sqlite3_column_type() is undefined once
+                // text() has converted the value.
+                const int type = stmt.column_type(i);
+                const bool is_null = type == SQLITE_NULL;
                 // Carry the real text even for NULL (empty here) but flag it, so a
                 // genuine "" / "NULL" text value stays distinct from SQL NULL.
                 row.values.push_back(is_null ? "" : stmt.text(i));
                 row.nulls.push_back(is_null ? 1 : 0);
+                row.types.push_back(static_cast<char>(type));
             }
             result.rows.push_back(std::move(row));
             continue;
@@ -842,6 +945,14 @@ int64_t Database::last_insert_rowid() const {
 
 int Database::changes() const {
     return is_open() ? sqlite3_changes(impl_->db) : 0;
+}
+
+int64_t Database::total_changes() const {
+    return is_open() ? static_cast<int64_t>(sqlite3_total_changes64(impl_->db)) : 0;
+}
+
+uint64_t Database::vtab_write_count() const {
+    return is_open() ? xsql::vtab_write_count(impl_->db) : 0;
 }
 
 void* Database::native_handle_unsafe() const {

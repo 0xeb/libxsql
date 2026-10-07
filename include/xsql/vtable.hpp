@@ -90,6 +90,53 @@ inline bool register_generator_vtable_sqlite(sqlite3* db,
                                              const GeneratorTableDef<RowData>* def);
 } // namespace detail
 
+// ============================================================================
+// Per-connection virtual-table write counter
+// ============================================================================
+//
+// Every row write a virtual table's write callback carries out (INSERT, UPDATE or
+// DELETE that reached the host and succeeded: the points that mark the table's
+// transaction as written) bumps a monotonic counter owned by the connection, on
+// tables that count as writes (the default; a session/bookkeeping table opts out
+// with counts_as_write(false)). Temp and ordinary SQLite tables never touch it,
+// unlike sqlite3_total_changes(). An embedder compares two readings to ask "did a
+// host-backed table change since X?". The counter lives in the connection's
+// client data, so it is created on the first write and freed with the connection.
+namespace detail {
+
+inline constexpr const char* kVtabWriteCountKey = "xsql.vtab_write_count";
+
+inline std::atomic<uint64_t>* vtab_write_counter(sqlite3* db, bool create) {
+    if (!db) return nullptr;
+    auto* counter = static_cast<std::atomic<uint64_t>*>(
+        sqlite3_get_clientdata(db, kVtabWriteCountKey));
+    if (counter || !create) return counter;
+    counter = new (std::nothrow) std::atomic<uint64_t>(0);
+    if (!counter) return nullptr;
+    // On failure SQLite has already run the destructor on `counter`.
+    if (sqlite3_set_clientdata(db, kVtabWriteCountKey, counter, [](void* p) {
+            delete static_cast<std::atomic<uint64_t>*>(p);
+        }) != SQLITE_OK) {
+        return nullptr;
+    }
+    return counter;
+}
+
+inline void note_vtab_write(sqlite3* db, bool counts_as_write) {
+    if (!counts_as_write) return;
+    if (auto* counter = vtab_write_counter(db, true)) {
+        counter->fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+} // namespace detail
+
+// Row writes accepted by `db`'s counting virtual tables since it opened (see above).
+inline uint64_t vtab_write_count(sqlite3* db) {
+    const auto* counter = detail::vtab_write_counter(db, false);
+    return counter ? counter->load(std::memory_order_relaxed) : 0;
+}
+
 inline thread_local std::string g_vtab_error_message;
 
 inline void clear_vtab_error() {
@@ -121,6 +168,16 @@ inline int return_vtab_error(sqlite3_vtab* pVtab) {
     }
     clear_vtab_error();
     return to_sqlite_status(Status::error);
+}
+
+// A table refusing to be read without constraints (a required constraint is
+// missing, or a full scan is forbidden) fails with SQLITE_CONSTRAINT -- SQLite's
+// own code for "this constraint set is unusable" -- instead of SQLITE_ERROR. The
+// message is the table's own. A plain read can raise SQLITE_CONSTRAINT no other
+// way, so callers such as export_tables can tell "needs a WHERE" from a failure.
+inline int return_vtab_refusal(sqlite3_vtab* pVtab) {
+    return_vtab_error(pVtab);
+    return to_sqlite_status(Status::constraint);
 }
 
 // ============================================================================
@@ -973,6 +1030,37 @@ struct TransactionState {
     }
 };
 
+// A live (index-based) table's per-statement positional snapshot.
+//
+// A live table's rowid is a position: the index the row held when the statement
+// scanned it. SQLite finishes a write statement's scan before its first xUpdate,
+// so every position it delivers names a row of that scan. A delete removes its
+// row and moves every later row up one, so after the statement's first delete a
+// later position no longer names its scanned row in the live sequence. This
+// ledger keeps the statement's scanned positions meaningful: it records each
+// position the statement deleted, and maps a scanned position to the row's
+// current index by subtracting the deleted positions before it. The snapshot
+// begins empty at the statement's first write and is dropped by the next scan
+// (xFilter), which starts a new statement. A position the statement already
+// deleted names no row.
+struct LiveStatementPositions {
+    std::vector<size_t> deleted;  // scanned positions this statement deleted, ascending
+
+    void reset() noexcept { deleted.clear(); }
+
+    // The current index of the row the statement scanned at `position`, or
+    // nullopt when the statement already deleted that row.
+    std::optional<size_t> current_index(size_t position) const {
+        const auto it = std::lower_bound(deleted.begin(), deleted.end(), position);
+        if (it != deleted.end() && *it == position) return std::nullopt;
+        return position - static_cast<size_t>(it - deleted.begin());
+    }
+
+    void record_delete(size_t position) {
+        deleted.insert(std::lower_bound(deleted.begin(), deleted.end(), position), position);
+    }
+};
+
 } // namespace detail
 
 struct VTableDef {
@@ -991,7 +1079,11 @@ struct VTableDef {
     // Filters for constraint pushdown (optional)
     std::vector<FilterDef> filters;
 
-    // DELETE handler: Delete row at index, returns success
+    // DELETE handler: delete the row at this index, return success. The index
+    // is the row's current position (see detail::LiveStatementPositions): in a
+    // multi-row DELETE, a row the statement scanned at position p arrives as p
+    // minus the rows the statement already deleted before it, so a handler that
+    // erases by index removes exactly the rows the statement matched.
     std::function<bool(size_t)> delete_row;
     bool supports_delete = false;
 
@@ -1003,6 +1095,11 @@ struct VTableDef {
     std::function<void(const std::string&)> before_modify;
 
     TransactionHooks transaction_hooks;
+
+    // Whether this table's row writes bump the connection's vtab_write_count().
+    // A session/bookkeeping table (settings, checkpoints, previews) sets it false
+    // so writing it does not read as a change to the host.
+    bool counts_as_write = true;
 
     std::string schema() const {
         return detail::render_table_schema(name, columns);
@@ -1030,6 +1127,7 @@ struct Vtab {
     std::string schema_name;
     std::string table_name;
     detail::TransactionState transaction;
+    detail::LiveStatementPositions positions;
 };
 
 struct Cursor {
@@ -1171,6 +1269,9 @@ inline int vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid) {
 inline int vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
                        int argc, sqlite3_value** argv) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
+
+    // A scan starts a new statement: drop the last statement's positions.
+    reinterpret_cast<Vtab*>(pCursor->pVtab)->positions.reset();
 
     // Reset state
     cursor->iter = nullptr;
@@ -1364,6 +1465,12 @@ inline std::vector<std::string> def_writable_columns(const Def* def) {
     return out;
 }
 
+// A position the statement already deleted names no row.
+inline int live_row_not_found(sqlite3_vtab* pVtab, const VTableDef* def, int64_t rowid) {
+    set_vtab_errmsg(pVtab, ("row " + std::to_string(rowid) + " not found in " + def->name).c_str());
+    return to_sqlite_status(Status::error);
+}
+
 }  // namespace detail
 
 // xUpdate - handles INSERT, UPDATE, DELETE
@@ -1383,7 +1490,11 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         if (raw_rowid < 0) {
             return to_sqlite_status(Status::error);
         }
-        size_t rowid = static_cast<size_t>(raw_rowid);
+        const size_t position = static_cast<size_t>(raw_rowid);
+        const std::optional<size_t> index = vtab->positions.current_index(position);
+        if (!index) {
+            return detail::live_row_not_found(pVtab, def, raw_rowid);
+        }
 
         vtab->transaction.touched = true;
         if (def->before_modify) {
@@ -1393,10 +1504,12 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         // Surface the callback's reason (set_vtab_error) instead of SQLite's
         // generic "SQL logic error", as the INSERT/UPDATE paths already do.
         clear_vtab_error();
-        if (!def->delete_row(rowid)) {
+        if (!def->delete_row(*index)) {
             return return_vtab_error(pVtab);
         }
+        vtab->positions.record_delete(position);
         vtab->transaction.wrote = true;
+        detail::note_vtab_write(vtab->db, def->counts_as_write);
         return to_sqlite_status(Status::ok);
     }
 
@@ -1408,7 +1521,12 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         if (raw_rowid < 0) {
             return to_sqlite_status(Status::error);
         }
-        size_t old_rowid = static_cast<size_t>(raw_rowid);
+        const std::optional<size_t> index =
+            vtab->positions.current_index(static_cast<size_t>(raw_rowid));
+        if (!index) {
+            return detail::live_row_not_found(pVtab, def, raw_rowid);
+        }
+        const size_t old_rowid = *index;
 
         vtab->transaction.touched = true;
         if (def->before_modify) {
@@ -1422,7 +1540,10 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
             [&](size_t c) { return def->columns[c].writable && static_cast<bool>(def->columns[c].set); },
             [&](size_t c) -> const std::string& { return def->columns[c].name; },
             [&](size_t c) { return def->columns[c].set(old_rowid, FunctionArg(argv[c + 2])); });
-        if (st == Status::ok) vtab->transaction.wrote = true;
+        if (st == Status::ok) {
+            vtab->transaction.wrote = true;
+            detail::note_vtab_write(vtab->db, def->counts_as_write);
+        }
         return to_sqlite_status(st);
     }
 
@@ -1448,6 +1569,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         }
         clear_vtab_error();
         vtab->transaction.wrote = true;
+        detail::note_vtab_write(vtab->db, def->counts_as_write);
         return to_sqlite_status(Status::ok);
     }
 
@@ -1790,6 +1912,12 @@ public:
         return *this;
     }
 
+    // Opt this table out of the connection's vtab_write_count() (default: counted).
+    VTableBuilder& counts_as_write(bool value) {
+        def_.counts_as_write = value;
+        return *this;
+    }
+
     // Read-only integer column (int64)
     VTableBuilder& column_int64(const char* name, std::function<int64_t(size_t)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
@@ -1901,7 +2029,9 @@ public:
         return *this;
     }
 
-    // Enable DELETE support
+    // Enable DELETE support. `delete_fn(index)` deletes the row at that current
+    // index; in a multi-row DELETE the index is already adjusted for the rows the
+    // statement deleted before it (see VTableDef::delete_row).
     VTableBuilder& deletable(std::function<bool(size_t)> delete_fn) {
         def_.supports_delete = true;
         def_.delete_row = std::move(delete_fn);
@@ -2246,6 +2376,11 @@ struct CachedTableDef {
     std::function<void(const std::string&)> after_modify;
 
     TransactionHooks transaction_hooks;
+
+    // Whether this table's row writes bump the connection's vtab_write_count().
+    // A session/bookkeeping table (settings, checkpoints, previews) sets it false
+    // so writing it does not read as a change to the host.
+    bool counts_as_write = true;
 
     // Populate a RowData from xUpdate argv values (argv[2..] = column values).
     // Used when the shared cache is not available (e.g., filter_eq path).
@@ -3891,6 +4026,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         detail::cached_table_invalidate_after_mutation(def);
         if (def->after_modify) def->after_modify("DELETE FROM " + def->name);
         vtab->transaction.wrote = true;
+        detail::note_vtab_write(vtab->db, def->counts_as_write);
         return to_sqlite_status(Status::ok);
     }
 
@@ -4036,6 +4172,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         detail::cached_table_invalidate_after_mutation(def);
         if (def->after_modify) def->after_modify("UPDATE " + def->name);
         vtab->transaction.wrote = true;
+        detail::note_vtab_write(vtab->db, def->counts_as_write);
         return to_sqlite_status(Status::ok);
     }
 
@@ -4062,6 +4199,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         def->invalidate_cache();
         if (def->after_modify) def->after_modify("INSERT INTO " + def->name);
         vtab->transaction.wrote = true;
+        detail::note_vtab_write(vtab->db, def->counts_as_write);
         return to_sqlite_status(Status::ok);
     }
 
@@ -4216,6 +4354,12 @@ public:
 
     CachedTableBuilder& transaction_hooks(TransactionHooks hooks) {
         def_.transaction_hooks = std::move(hooks);
+        return *this;
+    }
+
+    // Opt this table out of the connection's vtab_write_count() (default: counted).
+    CachedTableBuilder& counts_as_write(bool value) {
+        def_.counts_as_write = value;
         return *this;
     }
 
@@ -4743,6 +4887,11 @@ struct GeneratorTableDef {
 
     TransactionHooks transaction_hooks;
 
+    // Whether this table's row writes bump the connection's vtab_write_count().
+    // A session/bookkeeping table (settings, checkpoints, previews) sets it false
+    // so writing it does not read as a change to the host.
+    bool counts_as_write = true;
+
     std::string schema() const {
         return detail::render_table_schema(name, columns, [this](size_t i) {
             return hidden_columns.count(static_cast<int>(i)) != 0;
@@ -4807,7 +4956,7 @@ inline int materialize_count_only_generator(GeneratorCursor<RowData>* cursor,
         cursor->using_count_only = false;
         cursor->generator_eof = true;
         set_vtab_error(cursor->def->full_scan_error);
-        return return_vtab_error(cursor->base.pVtab);
+        return return_vtab_refusal(cursor->base.pVtab);
     }
 
     clear_vtab_error();
@@ -5061,7 +5210,7 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
 
     if (idxNum == MISSING_REQUIRED_CONSTRAINT) {
         set_vtab_error(idxStr && idxStr[0] ? idxStr : "required constraint missing");
-        return return_vtab_error(pCursor->pVtab);
+        return return_vtab_refusal(pCursor->pVtab);
     }
 
     if (idxNum != FILTER_NONE && argc > 0) {
@@ -5203,7 +5352,7 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
 
     if (!cursor->def->full_scan_error.empty()) {
         set_vtab_error(cursor->def->full_scan_error);
-        return return_vtab_error(pCursor->pVtab);
+        return return_vtab_refusal(pCursor->pVtab);
     }
 
     // Full scan - create generator and position to first row. A projection-aware
@@ -5263,7 +5412,13 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         }
     }
 
-    // First, check constraint filters (multi-column, multi-operator).
+    // Every filter kind competes by estimated_cost: the cheapest matching
+    // constraint filter (multi-column, multi-operator), the cheapest parametric
+    // filter (all of its columns EQ-constrained) and the cheapest single-column
+    // filter (EQ, or LIKE/GLOB with a usable literal prefix). The cheapest plan
+    // wins; on a cost tie the single-column filter wins (the same rule the cached
+    // planner applies to its constraint filters), then the constraint filter,
+    // then the parametric filter.
     const ConstraintFilterDef<RowData>* best_cf = nullptr;
     std::vector<int> best_matched_constraints;
     bool best_consumes_order = false;
@@ -5324,17 +5479,88 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         }
     }
 
-    if (best_cf) {
+    // Parametric filters (e.g. hidden params for table-valued functions): one
+    // matches when ALL its columns are EQ-constrained; the cheapest matching one
+    // (the first registered on a tie) is the candidate.
+    const ParametricFilterDef<RowData>* best_pf = nullptr;
+    std::vector<int> best_pf_constraints;
+    for (const auto& pf : def->parametric_filters) {
+        // Map each required column to its constraint index
+        std::vector<int> matched_constraints(pf.column_indices.size(), -1);
+        bool all_matched = true;
+
+        for (size_t p = 0; p < pf.column_indices.size(); ++p) {
+            int required_col = pf.column_indices[p];
+            bool found = false;
+            for (int i = 0; i < pInfo->nConstraint; i++) {
+                const auto& c = pInfo->aConstraint[i];
+                if (!c.usable) continue;
+                if (c.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+                if (c.iColumn == required_col) {
+                    matched_constraints[p] = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) { all_matched = false; break; }
+        }
+
+        if (all_matched && (!best_pf || pf.estimated_cost < best_pf->estimated_cost)) {
+            best_pf = &pf;
+            best_pf_constraints = std::move(matched_constraints);
+        }
+    }
+
+    // Single-column filters. EQ filters are trusted (omit=1). LIKE/GLOB filters
+    // are a best-effort superset optimization (omit=0, so SQLite re-applies the
+    // real pattern) -- same idiom as CachedTableDef's xBestIndex; only claimed
+    // when the pattern has a usable literal prefix, otherwise left to the full
+    // scan.
+    const FilterDef* best_filter = nullptr;
+    int best_constraint_idx = -1;
+
+    for (int i = 0; i < pInfo->nConstraint; i++) {
+        const auto& constraint = pInfo->aConstraint[i];
+        if (!constraint.usable) continue;
+        const bool is_eq = (constraint.op == SQLITE_INDEX_CONSTRAINT_EQ);
+        const bool is_like = (constraint.op == SQLITE_INDEX_CONSTRAINT_LIKE ||
+                              constraint.op == SQLITE_INDEX_CONSTRAINT_GLOB);
+        if (!is_eq && !is_like) continue;
+        if (is_like && !detail::like_constraint_has_usable_prefix(pInfo, i)) continue;
+        const FilterDef* filter = def->find_filter(constraint.iColumn, constraint.op);
+        if (filter) {
+            if (!best_filter || filter->estimated_cost < best_filter->estimated_cost) {
+                best_filter = filter;
+                best_constraint_idx = i;
+            }
+        }
+    }
+
+    enum class FilterPick { none, single, constraint, parametric };
+    FilterPick pick = FilterPick::none;
+    double pick_cost = 0.0;
+    // Considered in tie-break order: a later candidate must be strictly cheaper.
+    auto consider = [&](FilterPick kind, double cost) {
+        if (pick == FilterPick::none || cost < pick_cost) {
+            pick = kind;
+            pick_cost = cost;
+        }
+    };
+    if (best_filter && best_constraint_idx >= 0) {
+        consider(FilterPick::single, best_filter->estimated_cost);
+    }
+    if (best_cf) consider(FilterPick::constraint, best_cf->estimated_cost);
+    if (best_pf) consider(FilterPick::parametric, best_pf->estimated_cost);
+
+    if (pick == FilterPick::constraint) {
         std::ostringstream idx_str;
         // Projection-aware constraint filter: prefix idxStr with colUsed +
         // ';' before the usual comma-separated spec-index list (idxStr is
         // otherwise just that list -- see detail::resolve_constraint_specs /
         // xFilter's matching split below). Only done when this specific
-        // filter actually has create_with_col_used set, so every filter
-        // that doesn't use this (every pre-existing constraint_filter()
-        // registration in every tool) gets the exact same idxStr format as
-        // before -- fully additive, same idiom as ParametricFilterDef's
-        // create_with_col_used.
+        // filter actually has create_with_col_used set, so every other
+        // constraint filter gets the bare spec-index list -- same idiom as
+        // ParametricFilterDef's create_with_col_used.
         if (best_cf->create_with_col_used) {
             idx_str << static_cast<unsigned long long>(pInfo->colUsed) << ";";
         }
@@ -5359,79 +5585,24 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         pInfo->needToFreeIdxStr = 1;
         pInfo->estimatedCost = best_cf->estimated_cost;
         pInfo->estimatedRows = static_cast<sqlite3_int64>(best_cf->estimated_rows);
-        return to_sqlite_status(Status::ok);
-    }
-
-    // Next, check parametric filters (multi-column, e.g. hidden params for table-valued functions).
-    // A parametric filter matches when ALL its required columns are EQ-constrained.
-    for (const auto& pf : def->parametric_filters) {
-        // Map each required column to its constraint index
-        std::vector<int> matched_constraints(pf.column_indices.size(), -1);
-        bool all_matched = true;
-
-        for (size_t p = 0; p < pf.column_indices.size(); ++p) {
-            int required_col = pf.column_indices[p];
-            bool found = false;
-            for (int i = 0; i < pInfo->nConstraint; i++) {
-                const auto& c = pInfo->aConstraint[i];
-                if (!c.usable) continue;
-                if (c.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
-                if (c.iColumn == required_col) {
-                    matched_constraints[p] = i;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) { all_matched = false; break; }
+    } else if (pick == FilterPick::parametric) {
+        // Assign sequential argvIndex values (1-based)
+        for (size_t p = 0; p < best_pf_constraints.size(); ++p) {
+            pInfo->aConstraintUsage[best_pf_constraints[p]].argvIndex = static_cast<int>(p + 1);
+            pInfo->aConstraintUsage[best_pf_constraints[p]].omit = 1;
         }
-
-        if (all_matched) {
-            // Assign sequential argvIndex values (1-based)
-            for (size_t p = 0; p < matched_constraints.size(); ++p) {
-                pInfo->aConstraintUsage[matched_constraints[p]].argvIndex = static_cast<int>(p + 1);
-                pInfo->aConstraintUsage[matched_constraints[p]].omit = 1;
-            }
-            pInfo->idxNum = pf.filter_id;
-            pInfo->estimatedCost = pf.estimated_cost;
-            pInfo->estimatedRows = static_cast<sqlite3_int64>(pf.estimated_rows);
-            // Carry colUsed to xFilter for a projection-aware parametric
-            // filter, exactly like the full-scan projection_generator plan
-            // does (idxStr is otherwise unused by this filter shape).
-            if (pf.create_with_col_used) {
-                pInfo->idxStr = sqlite3_mprintf(
-                    "%llu", static_cast<unsigned long long>(pInfo->colUsed));
-                pInfo->needToFreeIdxStr = 1;
-            }
-            return to_sqlite_status(Status::ok);
+        pInfo->idxNum = best_pf->filter_id;
+        pInfo->estimatedCost = best_pf->estimated_cost;
+        pInfo->estimatedRows = static_cast<sqlite3_int64>(best_pf->estimated_rows);
+        // Carry colUsed to xFilter for a projection-aware parametric
+        // filter, exactly like the full-scan projection_generator plan
+        // does (idxStr is otherwise unused by this filter shape).
+        if (best_pf->create_with_col_used) {
+            pInfo->idxStr = sqlite3_mprintf(
+                "%llu", static_cast<unsigned long long>(pInfo->colUsed));
+            pInfo->needToFreeIdxStr = 1;
         }
-    }
-
-    // Next, check single-column filters. EQ filters are trusted (omit=1).
-    // LIKE/GLOB filters are a best-effort superset optimization (omit=0, so
-    // SQLite re-applies the real pattern) -- same idiom as CachedTableDef's
-    // xBestIndex; only claimed when the pattern has a usable literal prefix,
-    // otherwise left to the full scan.
-    const FilterDef* best_filter = nullptr;
-    int best_constraint_idx = -1;
-
-    for (int i = 0; i < pInfo->nConstraint; i++) {
-        const auto& constraint = pInfo->aConstraint[i];
-        if (!constraint.usable) continue;
-        const bool is_eq = (constraint.op == SQLITE_INDEX_CONSTRAINT_EQ);
-        const bool is_like = (constraint.op == SQLITE_INDEX_CONSTRAINT_LIKE ||
-                              constraint.op == SQLITE_INDEX_CONSTRAINT_GLOB);
-        if (!is_eq && !is_like) continue;
-        if (is_like && !detail::like_constraint_has_usable_prefix(pInfo, i)) continue;
-        const FilterDef* filter = def->find_filter(constraint.iColumn, constraint.op);
-        if (filter) {
-            if (!best_filter || filter->estimated_cost < best_filter->estimated_cost) {
-                best_filter = filter;
-                best_constraint_idx = i;
-            }
-        }
-    }
-
-    if (best_filter && best_constraint_idx >= 0) {
+    } else if (pick == FilterPick::single) {
         pInfo->aConstraintUsage[best_constraint_idx].argvIndex = 1;
         pInfo->aConstraintUsage[best_constraint_idx].omit =
             (best_filter->op == SQLITE_INDEX_CONSTRAINT_EQ) ? 1 : 0;
@@ -5468,7 +5639,7 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         // Full-scan plan: carry colUsed to xFilter via idxStr (mirrors
         // projection_cache_builder_fn) so a projection-aware generator can skip
         // expensive unused columns. Only the FILTER_NONE plan reaches xFilter's
-        // full-scan branch and uses idxStr (filter/constraint plans return above),
+        // full-scan branch and uses idxStr (filter plans take the branches above),
         // so there is no collision. Only allocated for projection-aware tables.
         if (def->projection_generator_factory_fn) {
             if (char* s = sqlite3_mprintf("%llu",
@@ -5521,6 +5692,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
 
         if (def->after_modify) def->after_modify("DELETE FROM " + def->name);
         vtab->transaction.wrote = true;
+        detail::note_vtab_write(vtab->db, def->counts_as_write);
         return to_sqlite_status(Status::ok);
     }
 
@@ -5565,6 +5737,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
 
         if (def->after_modify) def->after_modify("UPDATE " + def->name);
         vtab->transaction.wrote = true;
+        detail::note_vtab_write(vtab->db, def->counts_as_write);
         return to_sqlite_status(Status::ok);
     }
 
@@ -5596,6 +5769,7 @@ inline int generator_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** 
 
         if (def->after_modify) def->after_modify("INSERT INTO " + def->name);
         vtab->transaction.wrote = true;
+        detail::note_vtab_write(vtab->db, def->counts_as_write);
         return to_sqlite_status(Status::ok);
     }
 
@@ -5760,6 +5934,12 @@ public:
 
     GeneratorTableBuilder& transaction_hooks(TransactionHooks hooks) {
         def_.transaction_hooks = std::move(hooks);
+        return *this;
+    }
+
+    // Opt this table out of the connection's vtab_write_count() (default: counted).
+    GeneratorTableBuilder& counts_as_write(bool value) {
+        def_.counts_as_write = value;
         return *this;
     }
 

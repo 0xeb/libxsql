@@ -16,10 +16,12 @@
 #include "status.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 struct sqlite3;
@@ -79,13 +81,43 @@ struct Row {
     // This lets a genuine text value (even the literal string "NULL" or "") be
     // distinguished from a real SQL NULL on every output path.
     std::vector<char> nulls;
+    // Per-cell SQLite storage class, parallel to `values`: SQLITE_INTEGER (1),
+    // SQLITE_FLOAT (2), SQLITE_TEXT (3), SQLITE_BLOB (4) or SQLITE_NULL (5),
+    // read before the cell is converted to text. Database::query fills it; other
+    // producers may leave it empty, and type() then answers 0 ("unknown"). Lets an
+    // embedder hand an integer back as an integer, not as its decimal text.
+    std::vector<char> types;
 
     const std::string& operator[](size_t i) const { return values[i]; }
     std::string& operator[](size_t i) { return values[i]; }
     size_t size() const { return values.size(); }
     bool empty() const { return values.empty(); }
     bool is_null(size_t i) const { return i < nulls.size() && nulls[i] != 0; }
+    int type(size_t i) const { return i < types.size() ? types[i] : 0; }
 };
+
+// Flags for Database::register_function.
+enum class FunctionFlags : unsigned {
+    none = 0,
+    // The function always returns the same result for the same arguments and has
+    // no side effects, so SQLite may evaluate a constant-argument call once and
+    // reuse the value (and allow the function in index expressions).
+    deterministic = 1u << 0,
+};
+
+constexpr FunctionFlags operator|(FunctionFlags a, FunctionFlags b) {
+    return static_cast<FunctionFlags>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
+}
+
+constexpr bool has_flag(FunctionFlags flags, FunctionFlags flag) {
+    return (static_cast<unsigned>(flags) & static_cast<unsigned>(flag)) != 0;
+}
+
+// One bound statement parameter for Database::query(sql, params, options). SQL
+// names its placeholders `?`, `?NNN`, `:name`, `@name` or `$name`; params bind by
+// position from index 1. Text binds by length, so an embedded NUL is kept.
+using QueryParam = std::variant<std::nullptr_t, int64_t, double, std::string,
+                                std::vector<uint8_t>>;
 
 struct QueryOptions {
     int timeout_ms = 0;
@@ -197,7 +229,14 @@ public:
                create_table(table_name, def.name.c_str());
     }
 
-    Status register_function(const char* name, int argc, ScalarFn fn);
+    // Register a scalar SQL function. By default it is NOT deterministic, which is
+    // SQLite's own default: every call runs. That is required for a function with
+    // side effects or whose result follows state that can change between calls
+    // (writes, undo/redo, script execution, clocks, random values), because SQLite
+    // may evaluate a deterministic constant-argument call once and reuse the value.
+    // A pure function opts in with FunctionFlags::deterministic.
+    Status register_function(const char* name, int argc, ScalarFn fn,
+                             FunctionFlags flags = FunctionFlags::none);
 
     // Invalidate every cached table registered on this connection, as a write
     // through each would (see xsql/cache_registry.hpp). For a caller that
@@ -220,6 +259,14 @@ public:
     Result query(const char* sql, const QueryOptions& options);
     Result query(const std::string& sql);
     Result query(const std::string& sql, const QueryOptions& options);
+    // As query(sql, options), with `params` bound to the statement's placeholders
+    // first: same timeout, cancellation and partial-result rules. The number of
+    // params must equal the statement's parameter count, else the result carries
+    // an error and the statement does not run.
+    Result query(const char* sql, const std::vector<QueryParam>& params,
+                 const QueryOptions& options);
+    Result query(const std::string& sql, const std::vector<QueryParam>& params,
+                 const QueryOptions& options);
 
     std::string scalar(const char* sql);
     std::string scalar(const std::string& sql);
@@ -239,8 +286,20 @@ public:
     const std::string& last_error() const;
     int64_t last_insert_rowid() const;
     int changes() const;
+    // Rows changed by INSERT/UPDATE/DELETE on this connection since it opened
+    // (sqlite3_total_changes64), virtual-table writes included.
+    int64_t total_changes() const;
+    // Row writes accepted by this connection's virtual tables since it opened:
+    // every INSERT, UPDATE or DELETE a table's write callback carried out, on
+    // tables that count as writes (see the builders' counts_as_write). Temp and
+    // ordinary SQLite tables are not included. A later ROLLBACK does not lower
+    // it: a host write is not undone by SQLite. Compare two readings to ask "did
+    // a host-backed table change since X?".
+    uint64_t vtab_write_count() const;
 
 private:
+    Result query_impl(const char* sql, const std::vector<QueryParam>* params,
+                      const QueryOptions& options);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
@@ -279,6 +338,12 @@ private:
         const std::string& script,
         const ScriptOptions& options,
         const std::function<bool(const char*, std::size_t)>& sink);
+    // Reads the SQLite result code to tell a table that requires constraints
+    // from a genuine failure.
+    friend bool export_tables(Database& db,
+                              const std::vector<std::string>& requested_tables,
+                              const std::string& output_path,
+                              std::string& error);
 };
 
 } // namespace xsql
