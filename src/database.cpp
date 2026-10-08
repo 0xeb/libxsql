@@ -177,11 +177,21 @@ void scalar_fn_callback(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
         return;
     }
 
-    FunctionContext fctx(ctx);
-    detail::with_args(argc, reinterpret_cast<void* const*>(argv),
-        [&](int count, FunctionArg* args) {
-            wrapper->fn(fctx, count, args);
-        });
+    // A registered function is called by SQLite's C code: an exception must not
+    // unwind out of it (the same rule CAbiGuard applies to every vtable method).
+    try {
+        FunctionContext fctx(ctx);
+        detail::with_args(argc, reinterpret_cast<void* const*>(argv),
+            [&](int count, FunctionArg* args) {
+                wrapper->fn(fctx, count, args);
+            });
+    } catch (const std::bad_alloc&) {
+        sqlite3_result_error_nomem(ctx);
+    } catch (const std::exception& e) {
+        sqlite3_result_error(ctx, e.what(), -1);
+    } catch (...) {
+        sqlite3_result_error(ctx, "scalar function threw a non-standard exception", -1);
+    }
 }
 
 void destroy_scalar_fn_wrapper(void* ptr) {
@@ -199,11 +209,19 @@ void aggregate_step_callback(sqlite3_context* ctx, int argc, sqlite3_value** arg
         return;
     }
 
-    AggregateContext actx(ctx);
-    detail::with_args(argc, reinterpret_cast<void* const*>(argv),
-        [&](int count, FunctionArg* args) {
-            wrapper->step(actx, count, args);
-        });
+    try {
+        AggregateContext actx(ctx);
+        detail::with_args(argc, reinterpret_cast<void* const*>(argv),
+            [&](int count, FunctionArg* args) {
+                wrapper->step(actx, count, args);
+            });
+    } catch (const std::bad_alloc&) {
+        sqlite3_result_error_nomem(ctx);
+    } catch (const std::exception& e) {
+        sqlite3_result_error(ctx, e.what(), -1);
+    } catch (...) {
+        sqlite3_result_error(ctx, "aggregate step threw a non-standard exception", -1);
+    }
 }
 
 void aggregate_final_callback(sqlite3_context* ctx) {
@@ -212,8 +230,16 @@ void aggregate_final_callback(sqlite3_context* ctx) {
         return;
     }
 
-    AggregateContext actx(ctx);
-    wrapper->final(actx);
+    try {
+        AggregateContext actx(ctx);
+        wrapper->final(actx);
+    } catch (const std::bad_alloc&) {
+        sqlite3_result_error_nomem(ctx);
+    } catch (const std::exception& e) {
+        sqlite3_result_error(ctx, e.what(), -1);
+    } catch (...) {
+        sqlite3_result_error(ctx, "aggregate final threw a non-standard exception", -1);
+    }
 }
 
 void destroy_aggregate_fn_wrapper(void* ptr) {
@@ -228,9 +254,8 @@ void destroy_aggregate_fn_wrapper(void* ptr) {
 // the matched-row path and this 0-row path report the same actionable,
 // capability-scoped error; the column-scoped UPDATE denial additionally names
 // the offending column (which only prepare time knows).
-int write_surface_authorizer(void* pArg, int action, const char* a1,
-                             const char* a2, const char* db_name,
-                             const char* /*trigger*/) {
+int write_surface_authorizer_impl(void* pArg, int action, const char* a1,
+                                  const char* a2, const char* db_name) {
     auto* surfaces = static_cast<WriteSurfaceRegistry*>(pArg);
     if (!surfaces || !a1) return SQLITE_OK;
 
@@ -289,6 +314,19 @@ int write_surface_authorizer(void* pArg, int action, const char* a1,
     detail::set_authorizer_denial(
         phrase + " (capability mutation." + table + "." + leaf + " is unavailable)");
     return SQLITE_DENY;
+}
+
+// SQLite calls the authorizer from C while it prepares a statement, so nothing may
+// unwind out of it. The body only builds strings; if that fails, the statement is
+// refused rather than authorized.
+int write_surface_authorizer(void* pArg, int action, const char* a1,
+                             const char* a2, const char* db_name,
+                             const char* /*trigger*/) {
+    try {
+        return write_surface_authorizer_impl(pArg, action, a1, a2, db_name);
+    } catch (...) {
+        return SQLITE_DENY;
+    }
 }
 
 } // namespace

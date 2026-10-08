@@ -170,6 +170,60 @@ inline int return_vtab_error(sqlite3_vtab* pVtab) {
     return to_sqlite_status(Status::error);
 }
 
+namespace detail {
+
+// Where a module method that threw reports its message: the virtual table it was
+// called on, the cursor's table, or -- for xColumn -- the result context, which is
+// what SQLite reads a column error from. None of these can throw.
+inline void report_vtab_exception(const char* message, sqlite3_vtab* pVtab, ...) noexcept {
+    set_vtab_errmsg(pVtab, message);
+}
+inline void report_vtab_exception(const char* message, sqlite3_vtab_cursor* pCursor, ...) noexcept {
+    set_vtab_errmsg(pCursor ? pCursor->pVtab : nullptr, message);
+}
+inline void report_vtab_exception(const char* message, sqlite3_vtab_cursor*,
+                                  sqlite3_context* ctx, int) noexcept {
+    sqlite3_result_error(ctx, message, -1);
+}
+inline void report_vtab_exception(const char* message, sqlite3*, void*, int,
+                                  const char* const*, sqlite3_vtab**, char** pzErr) noexcept {
+    if (pzErr) *pzErr = sqlite3_mprintf("%s", message);
+}
+
+// Every module method is called by SQLite's C code, so a C++ exception must not
+// unwind out of it: that is undefined behaviour (std::terminate under GCC/Clang,
+// leaked VDBE state under MSVC). CAbiGuard<&fn>::call runs `fn` and turns an
+// exception into SQLITE_NOMEM (bad_alloc) or SQLITE_ERROR with the exception's
+// message, so a throwing table callback is a failed statement and the connection
+// stays usable. Every sqlite3_module this file builds goes through it.
+template <auto Fn>
+struct CAbiGuard;
+
+template <typename First, typename... Rest, int (*Fn)(First, Rest...)>
+struct CAbiGuard<Fn> {
+    static int call(First first, Rest... rest) noexcept {
+        try {
+            return Fn(first, rest...);
+        } catch (const std::bad_alloc&) {
+            clear_vtab_error();
+            return SQLITE_NOMEM;
+        } catch (const std::exception& e) {
+            return fail(e.what(), first, rest...);
+        } catch (...) {
+            return fail("virtual table callback threw a non-standard exception", first, rest...);
+        }
+    }
+
+private:
+    static int fail(const char* message, First first, Rest... rest) noexcept {
+        clear_vtab_error();
+        report_vtab_exception(message, first, rest...);
+        return SQLITE_ERROR;
+    }
+};
+
+} // namespace detail
+
 // A table refusing to be read without constraints (a required constraint is
 // missing, or a full scan is forbidden) fails with SQLITE_CONSTRAINT -- SQLite's
 // own code for "this constraint set is unusable" -- instead of SQLITE_ERROR. The
@@ -724,6 +778,45 @@ inline std::optional<std::string> exact_text(const FunctionArg& value) {
     const char* text = value.as_c_str();
     return std::string(text ? text : "");
 }
+
+namespace detail {
+
+// The value a typed integer setter receives: exactly the integer SQLite's
+// INTEGER comparison equates with `val` (16, 16.0 and '16' are 16), or nullopt
+// with the vtab error naming the column. SQLite applies no column affinity to
+// xUpdate values, so reading them with as_int64() truncated 16.5 to 16, read
+// '0x10', 'abc', a blob and NULL as 0, and never refused anything.
+// Parity contract vtable.typed-integer-setter-exact.
+inline std::optional<int64_t> exact_setter_int64(const std::string& column, FunctionArg val) {
+    const char* got = nullptr;
+    if (val.is_null()) {
+        got = "NULL";
+    } else if (val.type() == SQLITE_BLOB) {
+        got = "a blob";
+    } else if (std::optional<int64_t> v = exact_int64(val)) {
+        return v;
+    } else {
+        got = val.type() == SQLITE_FLOAT ? "a non-integral or out-of-range real"
+                                         : "non-integer text";
+    }
+    set_vtab_error("column \"" + column + "\": expected an integer, got " + got);
+    return std::nullopt;
+}
+
+// exact_setter_int64 for a 32-bit setter: an exact integer outside int32 is
+// refused instead of keeping its low 32 bits.
+inline std::optional<int> exact_setter_int(const std::string& column, FunctionArg val) {
+    const std::optional<int64_t> v = exact_setter_int64(column, val);
+    if (!v) return std::nullopt;
+    if (*v < INT32_MIN || *v > INT32_MAX) {
+        set_vtab_error("column \"" + column + "\": " + std::to_string(*v) +
+                       " does not fit a 32-bit integer");
+        return std::nullopt;
+    }
+    return static_cast<int>(*v);
+}
+
+}  // namespace detail
 
 /**
  * An inclusive span of unsigned 64-bit keys, `lo <= hi`. Produced by
@@ -1786,27 +1879,27 @@ template <typename VtabT> inline int vtab_xrollback_to(sqlite3_vtab* pVtab, int 
 inline sqlite3_module create_module() {
     sqlite3_module mod = {};
     mod.iVersion = 3;
-    mod.xCreate = vtab_connect;
-    mod.xConnect = vtab_connect;
-    mod.xBestIndex = vtab_best_index;
-    mod.xDisconnect = vtab_disconnect;
-    mod.xDestroy = vtab_destroy;
-    mod.xOpen = vtab_open;
-    mod.xClose = vtab_close;
-    mod.xFilter = vtab_filter;
-    mod.xNext = vtab_next;
-    mod.xEof = vtab_eof;
-    mod.xColumn = vtab_column;
-    mod.xRowid = vtab_rowid;
-    mod.xUpdate = vtab_update;
+    mod.xCreate = detail::CAbiGuard<&vtab_connect>::call;
+    mod.xConnect = detail::CAbiGuard<&vtab_connect>::call;
+    mod.xBestIndex = detail::CAbiGuard<&vtab_best_index>::call;
+    mod.xDisconnect = detail::CAbiGuard<&vtab_disconnect>::call;
+    mod.xDestroy = detail::CAbiGuard<&vtab_destroy>::call;
+    mod.xOpen = detail::CAbiGuard<&vtab_open>::call;
+    mod.xClose = detail::CAbiGuard<&vtab_close>::call;
+    mod.xFilter = detail::CAbiGuard<&vtab_filter>::call;
+    mod.xNext = detail::CAbiGuard<&vtab_next>::call;
+    mod.xEof = detail::CAbiGuard<&vtab_eof>::call;
+    mod.xColumn = detail::CAbiGuard<&vtab_column>::call;
+    mod.xRowid = detail::CAbiGuard<&vtab_rowid>::call;
+    mod.xUpdate = detail::CAbiGuard<&vtab_update>::call;
     // xBegin enrolls the vtab; xSync runs the fallible hook; xCommit clears state.
-    mod.xBegin = vtab_xbegin<Vtab>;
-    mod.xSync = vtab_prepare_commit<Vtab>;
-    mod.xCommit = vtab_finish_commit<Vtab>;
-    mod.xRollback = vtab_xrollback<Vtab>;
-    mod.xSavepoint = vtab_xsavepoint<Vtab>;
-    mod.xRelease = vtab_xrelease<Vtab>;
-    mod.xRollbackTo = vtab_xrollback_to<Vtab>;
+    mod.xBegin = detail::CAbiGuard<&vtab_xbegin<Vtab>>::call;
+    mod.xSync = detail::CAbiGuard<&vtab_prepare_commit<Vtab>>::call;
+    mod.xCommit = detail::CAbiGuard<&vtab_finish_commit<Vtab>>::call;
+    mod.xRollback = detail::CAbiGuard<&vtab_xrollback<Vtab>>::call;
+    mod.xSavepoint = detail::CAbiGuard<&vtab_xsavepoint<Vtab>>::call;
+    mod.xRelease = detail::CAbiGuard<&vtab_xrelease<Vtab>>::call;
+    mod.xRollbackTo = detail::CAbiGuard<&vtab_xrollback_to<Vtab>>::call;
     return mod;
 }
 
@@ -1936,8 +2029,9 @@ public:
             [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
                 ctx.result_int64(getter(idx));
             },
-            [setter = std::move(setter)](size_t idx, FunctionArg val) -> bool {
-                return setter(idx, val.as_int64());
+            [column = std::string(name), setter = std::move(setter)](size_t idx, FunctionArg val) -> bool {
+                const std::optional<int64_t> v = detail::exact_setter_int64(column, val);
+                return v && setter(idx, *v);
             });
         return *this;
     }
@@ -1960,8 +2054,9 @@ public:
             [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
                 ctx.result_int(getter(idx));
             },
-            [setter = std::move(setter)](size_t idx, FunctionArg val) -> bool {
-                return setter(idx, val.as_int());
+            [column = std::string(name), setter = std::move(setter)](size_t idx, FunctionArg val) -> bool {
+                const std::optional<int> v = detail::exact_setter_int(column, val);
+                return v && setter(idx, *v);
             });
         return *this;
     }
@@ -2253,17 +2348,19 @@ inline std::function<void(FunctionContext&, const RowData&)> row_getter_blob(
 
 template<typename RowData>
 inline std::function<bool(RowData&, FunctionArg)> row_setter_int64(
-        std::function<bool(RowData&, int64_t)> setter) {
-    return [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
-        return setter(row, val.as_int64());
+        const char* name, std::function<bool(RowData&, int64_t)> setter) {
+    return [column = std::string(name), setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+        const std::optional<int64_t> v = exact_setter_int64(column, val);
+        return v && setter(row, *v);
     };
 }
 
 template<typename RowData>
 inline std::function<bool(RowData&, FunctionArg)> row_setter_int(
-        std::function<bool(RowData&, int)> setter) {
-    return [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
-        return setter(row, val.as_int());
+        const char* name, std::function<bool(RowData&, int)> setter) {
+    return [column = std::string(name), setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+        const std::optional<int> v = exact_setter_int(column, val);
+        return v && setter(row, *v);
     };
 }
 
@@ -4210,27 +4307,27 @@ template<typename RowData>
 inline sqlite3_module create_cached_module() {
     sqlite3_module mod = {};
     mod.iVersion = 3;
-    mod.xCreate = cached_vtab_connect<RowData>;
-    mod.xConnect = cached_vtab_connect<RowData>;
-    mod.xBestIndex = cached_vtab_best_index<RowData>;
-    mod.xDisconnect = cached_vtab_disconnect<RowData>;
-    mod.xDestroy = cached_vtab_destroy<RowData>;
-    mod.xOpen = cached_vtab_open<RowData>;
-    mod.xClose = cached_vtab_close<RowData>;
-    mod.xFilter = cached_vtab_filter<RowData>;
-    mod.xNext = cached_vtab_next<RowData>;
-    mod.xEof = cached_vtab_eof<RowData>;
-    mod.xColumn = cached_vtab_column<RowData>;
-    mod.xRowid = cached_vtab_rowid<RowData>;
-    mod.xUpdate = cached_vtab_update<RowData>;
+    mod.xCreate = detail::CAbiGuard<&cached_vtab_connect<RowData>>::call;
+    mod.xConnect = detail::CAbiGuard<&cached_vtab_connect<RowData>>::call;
+    mod.xBestIndex = detail::CAbiGuard<&cached_vtab_best_index<RowData>>::call;
+    mod.xDisconnect = detail::CAbiGuard<&cached_vtab_disconnect<RowData>>::call;
+    mod.xDestroy = detail::CAbiGuard<&cached_vtab_destroy<RowData>>::call;
+    mod.xOpen = detail::CAbiGuard<&cached_vtab_open<RowData>>::call;
+    mod.xClose = detail::CAbiGuard<&cached_vtab_close<RowData>>::call;
+    mod.xFilter = detail::CAbiGuard<&cached_vtab_filter<RowData>>::call;
+    mod.xNext = detail::CAbiGuard<&cached_vtab_next<RowData>>::call;
+    mod.xEof = detail::CAbiGuard<&cached_vtab_eof<RowData>>::call;
+    mod.xColumn = detail::CAbiGuard<&cached_vtab_column<RowData>>::call;
+    mod.xRowid = detail::CAbiGuard<&cached_vtab_rowid<RowData>>::call;
+    mod.xUpdate = detail::CAbiGuard<&cached_vtab_update<RowData>>::call;
     // xBegin enrolls the vtab; xSync runs the fallible hook; xCommit clears state.
-    mod.xBegin = vtab_xbegin<CachedVtab<RowData>>;
-    mod.xSync = vtab_prepare_commit<CachedVtab<RowData>>;
-    mod.xCommit = vtab_finish_commit<CachedVtab<RowData>>;
-    mod.xRollback = vtab_xrollback<CachedVtab<RowData>>;
-    mod.xSavepoint = vtab_xsavepoint<CachedVtab<RowData>>;
-    mod.xRelease = vtab_xrelease<CachedVtab<RowData>>;
-    mod.xRollbackTo = vtab_xrollback_to<CachedVtab<RowData>>;
+    mod.xBegin = detail::CAbiGuard<&vtab_xbegin<CachedVtab<RowData>>>::call;
+    mod.xSync = detail::CAbiGuard<&vtab_prepare_commit<CachedVtab<RowData>>>::call;
+    mod.xCommit = detail::CAbiGuard<&vtab_finish_commit<CachedVtab<RowData>>>::call;
+    mod.xRollback = detail::CAbiGuard<&vtab_xrollback<CachedVtab<RowData>>>::call;
+    mod.xSavepoint = detail::CAbiGuard<&vtab_xsavepoint<CachedVtab<RowData>>>::call;
+    mod.xRelease = detail::CAbiGuard<&vtab_xrelease<CachedVtab<RowData>>>::call;
+    mod.xRollbackTo = detail::CAbiGuard<&vtab_xrollback_to<CachedVtab<RowData>>>::call;
     return mod;
 }
 
@@ -4392,7 +4489,7 @@ public:
         def_.columns.push_back(detail::make_row_column<RowData>(
             name, ColumnType::Integer, true,
             detail::row_getter_int64<RowData>(std::move(getter)),
-            detail::row_setter_int64<RowData>(std::move(setter))));
+            detail::row_setter_int64<RowData>(name, std::move(setter))));
         return *this;
     }
 
@@ -4417,7 +4514,7 @@ public:
         def_.columns.push_back(detail::make_row_column<RowData>(
             name, ColumnType::Integer, true,
             detail::row_getter_int<RowData>(std::move(getter)),
-            detail::row_setter_int<RowData>(std::move(setter))));
+            detail::row_setter_int<RowData>(name, std::move(setter))));
         return *this;
     }
 
@@ -5790,33 +5887,33 @@ template<typename RowData>
 inline sqlite3_module create_generator_module() {
     sqlite3_module mod = {};
     mod.iVersion = 3;
-    mod.xCreate = generator_vtab_connect<RowData>;
-    mod.xConnect = generator_vtab_connect<RowData>;
-    mod.xBestIndex = generator_vtab_best_index<RowData>;
-    mod.xDisconnect = generator_vtab_disconnect<RowData>;
-    mod.xDestroy = generator_vtab_destroy<RowData>;
-    mod.xOpen = generator_vtab_open<RowData>;
-    mod.xClose = generator_vtab_close<RowData>;
-    mod.xFilter = generator_vtab_filter<RowData>;
-    mod.xNext = generator_vtab_next<RowData>;
-    mod.xEof = generator_vtab_eof<RowData>;
-    mod.xColumn = generator_vtab_column<RowData>;
-    mod.xRowid = generator_vtab_rowid<RowData>;
+    mod.xCreate = detail::CAbiGuard<&generator_vtab_connect<RowData>>::call;
+    mod.xConnect = detail::CAbiGuard<&generator_vtab_connect<RowData>>::call;
+    mod.xBestIndex = detail::CAbiGuard<&generator_vtab_best_index<RowData>>::call;
+    mod.xDisconnect = detail::CAbiGuard<&generator_vtab_disconnect<RowData>>::call;
+    mod.xDestroy = detail::CAbiGuard<&generator_vtab_destroy<RowData>>::call;
+    mod.xOpen = detail::CAbiGuard<&generator_vtab_open<RowData>>::call;
+    mod.xClose = detail::CAbiGuard<&generator_vtab_close<RowData>>::call;
+    mod.xFilter = detail::CAbiGuard<&generator_vtab_filter<RowData>>::call;
+    mod.xNext = detail::CAbiGuard<&generator_vtab_next<RowData>>::call;
+    mod.xEof = detail::CAbiGuard<&generator_vtab_eof<RowData>>::call;
+    mod.xColumn = detail::CAbiGuard<&generator_vtab_column<RowData>>::call;
+    mod.xRowid = detail::CAbiGuard<&generator_vtab_rowid<RowData>>::call;
     if constexpr (std::is_default_constructible_v<RowData>) {
-        mod.xUpdate = generator_vtab_update<RowData>;
+        mod.xUpdate = detail::CAbiGuard<&generator_vtab_update<RowData>>::call;
     } else {
-        mod.xUpdate = generator_vtab_read_only_update;
+        mod.xUpdate = detail::CAbiGuard<&generator_vtab_read_only_update>::call;
     }
     // xBegin enrolls the vtab; xSync runs the fallible hook; xCommit clears
     // state. Inert for read-only generator tables,
     // which never enroll in a write transaction.
-    mod.xBegin = vtab_xbegin<GeneratorVtab<RowData>>;
-    mod.xSync = vtab_prepare_commit<GeneratorVtab<RowData>>;
-    mod.xCommit = vtab_finish_commit<GeneratorVtab<RowData>>;
-    mod.xRollback = vtab_xrollback<GeneratorVtab<RowData>>;
-    mod.xSavepoint = vtab_xsavepoint<GeneratorVtab<RowData>>;
-    mod.xRelease = vtab_xrelease<GeneratorVtab<RowData>>;
-    mod.xRollbackTo = vtab_xrollback_to<GeneratorVtab<RowData>>;
+    mod.xBegin = detail::CAbiGuard<&vtab_xbegin<GeneratorVtab<RowData>>>::call;
+    mod.xSync = detail::CAbiGuard<&vtab_prepare_commit<GeneratorVtab<RowData>>>::call;
+    mod.xCommit = detail::CAbiGuard<&vtab_finish_commit<GeneratorVtab<RowData>>>::call;
+    mod.xRollback = detail::CAbiGuard<&vtab_xrollback<GeneratorVtab<RowData>>>::call;
+    mod.xSavepoint = detail::CAbiGuard<&vtab_xsavepoint<GeneratorVtab<RowData>>>::call;
+    mod.xRelease = detail::CAbiGuard<&vtab_xrelease<GeneratorVtab<RowData>>>::call;
+    mod.xRollbackTo = detail::CAbiGuard<&vtab_xrollback_to<GeneratorVtab<RowData>>>::call;
     return mod;
 }
 
@@ -5981,7 +6078,7 @@ public:
         def_.columns.push_back(detail::make_row_column<RowData>(
             name, ColumnType::Integer, true,
             detail::row_getter_int64<RowData>(std::move(getter)),
-            detail::row_setter_int64<RowData>(std::move(setter))));
+            detail::row_setter_int64<RowData>(name, std::move(setter))));
         return *this;
     }
 
@@ -6006,7 +6103,7 @@ public:
         def_.columns.push_back(detail::make_row_column<RowData>(
             name, ColumnType::Integer, true,
             detail::row_getter_int<RowData>(std::move(getter)),
-            detail::row_setter_int<RowData>(std::move(setter))));
+            detail::row_setter_int<RowData>(name, std::move(setter))));
         return *this;
     }
 

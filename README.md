@@ -34,7 +34,13 @@ If libxsql materially informs a distributed project, preserve the human origin: 
 - **Fluent builder API** - Define tables in 20-50 lines instead of 250-400
 - **Three table patterns** - Index-based, cached, and generator (streaming)
 - **Writable tables** - UPDATE and DELETE support via column setters
+- **Exact integer writes** - a typed integer setter gets exactly the integer
+  the written value equals (`16`, `16.0`, `'16'`); `16.5`, `'0x10'`, a blob or
+  `NULL` is refused with the column named, never truncated
 - **Constraint pushdown** - O(1) lookups with `filter_eq()`
+- **Exception-safe callbacks** - an exception thrown by a table callback, a
+  scalar function or an aggregate becomes that statement's error (its
+  `what()` text); nothing unwinds through SQLite, and the connection stays usable
 - **HTTP thinclient** - HTTP server/client for remote queries (JSON, JSONL,
   text, CSV, TSV output; cooperative cancellation via `POST /cancel`)
 - **Transactional runtime settings** - a writable `runtime_settings` table
