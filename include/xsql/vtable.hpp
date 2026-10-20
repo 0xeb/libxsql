@@ -224,14 +224,11 @@ private:
 
 } // namespace detail
 
-// A table refusing to be read without constraints (a required constraint is
-// missing, or a full scan is forbidden) fails with SQLITE_CONSTRAINT -- SQLite's
-// own code for "this constraint set is unusable" -- instead of SQLITE_ERROR. The
-// message is the table's own. A plain read can raise SQLITE_CONSTRAINT no other
-// way, so callers such as export_tables can tell "needs a WHERE" from a failure.
+// Explicit scan refusal uses SQLITE_CONSTRAINT_VTAB. Other constraint errors
+// remain failures, so exporting cannot mistake backend failures for a missing WHERE.
 inline int return_vtab_refusal(sqlite3_vtab* pVtab) {
     return_vtab_error(pVtab);
-    return to_sqlite_status(Status::constraint);
+    return SQLITE_CONSTRAINT_VTAB;
 }
 
 // ============================================================================
@@ -776,7 +773,7 @@ inline std::optional<int64_t> exact_int64(const FunctionArg& value) {
 inline std::optional<std::string> exact_text(const FunctionArg& value) {
     if (!detail::text_key_can_match(value)) return std::nullopt;
     const char* text = value.as_c_str();
-    return std::string(text ? text : "");
+    return text ? std::string(text, static_cast<size_t>(value.bytes())) : std::string();
 }
 
 namespace detail {
@@ -1401,6 +1398,13 @@ inline int vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
 }
 
 // xBestIndex - query planner hook for constraint pushdown
+// Exact filters implement binary comparisons. Narrowing a NOCASE/RTRIM/custom
+// constraint can discard matching rows even when SQLite rechecks the remainder.
+inline bool binary_constraint(sqlite3_index_info* info, int index) {
+    const char* name = sqlite3_vtab_collation(info, index);
+    return name && sqlite3_stricmp(name, "BINARY") == 0;
+}
+
 inline int vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
     auto* vtab = reinterpret_cast<Vtab*>(pVtab);
     const VTableDef* def = vtab->def;
@@ -1414,7 +1418,7 @@ inline int vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
         const auto& constraint = pInfo->aConstraint[i];
 
         // Only handle usable EQ constraints for now
-        if (!constraint.usable) continue;
+        if (!constraint.usable || !binary_constraint(pInfo, i)) continue;
         if (constraint.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
 
         // Check if we have a filter for this column
@@ -2188,10 +2192,11 @@ public:
     }
 
     /**
-     * Add an equality filter for text column.
+     * Add an equality filter for a text column. The callback receives the
+     * complete string, including embedded NUL bytes.
      */
     VTableBuilder& filter_eq_text(const char* column_name,
-                                   std::function<std::unique_ptr<RowIterator>(const char*)> factory,
+                                   std::function<std::unique_ptr<RowIterator>(const std::string&)> factory,
                                    double cost = 10.0,
                                    double est_rows = 10.0) {
         int col_idx = def_.find_column(column_name);
@@ -2204,8 +2209,7 @@ public:
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
                 // omit=1: NULL equals nothing and a blob never equals text.
                 if (!detail::text_key_can_match(val)) return nullptr;
-                const char* text = val.as_c_str();
-                return factory(text ? text : "");
+                return factory(val.as_text());
             }
         );
         return *this;
@@ -3806,7 +3810,7 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
             bool found = false;
             for (int i = 0; i < pInfo->nConstraint; ++i) {
                 const auto& constraint = pInfo->aConstraint[i];
-                if (!constraint.usable || constraint.iColumn != spec.column_index ||
+                if (!constraint.usable || !binary_constraint(pInfo, i) || constraint.iColumn != spec.column_index ||
                     constraint.op != sqlite_op) {
                     continue;
                 }
@@ -3833,7 +3837,7 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
 
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
-        if (!constraint.usable) continue;
+        if (!constraint.usable || !binary_constraint(pInfo, i)) continue;
 
         const int op = constraint.op;
         const bool is_eq = (op == SQLITE_INDEX_CONSTRAINT_EQ);
@@ -4619,7 +4623,7 @@ public:
     }
 
     CachedTableBuilder& filter_eq_text(const char* column_name,
-                                        std::function<std::unique_ptr<RowIterator>(const char*)> factory,
+                                        std::function<std::unique_ptr<RowIterator>(const std::string&)> factory,
                                         double cost = 10.0, double est_rows = 10.0) {
         int col_idx = def_.find_column(column_name);
         if (col_idx < 0) return *this;
@@ -4628,8 +4632,7 @@ public:
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
                 // omit=1: NULL equals nothing and a blob never equals text.
                 if (!detail::text_key_can_match(val)) return nullptr;
-                const char* text = val.as_c_str();
-                return factory(text ? text : "");
+                return factory(val.as_text());
             });
         return *this;
     }
@@ -5533,7 +5536,7 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
             const int sqlite_op = sqlite_constraint_op(spec.op);
             for (int i = 0; i < pInfo->nConstraint; i++) {
                 const auto& c = pInfo->aConstraint[i];
-                if (!c.usable) continue;
+                if (!c.usable || !binary_constraint(pInfo, i)) continue;
                 if (c.op != sqlite_op) continue;
                 if (c.iColumn == spec.column_index) {
                     matched_constraints[s] = i;
@@ -5591,7 +5594,7 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
             bool found = false;
             for (int i = 0; i < pInfo->nConstraint; i++) {
                 const auto& c = pInfo->aConstraint[i];
-                if (!c.usable) continue;
+                if (!c.usable || !binary_constraint(pInfo, i)) continue;
                 if (c.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
                 if (c.iColumn == required_col) {
                     matched_constraints[p] = i;
@@ -5618,7 +5621,7 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
 
     for (int i = 0; i < pInfo->nConstraint; i++) {
         const auto& constraint = pInfo->aConstraint[i];
-        if (!constraint.usable) continue;
+        if (!constraint.usable || !binary_constraint(pInfo, i)) continue;
         const bool is_eq = (constraint.op == SQLITE_INDEX_CONSTRAINT_EQ);
         const bool is_like = (constraint.op == SQLITE_INDEX_CONSTRAINT_LIKE ||
                               constraint.op == SQLITE_INDEX_CONSTRAINT_GLOB);
@@ -6163,7 +6166,7 @@ public:
     }
 
     GeneratorTableBuilder& filter_eq_text(const char* column_name,
-                                          std::function<std::unique_ptr<RowIterator>(const char*)> factory,
+                                          std::function<std::unique_ptr<RowIterator>(const std::string&)> factory,
                                           double cost = 10.0, double est_rows = 10.0) {
         int col_idx = def_.find_column(column_name);
         if (col_idx < 0) return *this;
@@ -6172,8 +6175,7 @@ public:
             [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
                 // omit=1: NULL equals nothing and a blob never equals text.
                 if (!detail::text_key_can_match(val)) return nullptr;
-                const char* text = val.as_c_str();
-                return factory(text ? text : "");
+                return factory(val.as_text());
             });
         return *this;
     }

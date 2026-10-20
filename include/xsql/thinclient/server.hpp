@@ -145,6 +145,13 @@ public:
      * Start server in background thread.
      */
     void run_async() {
+        // A completed delayed-shutdown worker remains joinable. Reap it before
+        // starting a new listen cycle so schedule_shutdown() can arm the
+        // restarted server independently.
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex_);
+            if (shutdown_thread_.joinable()) shutdown_thread_.join();
+        }
         // Wait until the server is actually listening OR the worker returns.
         // run() sets running_ = true then blocks in listen(); on a bind failure
         // (e.g. the port is already in use) it returns almost immediately without
@@ -154,6 +161,10 @@ public:
         // — that makes a failed bind surface immediately, not after a fixed wait.
         // The deadline is a last-resort guard against a listen() that neither
         // starts serving nor returns.
+        if (server_thread_.joinable()) {
+            if (!thread_finished_.load()) return;
+            server_thread_.join();
+        }
         thread_finished_.store(false);
         server_thread_ = std::thread([this] {
             run();
@@ -170,6 +181,10 @@ public:
      * Stop server gracefully.
      */
     void stop() {
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex_);
+            if (shutdown_thread_.joinable()) shutdown_thread_.join();
+        }
         if (svr_.is_running()) {
             svr_.stop();
         }
@@ -219,16 +234,20 @@ public:
      * Applications can call this from their shutdown endpoint.
      */
     void schedule_shutdown() {
-        std::thread([this] {
+        std::lock_guard<std::mutex> lock(shutdown_mutex_);
+        if (shutdown_thread_.joinable()) return;
+        shutdown_thread_ = std::thread([this] {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             svr_.stop();
-        }).detach();
+        });
     }
 
 private:
     server_config config_;
     httplib::Server svr_;
     std::thread server_thread_;
+    std::thread shutdown_thread_;
+    std::mutex shutdown_mutex_;
     std::atomic<bool> running_;
     // Set true by the run_async worker the moment run() returns, so the
     // start-up wait can distinguish "still binding" from "worker exited (bind

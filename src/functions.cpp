@@ -27,7 +27,7 @@ double FunctionArg::as_double() const {
 
 std::string FunctionArg::as_text() const {
     const auto* text = sqlite3_value_text(static_cast<sqlite3_value*>(const_cast<void*>(value_)));
-    return text ? reinterpret_cast<const char*>(text) : "";
+    return text ? std::string(reinterpret_cast<const char*>(text), static_cast<size_t>(bytes())) : std::string();
 }
 
 const char* FunctionArg::as_c_str() const {
@@ -84,7 +84,7 @@ void FunctionContext::result_int64(int64_t val) {
 }
 
 void FunctionContext::result_text(const std::string& val) {
-    sqlite3_result_text(static_cast<sqlite3_context*>(ctx_), val.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_result_text64(static_cast<sqlite3_context*>(ctx_), val.data(), val.size(), SQLITE_TRANSIENT, SQLITE_UTF8);
 }
 
 void FunctionContext::result_text(const char* val) {

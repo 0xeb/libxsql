@@ -1138,8 +1138,20 @@ private:
                     // "no limit" against a tool with its own default.
                     if (req.has_header("X-XSQL-Timeout")) {
                         try {
-                            const long ms = std::stol(req.get_header_value("X-XSQL-Timeout"));
-                            if (ms >= 0) opts.timeout_ms = static_cast<int>(ms);
+                            const auto text = req.get_header_value("X-XSQL-Timeout");
+                            size_t i = text.find_first_not_of(" \t\r\n\v\f");
+                            if (i != std::string::npos) {
+                                const bool negative = text[i] == '-';
+                                if (text[i] == '+' || text[i] == '-') ++i;
+                                const size_t start = i;
+                                int ms = 0;
+                                while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+                                    const int digit = text[i++] - '0';
+                                    ms = ms > ((std::numeric_limits<int>::max)() - digit) / 10
+                                        ? (std::numeric_limits<int>::max)() : ms * 10 + digit;
+                                }
+                                if (i > start && (!negative || ms == 0)) opts.timeout_ms = ms;
+                            }
                         } catch (...) { /* invalid header: leave opts.timeout_ms as-is */ }
                     }
                     // Cooperative cancellation via POST /cancel. The predicate

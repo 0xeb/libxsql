@@ -11,14 +11,29 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
+#include <cmath>
+#include <locale>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <system_error>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <sstream>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
+#include <sys/stat.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace xsql {
 
@@ -166,15 +181,15 @@ constexpr const char* kNoQuerySolution = "no query solution";
 
 // True when the last call on `h` failed because the table cannot be read
 // without constraints: a libxsql table refuses the scan with SQLITE_CONSTRAINT
-// (see return_vtab_refusal), and a table whose xBestIndex rejects every plan
-// fails to prepare with "no query solution". A plain SELECT can produce neither
-// any other way, so this never swallows a real error.
+// (SQLITE_CONSTRAINT_VTAB), and a table whose xBestIndex rejects every plan
+// fails to prepare with "no query solution".
+// Only the explicit refusal code is skippable; ordinary constraint errors fail.
 bool is_constraint_refusal(sqlite3* h, const std::string& message) {
     if (!h) {
         return false;
     }
-    const int code = sqlite3_errcode(h) & 0xff;
-    return code == SQLITE_CONSTRAINT ||
+    const int code = sqlite3_extended_errcode(h);
+    return code == SQLITE_CONSTRAINT_VTAB ||
            (code == SQLITE_ERROR && message == kNoQuerySolution);
 }
 
@@ -199,10 +214,15 @@ void write_row(std::ostream& out, Statement& stmt, const std::string& quoted_tab
                 out << stmt.int64_value(i);
                 break;
             case SQLITE_FLOAT: {
-                std::ostringstream oss;
-                oss << std::setprecision(std::numeric_limits<double>::digits10 + 1)
-                    << stmt.double_value(i);
-                out << oss.str();
+                const double value = stmt.double_value(i);
+                if (std::isinf(value)) {
+                    out << (value < 0 ? "-9.0e999" : "9.0e999");
+                } else {
+                    std::ostringstream oss;
+                    oss.imbue(std::locale::classic());
+                    oss << std::scientific << std::setprecision(16) << value;
+                    out << oss.str();
+                }
                 break;
             }
             case SQLITE_BLOB:
@@ -210,7 +230,14 @@ void write_row(std::ostream& out, Statement& stmt, const std::string& quoted_tab
                 break;
             case SQLITE_TEXT:
             default:
-                out << "'" << escape_text(stmt.text(i)) << "'";
+                {
+                    const auto text = stmt.text(i);
+                    if (text.find('\0') != std::string::npos) {
+                        out << "CAST(" << blob_to_hex(std::vector<uint8_t>(text.begin(), text.end())) << " AS TEXT)";
+                    } else {
+                        out << "'" << escape_text(text) << "'";
+                    }
+                }
                 break;
         }
         if (i + 1 < col_count) {
@@ -221,6 +248,127 @@ void write_row(std::ostream& out, Statement& stmt, const std::string& quoted_tab
 }
 
 enum class TableOutcome { exported, empty, refused, failed };
+
+class FileOutputBuffer final : public std::streambuf {
+public:
+    explicit FileOutputBuffer(std::FILE* file) : file_(file) {}
+
+protected:
+    int_type overflow(int_type ch) override {
+        if (traits_type::eq_int_type(ch, traits_type::eof())) {
+            return traits_type::not_eof(ch);
+        }
+        return std::fputc(traits_type::to_char_type(ch), file_) == EOF
+                   ? traits_type::eof()
+                   : ch;
+    }
+
+    std::streamsize xsputn(const char* data, std::streamsize size) override {
+        if (size <= 0) return 0;
+        return static_cast<std::streamsize>(
+            std::fwrite(data, 1, static_cast<size_t>(size), file_));
+    }
+
+    int sync() override { return std::fflush(file_) == 0 ? 0 : -1; }
+
+private:
+    std::FILE* file_;
+};
+
+std::FILE* open_exclusive_binary(const std::string& path) {
+#ifdef _WIN32
+    int descriptor = -1;
+    const errno_t open_error = _sopen_s(
+        &descriptor, path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+        _SH_DENYRW, _S_IREAD | _S_IWRITE);
+    if (open_error != 0) {
+        errno = open_error;
+        return nullptr;
+    }
+    std::FILE* file = _fdopen(descriptor, "wb");
+    if (!file) {
+        const int saved_errno = errno;
+        _close(descriptor);
+        std::remove(path.c_str());
+        errno = saved_errno;
+    }
+    return file;
+#else
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (descriptor < 0) return nullptr;
+    std::FILE* file = fdopen(descriptor, "wb");
+    if (!file) {
+        const int saved_errno = errno;
+        ::close(descriptor);
+        std::remove(path.c_str());
+        errno = saved_errno;
+    }
+    return file;
+#endif
+}
+
+class AdjacentTempOutput final {
+public:
+    AdjacentTempOutput() = default;
+    AdjacentTempOutput(const AdjacentTempOutput&) = delete;
+    AdjacentTempOutput& operator=(const AdjacentTempOutput&) = delete;
+
+    ~AdjacentTempOutput() {
+        close();
+        if (owned_ && !path_.empty()) std::remove(path_.c_str());
+    }
+
+    bool create(const std::string& output_path, const char* role) {
+        unsigned char nonce[16];
+        static constexpr char hex[] = "0123456789abcdef";
+        for (int attempt = 0; attempt < 128; ++attempt) {
+            sqlite3_randomness(static_cast<int>(sizeof(nonce)), nonce);
+            std::string suffix;
+            suffix.reserve(sizeof(nonce) * 2);
+            for (unsigned char byte : nonce) {
+                suffix.push_back(hex[byte >> 4]);
+                suffix.push_back(hex[byte & 0x0f]);
+            }
+            path_ = output_path + "." + role + "." + suffix + ".tmp";
+            file_ = open_exclusive_binary(path_);
+            if (file_) {
+                owned_ = true;
+                buffer_ = std::make_unique<FileOutputBuffer>(file_);
+                stream_ = std::make_unique<std::ostream>(buffer_.get());
+                return true;
+            }
+            if (errno != EEXIST) return false;
+        }
+        errno = EEXIST;
+        return false;
+    }
+
+    std::ostream& stream() { return *stream_; }
+    const std::string& path() const { return path_; }
+
+    bool close() {
+        if (!file_) return true;
+        bool stream_ok = true;
+        if (stream_) {
+            stream_->flush();
+            stream_ok = stream_->good();
+        }
+        stream_.reset();
+        buffer_.reset();
+        const bool close_ok = std::fclose(file_) == 0;
+        file_ = nullptr;
+        return stream_ok && close_ok;
+    }
+
+    void disarm() { owned_ = false; }
+
+private:
+    std::string path_;
+    std::FILE* file_ = nullptr;
+    std::unique_ptr<FileOutputBuffer> buffer_;
+    std::unique_ptr<std::ostream> stream_;
+    bool owned_ = false;
+};
 
 // Write one table's section to `out`. Whether the table can be read is settled
 // by the first step of its SELECT, before any of its text is written, so a
@@ -332,17 +480,14 @@ bool export_tables(Database& db,
     // which is only known at the end. Table sections stream to a sibling body
     // file (memory stays at one row), then header and body are joined into
     // `output_path`. A failed export leaves `output_path` untouched.
-    const std::string body_path = output_path + ".body.tmp";
-    std::ofstream body(body_path, std::ios::out | std::ios::trunc | std::ios::binary);
-    if (!body.is_open()) {
+    AdjacentTempOutput body_file;
+    if (!body_file.create(output_path, "body")) {
         error = "Cannot open output file: " + output_path;
         return false;
     }
+    std::ostream& body = body_file.stream();
     auto fail = [&](std::string message) {
-        if (body.is_open()) {
-            body.close();
-        }
-        std::remove(body_path.c_str());
+        body_file.close();
         error = std::move(message);
         return false;
     };
@@ -370,22 +515,20 @@ bool export_tables(Database& db,
             return fail("Cannot write output file: " + output_path);
         }
     }
-    body.close();
-    if (body.fail()) {
+    if (!body_file.close()) {
         return fail("Cannot write output file: " + output_path);
     }
 
     // Assembled beside the target and renamed over it, so a failure while
     // writing never leaves a partial `output_path`.
-    const std::string staged_path = output_path + ".tmp";
-    auto fail_staged = [&](std::string message) {
-        std::remove(staged_path.c_str());
-        return fail(std::move(message));
-    };
-    std::ofstream out(staged_path, std::ios::out | std::ios::trunc | std::ios::binary);
-    if (!out.is_open()) {
+    AdjacentTempOutput staged_file;
+    if (!staged_file.create(output_path, "stage")) {
         return fail("Cannot open output file: " + output_path);
     }
+    auto fail_staged = [&](std::string message) {
+        return fail(std::move(message));
+    };
+    std::ostream& out = staged_file.stream();
     out << "-- SQL Export\n";
     out << "-- Tables: " << exported << "\n";
     if (!skipped.empty()) {
@@ -397,26 +540,25 @@ bool export_tables(Database& db,
     }
     out << "\n";
     {
-        std::ifstream in(body_path, std::ios::in | std::ios::binary);
+        std::ifstream in(body_file.path(), std::ios::in | std::ios::binary);
         if (!in.is_open()) {
-            out.close();
-            return fail_staged("Cannot read temporary export file: " + body_path);
+            staged_file.close();
+            return fail_staged("Cannot read temporary export file: " + body_file.path());
         }
         if (in.peek() != std::ifstream::traits_type::eof()) {
             out << in.rdbuf();
         }
     }
-    out.close();
-    if (out.fail()) {
+    if (!staged_file.close()) {
         return fail_staged("Cannot write output file: " + output_path);
     }
     std::error_code rename_error;
-    std::filesystem::rename(staged_path, output_path, rename_error);
+    std::filesystem::rename(staged_file.path(), output_path, rename_error);
     if (rename_error) {
         return fail_staged("Cannot write output file: " + output_path + ": " +
                            rename_error.message());
     }
-    std::remove(body_path.c_str());
+    staged_file.disarm();
 
     error.clear();
     return true;
