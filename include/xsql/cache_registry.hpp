@@ -40,8 +40,9 @@ struct CachedTableRegistry {
 };
 
 inline CachedTableRegistry& cached_table_registry() {
-    static CachedTableRegistry registry;
-    return registry;
+    // Databases can unregister tables during static teardown.
+    static auto* registry = new CachedTableRegistry();
+    return *registry;
 }
 
 inline void register_cached_table_invalidator(sqlite3* db, const void* def,
