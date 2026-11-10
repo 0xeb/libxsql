@@ -122,9 +122,10 @@ struct Database::Impl {
 
 namespace {
 
+// Never destroyed: error() may run during static teardown.
 const std::string& empty_error() {
-    static const std::string kEmpty;
-    return kEmpty;
+    static const auto* kEmpty = new std::string();
+    return *kEmpty;
 }
 
 std::string write_surface_key(const char* db_name, const char* table_name) {

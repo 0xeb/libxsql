@@ -20,9 +20,10 @@ struct Statement::Impl {
 
 namespace {
 
+// Never destroyed: error() may run during static teardown.
 const std::string& empty_error() {
-    static const std::string kEmpty;
-    return kEmpty;
+    static const auto* kEmpty = new std::string();
+    return *kEmpty;
 }
 
 } // namespace
